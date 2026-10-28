@@ -18,6 +18,7 @@
 #include "spurs_chain_worker.h"
 #include "spurs_command_wait.h"
 #include "spurs_completion_queue.h"
+#include "spurs_env_cache.h"
 #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include <stdio.h>
@@ -2866,16 +2867,10 @@ static void jc_pool_job(u32 job, int index, u32 stride, u32 chain)
  * environment (strchr per entry under the CRT lock); the walker asked for the
  * same few variables on every JOBLIST command -- ~8% of its busy time in the
  * menu's heaviest scene. The variables are fixed before launch, so cache by the
- * literal's address (benign race: every thread stores the same value). */
+ * literal's address in a thread-local cache, including absent variables. */
 static const char* jc_getenv(const char* name)
 {
-    static const char* keys[32]; static const char* vals[32]; static volatile long used;
-    const long n = used;
-    for (long i = 0; i < n && i < 32; ++i) if (keys[i] == name) return vals[i];
-    const char* value = getenv(name);
-    const long slot = _InterlockedIncrement(&used) - 1;
-    if (slot < 32) { vals[slot] = value; _ReadWriteBarrier(); keys[slot] = name; }
-    return value;
+    return spurs_cached_env(name);
 }
 
 static int jc_parallel_list(u32 chain, u32 first, u32 count, u32 stride, int index)
