@@ -13,11 +13,18 @@
 #include <string.h>
 #include <stdlib.h>
 #include "ps3emu/log_first.h"
+#include "timer_short_spin.h"
 
 /* ---------------------------------------------------------------------------
  * Globals
  * -----------------------------------------------------------------------*/
 sys_timer_info g_sys_timers[SYS_TIMER_MAX];
+static unsigned s_short_spin_us;
+__attribute__((constructor)) static void timer_short_spin_options_init(void)
+{
+    const char* e=getenv("PS3_SHORT_SLEEP_SPIN_US");int requested=e?atoi(e):0;
+    s_short_spin_us=requested>=1 && requested<=100?(unsigned)requested:0;
+}
 
 #ifdef _WIN32
 static LARGE_INTEGER s_qpc_freq;
@@ -240,6 +247,10 @@ int64_t sys_timer_usleep(ppu_context* ctx)
          * (SwitchToThread) so a sibling host thread the guest may be waiting on
          * still gets the core. Mirrors RPCS3's "Usleep Only" TSC busy-tail. */
         ensure_qpc_init();
+        /* Yielding a 2-us guest poll to another runnable host thread can
+         * consume a complete host slice. Optional bounded PAUSE/QPC waits
+         * retain the actual deadline; all longer sleeps keep the old path. */
+        if(ps3_short_sleep_spin(usec,s_qpc_freq.QuadPart,s_short_spin_us))return CELL_OK;
         LARGE_INTEGER qpc_start, qpc_now;
         QueryPerformanceCounter(&qpc_start);
         const int64_t qpc_deadline = qpc_start.QuadPart +

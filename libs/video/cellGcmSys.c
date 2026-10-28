@@ -15,7 +15,9 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 #include "../../runtime/spu/spu_coherency.h" /* the blit row copy's reservation bookkeeping */
+#include "rsx_frame_boundary.h"
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
+#include "rsx_morton2d.h"
 #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
 #include "../../include/ps3emu/ps3_ftrace.h"  /* PS3_FTRACE timeline */
 
@@ -294,6 +296,18 @@ static CellGcmQueueHandler    s_queue_handler    = NULL;
 /* Second V / VBlank frequency */
 static u32 s_second_v_frequency = 0;
 static u32 s_vblank_frequency   = 0;
+/* Diagnostic isolation only. The default implements the registered callback;
+ * an explicitly movie-less bootstrap may disable the unsupported movie path
+ * while its downstream conversion queue is still being brought up. */
+static int gcm_second_v_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* e = getenv("GCM_SECOND_V");
+        enabled = !(e && e[0] == '0');
+    }
+    return enabled;
+}
 
 /* User command */
 #ifdef _WIN32
@@ -304,6 +318,8 @@ static volatile LONG s_user_command = 0;
 static volatile LONG64 s_user_pending = 0;
 #define GCM_USER_PENDING_STORE(value) InterlockedExchange64(&s_user_pending, (LONG64)(value))
 #define GCM_USER_PENDING_TAKE() ((u64)InterlockedExchange64(&s_user_pending, 0))
+/* Advisory aligned loads only; claiming still uses the interlocked exchange. */
+#define GCM_USER_PENDING_PEEK() ((u64)s_user_pending)
 #else
 #include <stdatomic.h>
 static atomic_uint s_user_command = 0;
@@ -311,6 +327,7 @@ static atomic_uint s_user_command = 0;
 static _Atomic(u64) s_user_pending = 0;
 #define GCM_USER_PENDING_STORE(value) atomic_store(&s_user_pending, (value))
 #define GCM_USER_PENDING_TAKE() atomic_exchange(&s_user_pending, 0)
+#define GCM_USER_PENDING_PEEK() atomic_load_explicit(&s_user_pending, memory_order_relaxed)
 #endif
 
 /* Tile configuration (up to 15 tiles, 8 commonly used) */
@@ -512,6 +529,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     s_vblank_handler = NULL;
     s_user_handler = NULL;
     s_second_v_handler = NULL;
+    s_second_v_handler_opd = 0;
     s_last_flip_time = get_timestamp_ns();
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_flip_mode = CELL_GCM_DISPLAY_VSYNC;
@@ -721,6 +739,7 @@ u32 cellGcmGetFlipStatus(void)
 static volatile LONG s_gcm_pending = 0;    /* bit0 = vblank, bit1 = flip */
 #define GCM_PENDING_SET(bits)  InterlockedOr(&s_gcm_pending, (bits))
 #define GCM_PENDING_TAKE()     InterlockedExchange(&s_gcm_pending, 0)
+#define GCM_PENDING_PEEK()     s_gcm_pending
 static volatile LONG s_gcm_pumping = 0;
 #define GCM_PUMP_TRY_ENTER() (InterlockedCompareExchange(&s_gcm_pumping, 1, 0) == 0)
 #define GCM_PUMP_LEAVE()     InterlockedExchange(&s_gcm_pumping, 0)
@@ -729,6 +748,7 @@ static volatile LONG s_gcm_pumping = 0;
 static atomic_int s_gcm_pending = 0;
 #define GCM_PENDING_SET(bits)  atomic_fetch_or(&s_gcm_pending, (bits))
 #define GCM_PENDING_TAKE()     atomic_exchange(&s_gcm_pending, 0)
+#define GCM_PENDING_PEEK()     atomic_load_explicit(&s_gcm_pending, memory_order_relaxed)
 static atomic_flag s_gcm_pumping = ATOMIC_FLAG_INIT;
 #define GCM_PUMP_TRY_ENTER() (!atomic_flag_test_and_set_explicit(&s_gcm_pumping, memory_order_acquire))
 #define GCM_PUMP_LEAVE()     atomic_flag_clear_explicit(&s_gcm_pumping, memory_order_release)
@@ -782,6 +802,12 @@ void cellGcm_request_tick(void)
  * pending notifications untouched when another pump is active. */
 void ppu_gcm_pump(void)
 {
+    /* Called at every HLE boundary, overwhelmingly without a new interrupt.
+     * Avoid four contended RMWs (guard, two claims, release) in that case.
+     * This is only a hint: an interrupt arriving after these reads stays
+     * pending for the next pump. The serialized exchange below still owns
+     * delivery, including user command zero, recursion and competing pumps. */
+    if (!GCM_PENDING_PEEK() && !GCM_USER_PENDING_PEEK()) return;
     if (!GCM_PUMP_TRY_ENTER()) return;
     long p = (long)GCM_PENDING_TAKE();
     u64 user = GCM_USER_PENDING_TAKE();
@@ -797,6 +823,16 @@ void ppu_gcm_pump(void)
         g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count,
                            0, 0, 0, 0, 0, 0, 0);
     }
+    /* Second-V is a separate registered interrupt, not a second main VBlank
+     * handler slot. CRI's movie scheduler uses it to wake its PPU workers.
+     * Deliver from the same serialized, deferred scanout pump: never run
+     * guest code on the ticker or synthesize wakes of individual workloads.
+     * Frequencies 2 (scanout) and 3 (59.94 Hz) share our current 60-Hz clock;
+     * 4 explicitly disables delivery, as in sys_rsx_context_attribute 0x108.
+     */
+    if ((p & 1) && gcm_second_v_enabled() && s_second_v_frequency != 4 &&
+        s_second_v_handler_opd && g_ps3_guest_caller)
+        g_ps3_guest_caller(s_second_v_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
     if (p & 2) {
         /* Delivery waits for a guest thread to reach an HLE call or a timer
          * sleep, so a newer flip may have been requested (status WAITING
@@ -988,12 +1024,7 @@ static struct {
  * dimension above them. */
 static u32 nv309e_swz(u32 x, u32 y, u32 l2w, u32 l2h)
 {
-    u32 n = l2w < l2h ? l2w : l2h, off = 0;
-    for (u32 i = 0; i < n; i++)
-        off |= (((x >> i) & 1u) << (2 * i)) | (((y >> i) & 1u) << (2 * i + 1));
-    if (l2w > l2h)      off |= (x >> n) << (2 * n);
-    else if (l2h > l2w) off |= (y >> n) << (2 * n);
-    return off;
+    return rsx_morton2d(x, y, l2w, l2h);
 }
 
 /* IMAGE_IN_POINT is 12.4 fixed point per axis; DS_DX / DT_DY step the source in 20 fractional bits (1.0 = 0x100000).
@@ -1113,7 +1144,7 @@ static void nv3089_blit(void)
        * where a minified surface should be, and the shell that samples the
        * pyramid draws untextured. NV309E_BLIT=0 disables. */
       if (en < 0) { const char* e = getenv("NV309E_BLIT"); en = e ? atoi(e) : 1; }
-      if (en && f == 3 && s_nv309e.active && s_nv309e.offset &&
+      if (en && f == 3 && s_nv309e.active && s_nv309e.offset && l2w < 16 && l2h < 16 &&
           (1u << l2w) == out_w && (1u << l2h) == out_h) {
         int sl = (s_nv3089.src_dma != 0xFEED0001u);
         u32 src2 = cellGcmResolveLocated(sl, s_nv3089.in_off);
@@ -1126,15 +1157,26 @@ static void nv3089_blit(void)
         { extern u8* vm_base;
           const u8* sbase = vm_base + src2;
           u8* dbase = vm_base + dst2;
+          /* Validated power-of-two width in the 16-bit OUT_SIZE field is
+           * at most 32768. Address bits are separable: hoist X once per
+           * column and Y once per row instead of interleaving per pixel. */
+          static u32 column_offsets[32768]; /* FIFO owner serializes blits */
+          for (u32 x = 0; x < out_w; ++x)
+              column_offsets[x] = nv309e_swz(x, 0, l2w, l2h);
+          const u64 blit_start = PS3_FT_ON() ? ps3_ft_now() : 0;
           for (u32 y = 0; y < out_h; y++) {
+              u32 row_offset = nv309e_swz(0, y, l2w, l2h);
               u64 sv = nv3089_origin(v0b) + (u64)y * s_nv3089.dt_dy;
               const u8* srow = sbase + (u32)(sv >> 20) * in_pitch;
               for (u32 x = 0; x < out_w; x++) {
                   u64 su = nv3089_origin(u0b) + (u64)x * s_nv3089.ds_dx;
-                  memcpy(dbase + (u64)nv309e_swz(x, y, l2w, l2h) * 4,
+                  memcpy(dbase + (u64)(column_offsets[x] | row_offset) * 4,
                          srow + (u32)(su >> 20) * 4, 4);
               }
-          } }
+          }
+          if (blit_start) ps3_ft_span(PS3_FT_BLIT, 0, 1, out_w * out_h,
+                                     blit_start, ps3_ft_now());
+        }
         { static int _n = 0; static int cap = -1;
           if (cap < 0) { const char* e = getenv("NV3089_DBG"); cap = e ? atoi(e) : 0; }
           if (cap && _n < cap) { _n++;
@@ -1960,8 +2002,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * 3 MB ring at boot, wraps, and a walker stopping at every flip
              * then crawled ~1 KB a tick while the title wrote over the
              * commands ahead of it. */
-            if (gcm_fifo_backlog(put, s_fifo_getoff) < GCM_FIFO_CATCHUP_BYTES)
-                { why = "flip"; break; }
+            {
+                static int strict=-1;
+                if(strict<0){const char*e=getenv("GCM_FIFO_STOP_AT_FLIP");strict=e&&e[0]=='1';}
+                const u32 backlog=gcm_fifo_backlog(put,s_fifo_getoff);
+                const int stop=rsx_stop_at_flip(strict,backlog,GCM_FIFO_CATCHUP_BYTES);
+                if(PS3_FT_ON()){u64 t=ps3_ft_now();ps3_ft_span(PS3_FT_FRAME_GATE,stop?(strict?1:2):3,w&7u,backlog,t,t);}
+                if(stop){why="flip";break;}
+            }
             continue;
         }
 
@@ -2003,7 +2051,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                       const unsigned long long now = ps3_ms_now();
                       if (park_off != s_fifo_getoff || park_put != put) {
                           park_off = s_fifo_getoff; park_put = put; park_since = now;
-                      } else if (now - park_since >= GCM_PARK_GRACE_MS) {
+                      } else if (now - park_since >= GCM_PARK_GRACE_MS && !getenv("GCM_STRICT_PARK")) {
                           park_off = 0;
                           gcm_fifo_dump_around(s_fifo_getoff);
                           gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
@@ -2656,6 +2704,22 @@ int cellGcmOffsetIsDisplay(u32 offset)
     for (int i = 0; i < CELL_GCM_MAX_DISPLAY_BUFFER_NUM; i++)
         if (s_display_buffer_set[i] && s_display_buffers[i].offset == offset)
             return 1;
+    return 0;
+}
+
+/* A CPU/SPU texture with scanout dimensions is still an independent image.
+ * Display buffers are local memory; reject a main-memory texture sharing its
+ * raw offset, or a different row layout, before aliasing it to a GPU copy. */
+int cellGcmTextureIsDisplay(u32 offset, u32 address, u32 width, u32 height, u32 pitch)
+{
+    if (!width || !height || !pitch ||
+        (u64)s_config.localAddress + offset != (u64)address) return 0;
+    for (u32 i = 0; i < CELL_GCM_MAX_DISPLAY_BUFFER_NUM; ++i) {
+        const CellGcmDisplayInfo* d = &s_display_buffers[i];
+        if (s_display_buffer_set[i] && d->offset == offset &&
+            d->width == width && d->height == height && d->pitch == pitch)
+            return 1;
+    }
     return 0;
 }
 
@@ -3700,6 +3764,8 @@ void cellGcmTerminate(void)
     s_vblank_handler   = NULL;
     s_user_handler     = NULL;
     s_second_v_handler = NULL;
+    s_second_v_handler_opd = 0;
+    s_second_v_frequency = 0;
     s_graphics_handler = NULL;
     s_queue_handler    = NULL;
     s_local_mem_allocated = 0;

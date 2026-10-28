@@ -22,6 +22,13 @@ void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 ps3_guest_caller_fn g_ps3_guest_caller;
 static unsigned flips;
+/* ResetFlipStatus only marks a request. A ticker cannot complete an
+ * unexecuted FIFO flip; simulate the direct backend's completion too. */
+static void complete_direct_flip(void)
+{
+    s_flip_direct_pending = 1;
+    cellGcmTickFlip();
+}
 static void callback(uint32_t opd, uint64_t a, uint64_t b, uint64_t c,
                      uint64_t d, uint64_t e, uint64_t f, uint64_t h, uint64_t i)
 {
@@ -36,7 +43,7 @@ int main(void)
     /* The plain case: request, tick, deliver. */
     cellGcmResetFlipStatus();
     assert(cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_WAITING);
-    cellGcmTickFlip();
+    complete_direct_flip();
     ppu_gcm_pump();
     assert(flips == 1 && cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_DONE);
     /* No flip outstanding: a tick completes nothing and calls no handler. */
@@ -47,11 +54,11 @@ int main(void)
     /* A newer request between the tick and the delivery: the late completion
      * runs the handler for the old flip but leaves the new one WAITING. */
     cellGcmResetFlipStatus();
-    cellGcmTickFlip();
+    complete_direct_flip();
     cellGcmResetFlipStatus();
     ppu_gcm_pump();
     assert(flips == 2 && cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_WAITING);
-    cellGcmTickFlip();
+    complete_direct_flip();
     ppu_gcm_pump();
     assert(flips == 3 && cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_DONE);
 
@@ -60,7 +67,7 @@ int main(void)
     cellGcmResetFlipStatus();
     cellGcmSetWaitFlip();
     assert(cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_WAITING);
-    cellGcmTickFlip();
+    complete_direct_flip();
     ppu_gcm_pump();
     assert(flips == 4 && cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_DONE);
 

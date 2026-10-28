@@ -38,6 +38,11 @@ typedef void (*spu_lifted_entry_fn)(spu_context*);
  * offline extractor computes the same value so registrations and the images a
  * title passes to cellSpurs line up. */
 uint64_t spu_workload_fingerprint(const void* data, size_t n);
+/* Release this job-chain worker's content-validated image cache at exit. */
+void spu_workload_clear_job_cache(void);
+/* Content-validated job-image classification, using the same bounded TLS
+ * fingerprint memo as dispatch. -1 if the bytes are not registered. */
+int spu_workload_job_image(const uint8_t* image, uint32_t size);
 
 /* Register one lifted SPU binary under its image fingerprint. `name` is borrowed
  * (kept by pointer for logging — pass a string literal / static). Idempotent on

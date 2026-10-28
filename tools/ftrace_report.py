@@ -23,6 +23,8 @@ import sys
 
 (SYSCALL, USLEEP, SPU_WAIT, SPU_BUSY, SEMA, SEMA_GAVEUP, DRAIN, FLIP_FIFO, FLIP_REQ, PRESENT,
  GPU_ENCODE, GPU_WAIT, READBACK, GPU_EXEC) = range(1, 15)
+HLE, SPU_JOB = 15, 16
+BLIT = 17
 GPU_WAIT_KIND = {0: "gpu wait (flush)", 1: "gpu wait (present)", 2: "gpu wait (in-flight)"}
 
 SYSCALL_NAMES = {   # runtime/syscalls/lv2_syscall_table.h
@@ -34,7 +36,8 @@ SYSCALL_NAMES = {   # runtime/syscalls/lv2_syscall_table.h
 
 
 RSX_ROWS = ("acquire wait", "drain", "present", "encode (flush)", "encode (present)",
-            "gpu wait (flush)", "gpu wait (present)", "gpu wait (in-flight)", "readback")
+            "gpu wait (flush)", "gpu wait (present)", "gpu wait (in-flight)", "readback",
+            "swizzled blit (inside drain)")
 
 
 def load(path):
@@ -64,16 +67,28 @@ def main():
     ap.add_argument("--frames", type=int, default=3, help="frames drawn as a timeline")
     ap.add_argument("--ms-per-col", type=float, default=1.0)
     ap.add_argument("--threads", default="", help="PPU tids to draw (default: the six least blocked)")
+    ap.add_argument("--frame-source",choices=("flip","present"),default="flip",
+                    help="guest flip requests (legacy) or completed host presents")
     args = ap.parse_args()
 
     header, names, spans = load(args.trace)
     print(header)
-    flips = [s[4] for s in spans if s[0] == FLIP_REQ]
+    presents=[s[5] for s in spans if s[0]==PRESENT]
+    if len(presents)>=2:
+        intervals=[b-a for a,b in zip(presents,presents[1:])]
+        print(f"Host presents: {len(presents)}, interval mean {statistics.mean(intervals):.2f} ms "
+              f"({1000/statistics.mean(intervals):.2f} FPS), median {statistics.median(intervals):.2f} ms")
+        if len(intervals)>=3:
+            percentiles=statistics.quantiles(intervals,n=100,method="inclusive")
+            print(f"Host pacing: p95 {percentiles[94]:.2f} ms, p99 {percentiles[98]:.2f} ms, max {max(intervals):.2f} ms")
+    else:
+        print("Host-present timing unavailable; guest flip rates are NOT verified displayed FPS.")
+    flips = presents if args.frame_source=="present" else [s[4] for s in spans if s[0] == FLIP_REQ]
     if len(flips) < 3:
-        sys.exit("fewer than 3 flip requests in the window")
+        sys.exit(f"fewer than 3 {args.frame_source} events in the window")
     frames = list(zip(flips, flips[1:]))
     durs = [b - a for a, b in frames]
-    print(f"{len(frames)} frames, median {statistics.median(durs):.1f} ms "
+    print(f"{len(frames)} frames ({args.frame_source}), median {statistics.median(durs):.1f} ms "
           f"({1000 / statistics.median(durs):.1f} fps), min {min(durs):.1f}, max {max(durs):.1f}")
 
     # Per-frame totals, then the median of each.
@@ -117,6 +132,8 @@ def main():
                 acc[("rsx", GPU_WAIT_KIND.get(a, "gpu wait"))] += o
             elif k == READBACK:
                 acc[("rsx", "readback")] += o
+            elif k == BLIT:
+                acc[("rsx", "swizzled blit (inside drain)")] += o
         for t in tids:
             keys = [key for key in acc if key[0] == "ppu" and key[1] == t]
             for key in keys:
@@ -154,6 +171,26 @@ def main():
     print("  RSX / present thread:")
     for what in RSX_ROWS:
         print(f"    {what:20s} {mean(rsx[what]):5.1f}")
+
+    # Elapsed spans, not CPU usage: HLE may include callbacks, waits and nested
+    # guest execution. Keep this separate from the blocked-thread totals.
+    for kind, label in ((HLE, "HLE (tid, NID, LR)"), (SPU_JOB, "SPU jobs (image)")):
+        totals = collections.defaultdict(float)
+        counts = collections.Counter()
+        for k, who, a, b, t0, t1 in spans:
+            if k != kind:
+                continue
+            elapsed = overlap(t0, t1, flips[0], flips[-1])
+            if elapsed <= 0:
+                continue
+            key = (who, a, b) if kind == HLE else a
+            totals[key] += elapsed
+            counts[key] += 1
+        if totals:
+            print(f"  {label}: elapsed ms/frame (may overlap, NOT CPU utilization)")
+            for key in sorted(totals, key=totals.get, reverse=True)[:12]:
+                name = f"tid {key[0]} NID {key[1]:08X} LR {key[2]:08X}" if kind == HLE else f"image {key}"
+                print(f"    {name:44s} {totals[key] / n:8.2f} ms  {counts[key] / n:.1f} calls/frame")
 
     # GPU execution per command buffer (headless commits wait for each one).
     ex = [s for s in spans if s[0] == GPU_EXEC and flips[0] <= s[5] <= flips[-1]]

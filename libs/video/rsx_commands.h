@@ -251,6 +251,7 @@ typedef struct rsx_state {
     u32 surface_color_pitch[RSX_MAX_RENDER_TARGETS];
     u32 surface_zeta_offset;
     u32 surface_zeta_pitch;
+    u32 surface_zeta_dma; /* FEED0000 local / FEED0001 main, not a texture location */
     u32 surface_clip_x, surface_clip_y;
     u32 surface_clip_w, surface_clip_h;
     u32 color_target;

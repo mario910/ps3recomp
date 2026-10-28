@@ -708,6 +708,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * find the pushbuffer; NULL for every title that does not. */
         { extern void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
           if (g_spu_put_hook) g_spu_put_hook((uint32_t)ea, size); }
+        /* A PUT can replace a SPURS jump-to-self the host walker is parked on;
+         * wake it now instead of at its timeout. NULL unless enabled. */
+        { extern void (*g_spu_put_notify)(uint32_t ea, uint32_t size);
+          if (g_spu_put_notify) g_spu_put_notify((uint32_t)ea, size); }
         /* Bink sync-area watch (armed by the PPU barrier probe): log SPU PUTs
          * that touch the per-SPU lane counters. */
         { extern uint32_t g_barrier_sync_watch;

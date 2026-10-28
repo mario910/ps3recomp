@@ -55,6 +55,7 @@ u32 cellGcmResolveLocated(int location, u32 offset);
  * in the PS3's byte order, so these are the bottom of every fetch path. */
 float rsx_rd_bef(const u8* p);      /* 4-byte IEEE float          */
 float rsx_rd_half_be(const u8* p);  /* 2-byte IEEE half -> float  */
+void rsx_rd_cmp_be(const u8* p,float out[4]); /* packed signed 11/11/10 normal */
 
 /* Fetch attribute `idx` (0..15) of vertex `vi` as a float4 into `out`.
  *
@@ -67,6 +68,36 @@ float rsx_rd_half_be(const u8* p);  /* 2-byte IEEE half -> float  */
  * through the correct context DMA. Reads guest memory; requires vm_base.
  */
 void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4]);
+/* Decode a complete vertex in one call, bulk-copying constant attributes. */
+void rsx_fetch_vertex(const rsx_state* st, u32 vi, float out[16][4]);
+/* Per-draw plan. Descriptors and IO mappings must stay fixed until the draw
+ * completes, just like the indexed vertex memo below. Payload RAM is NOT
+ * cached: every non-memoized fetch still reads current guest bytes. */
+typedef struct {
+    u32 offset,stride,frequency,operation,type,size;
+    u32 page,ea_bias;
+    u8 idx,local,mapped;
+} rsx_vertex_planned_attr;
+typedef struct {
+    const rsx_state* state;
+    unsigned count;
+    rsx_vertex_planned_attr attrs[16];
+} rsx_vertex_draw_plan;
+void rsx_vertex_draw_plan_init(rsx_vertex_draw_plan* plan,const rsx_state* state);
+void rsx_fetch_vertex_planned(rsx_vertex_draw_plan* plan,u32 vi,float out[16][4]);
+/* Per-DRAW indexed-vertex memo. Never retain it across a state change or a
+ * later draw: vertex RAM and constant attribute registers are mutable. */
+typedef struct {
+    const rsx_state* state;
+    u64 valid;
+    u32 indices[64];
+    float vertices[64][16][4];
+    int planned;
+    rsx_vertex_draw_plan plan;
+} rsx_vertex_cache;
+void rsx_vertex_cache_init(rsx_vertex_cache* cache, const rsx_state* state);
+void rsx_vertex_cache_init_planned(rsx_vertex_cache* cache, const rsx_state* state);
+void rsx_fetch_vertex_cached(rsx_vertex_cache* cache, u32 vi, float out[16][4]);
 
 #ifdef __cplusplus
 }

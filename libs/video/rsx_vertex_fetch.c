@@ -25,6 +25,43 @@ float rsx_rd_half_be(const u8* p)
     float o; memcpy(&o, &f, 4); return o;
 }
 
+void rsx_rd_cmp_be(const u8* p,float out[4])
+{
+    /* RSX CMP32: signed X/Y in low 11-bit fields, Z in the high 10 bits.
+     * Expand into signed 16-bit lanes before dividing by 32767, matching
+     * RPCS3 RSXVertexFetch.glsl (not ordinary 10/11-bit endpoint SNORM).
+     * Never reinterpret this word as float: valid packed normals can have
+     * IEEE NaN bit patterns, blanking whole lit surfaces. */
+    u32 word=((u32)p[0]<<24)|((u32)p[1]<<16)|((u32)p[2]<<8)|p[3];
+    int x=(int)(word&0x7FFu),y=(int)((word>>11)&0x7FFu),z=(int)(word>>22);
+    if (x&0x400) x-=0x800;
+    if (y&0x400) y-=0x800;
+    if (z&0x200) z-=0x400;
+    out[0]=(float)(x*32)/32767.0f;
+    out[1]=(float)(y*32)/32767.0f;
+    out[2]=(float)(z*64)/32767.0f;
+    out[3]=1.0f;
+}
+
+static void rsx_decode_attrib(u32 type,u32 size,const u8* p,float out[4],int idx)
+{
+    u32 n=size?size:4;if(n>4)n=4;
+    switch(type) {
+    case 2: for(u32 k=0;k<n;++k)out[k]=rsx_rd_bef(p+k*4);break;
+    case 3: for(u32 k=0;k<n;++k)out[k]=rsx_rd_half_be(p+k*2);break;
+    case 4: for(u32 k=0;k<n;++k)out[k]=p[k]/255.0f;break;
+    case 1: for(u32 k=0;k<n;++k)out[k]=(float)(s16)((p[k*2]<<8)|p[k*2+1])/32767.0f;break;
+    case 5: for(u32 k=0;k<n;++k)out[k]=(float)(s16)((p[k*2]<<8)|p[k*2+1]);break;
+    case 6: rsx_rd_cmp_be(p,out);break;
+    case 7: for(u32 k=0;k<n;++k)out[k]=(float)p[k];break;
+    default:
+        { static int t=-1;if(t<0)t=getenv("VTX_TYPEDBG")?1:0;
+          if(t){static u32 seen=0;if(!(seen&(1u<<(type&31)))){seen|=1u<<(type&31);
+              fprintf(stderr,"[VTXTYPE] UNHANDLED type=%u attr=%d size=%u\n",type,idx,size);}} }
+        for(u32 k=0;k<n;++k)out[k]=rsx_rd_bef(p+k*4);break;
+    }
+}
+
 void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
 {
     /* A disabled attribute array feeds the CONSTANT vertex attribute register
@@ -73,37 +110,67 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
         ? cellGcmResolveLocated(0, off)   /* MAIN:  IO offset table          */
         : cellGcmResolveLocated(1, off)); /* LOCAL: VRAM, never the IO table */
 
-    u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
-    switch (a->type) {
-    case 2: /* CELL_GCM_VERTEX_F: float32 BE */
-        for (u32 k = 0; k < n; k++) out[k] = rsx_rd_bef(p + k * 4);
-        break;
-    case 3: /* SF: half float BE */
-        for (u32 k = 0; k < n; k++) out[k] = rsx_rd_half_be(p + k * 2);
-        break;
-    case 4: /* UB: u8 normalized [0,1] */
-        for (u32 k = 0; k < n; k++) out[k] = p[k] / 255.0f;
-        break;
-    case 1: /* S1: s16 normalized [-1,1] */
-        for (u32 k = 0; k < n; k++) {
-            s16 s = (s16)((p[k*2] << 8) | p[k*2+1]);
-            out[k] = (float)s / 32767.0f;
-        }
-        break;
-    case 5: /* S32K: s16 integer */
-        for (u32 k = 0; k < n; k++)
-            out[k] = (float)(s16)((p[k*2] << 8) | p[k*2+1]);
-        break;
-    case 7: /* UB256: u8 unnormalized */
-        for (u32 k = 0; k < n; k++) out[k] = (float)p[k];
-        break;
-    default:
-        { static int t = -1; if (t < 0) t = getenv("VTX_TYPEDBG") ? 1 : 0;
-          if (t) { static u32 seen = 0;
-              if (!(seen & (1u << (a->type & 31)))) { seen |= 1u << (a->type & 31);
-                  fprintf(stderr, "[VTXTYPE] UNHANDLED type=%u attr=%d size=%u stride=%u\n",
-                          a->type, idx, a->size, a->stride); } } }
-        for (u32 k = 0; k < n; k++) out[k] = rsx_rd_bef(p + k * 4);
-        break;
+    rsx_decode_attrib(a->type,a->size,p,out,idx);
+}
+
+void rsx_fetch_vertex(const rsx_state* st, u32 vi, float out[16][4])
+{
+    memcpy(out, st->vertex_data4f, sizeof(st->vertex_data4f));
+    if (!vm_base) return;
+    for (int n = 0; n < 16; ++n)
+        if (st->vertex_attribs[n].enabled && st->vertex_attribs[n].stride)
+            rsx_fetch_attrib(st, n, vi, out[n]);
+}
+
+void rsx_vertex_draw_plan_init(rsx_vertex_draw_plan* plan,const rsx_state* state)
+{
+    static int nofreq=-1;if(nofreq<0)nofreq=getenv("VP_NOFREQ")?1:0;
+    plan->state=state;plan->count=0;
+    for(unsigned n=0;n<16;++n){const rsx_vertex_attrib* a=&state->vertex_attribs[n];
+        if(!a->enabled || !a->stride)continue;
+        rsx_vertex_planned_attr* p=&plan->attrs[plan->count++];
+        p->idx=(u8)n;p->type=a->type;p->size=a->size;p->local=!(a->offset&0x80000000u);
+        p->offset=a->offset&0x7fffffffu;p->stride=a->stride;
+        p->frequency=nofreq?0:a->frequency;p->operation=(state->frequency_divider_op>>n)&1u;p->mapped=0;
     }
+}
+void rsx_fetch_vertex_planned(rsx_vertex_draw_plan* plan,u32 vi,float out[16][4])
+{
+    memcpy(out,plan->state->vertex_data4f,sizeof(plan->state->vertex_data4f));
+    if(!vm_base)return;
+    for(unsigned n=0;n<plan->count;++n){rsx_vertex_planned_attr* a=&plan->attrs[n];
+        u32 ei=vi;if(a->frequency>1)ei=a->operation?vi%a->frequency:vi/a->frequency;
+        u32 off=a->offset+ei*a->stride; /* Preserve the reference's 32-bit wrap. */
+        u32 page=off>>20;
+        if(!a->mapped || a->page!=page){
+            /* Resolve the actual element address, not an assumed aligned EA.
+             * cellGcmResolveLocated is affine within each 1-MiB IO page. */
+            a->ea_bias=cellGcmResolveLocated(a->local,off)-off;a->page=page;a->mapped=1;
+        }
+        rsx_decode_attrib(a->type,a->size,vm_base+(u32)(a->ea_bias+off),out[a->idx],a->idx);
+    }
+}
+
+void rsx_vertex_cache_init(rsx_vertex_cache* cache, const rsx_state* state)
+{
+    cache->state = state;
+    cache->planned=0;
+    cache->valid = 0; /* do not clear the 16 KiB payload */
+}
+void rsx_vertex_cache_init_planned(rsx_vertex_cache* cache,const rsx_state* state)
+{
+    rsx_vertex_cache_init(cache,state);rsx_vertex_draw_plan_init(&cache->plan,state);cache->planned=1;
+}
+
+void rsx_fetch_vertex_cached(rsx_vertex_cache* cache, u32 vi, float out[16][4])
+{
+    unsigned slot = vi & 63u;
+    u64 bit = (u64)1 << slot;
+    if (!(cache->valid & bit) || cache->indices[slot] != vi) {
+        if(cache->planned)rsx_fetch_vertex_planned(&cache->plan,vi,cache->vertices[slot]);
+        else rsx_fetch_vertex(cache->state, vi, cache->vertices[slot]);
+        cache->indices[slot] = vi;
+        cache->valid |= bit;
+    }
+    memcpy(out, cache->vertices[slot], sizeof cache->vertices[slot]);
 }

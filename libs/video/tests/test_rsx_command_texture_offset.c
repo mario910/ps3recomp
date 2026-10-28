@@ -34,6 +34,11 @@ int main(void)
 {
     rsx_state st;
     rsx_state_init(&st);
+    st.surface_dirty=0;
+    rsx_process_method(&st,NV4097_SET_CONTEXT_DMA_ZETA,0xFEED0001u);
+    check(st.surface_zeta_dma==0xFEED0001u && st.surface_dirty,"zeta DMA main and dirty flag preserved",st.surface_zeta_dma);
+    rsx_process_method(&st,NV4097_SET_CONTEXT_DMA_ZETA,0xFEED0000u);
+    check(st.surface_zeta_dma==0xFEED0000u,"zeta DMA local preserved",st.surface_zeta_dma);
 
     rsx_process_method(&st, 0x1A00 + 2 * 0x20, 0x82A22900u);
     check(st.textures[2].offset == 0x02A22900u, "fragment unit 2 offset 0x82A22900 stores as 0x02A22900", st.textures[2].offset);

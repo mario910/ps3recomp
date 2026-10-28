@@ -106,9 +106,17 @@ static uint32_t g_cache_ls, g_sp;
 
 /* The prologue every SPU function starts with: save $lr in the caller's
  * frame, then push a frame of its own and store the back chain. */
+static int expect_available_stack=1;
 static void job_entry(spu_context* ctx)
 {
     const uint32_t sp = ctx->gpr[1]._u32[0];
+    /* Real GCC prologue: an empty word1 spuriously reports stack overflow. */
+    if(expect_available_stack){
+        CHECK(ctx->gpr[1]._u32[1] >= 0x40u);
+        CHECK(ctx->gpr[1]._u32[1] <= sp);
+        const int32_t remaining = (int32_t)(ctx->gpr[1]._u32[1] - 0x40u);
+        CHECK(remaining >= 0);
+    }else CHECK(ctx->gpr[1]._u32[1] == 0);
     g_ran = 1;
     g_sp = sp;
     memcpy(ctx->ls + ((sp + 16u) & SPU_LS_MASK), &ctx->gpr[0], 16);   /* stqd $lr,16($sp) */
@@ -140,9 +148,27 @@ static void run_case(const char* name, uint16_t stack_qw, uint16_t scratch_qw)
 
 int main(void)
 {
+#ifdef _WIN32
+    _putenv_s("SPURS_JOB_ABI_STACK", "1");
+#else
+    setenv("SPURS_JOB_ABI_STACK", "1", 1);
+#endif
     run_case("default stack (sizeStack 0)", 0, 0);
     run_case("explicit stack, no scratch", 0x100, 0);
     run_case("stack and scratch", 0x80, 0x40);
+#ifndef _WIN32
+    unsetenv("SPURS_JOB_ABI_STACK");
+    setenv("SPURS_JOB_ABI_MIN_IMAGE","7",1);
+    run_case("selective ABI at inclusive image threshold",0,0);
+    setenv("SPURS_JOB_ABI_MIN_IMAGE","8",1);
+    expect_available_stack=0;
+    run_case("earlier images retain compatibility ABI",0,0);
+    setenv("SPURS_JOB_ABI_STAGE_IMAGE","7",1);
+    expect_available_stack=1;
+    run_case("stage marker enables real ABI",0,0);
+    unsetenv("SPURS_JOB_ABI_STAGE_IMAGE");
+    run_case("stage remains active for subsequent earlier image",0,0);
+#endif
 
     printf("spurs job stack: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

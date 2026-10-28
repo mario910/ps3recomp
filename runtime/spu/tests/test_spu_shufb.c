@@ -13,6 +13,14 @@ int main(void)
     return 0;
 #else
     srand(12345);
+    /* Exhaustive selectors at every destination byte, with distinguishable
+     * source bytes. Catches host/SPU ordering mistakes independently of RNG. */
+    for (unsigned selector=0;selector<256;++selector) {
+        u128 a,b,c;
+        for(unsigned i=0;i<16;++i){a._u8[i]=(uint8_t)(i+1);b._u8[i]=(uint8_t)(i+65);c._u8[i]=(uint8_t)selector;}
+        u128 actual=spu_shufb(a,b,c),expected=spu_shufb_ref(a,b,c);
+        if(memcmp(&actual,&expected,16)){printf("selector %u mismatch\n",selector);return 1;}
+    }
     for (int it = 0; it < 200000; it++) {
         u128 a, b, c;
         for (int i = 0; i < 16; i++) {

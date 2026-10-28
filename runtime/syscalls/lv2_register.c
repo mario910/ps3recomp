@@ -1878,12 +1878,14 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
      * the lookup fails outright and the title reports
      * "failed to SPURS printf server". It is debug output, not the path any
      * query result travels. */
-    { extern const uint8_t* spurs_job_ls_for_handle(uint32_t);
-      const uint8_t* jls = spurs_job_ls_for_handle(tid);
-      if (jls && value_ea && vm_base && ls_offset + type <= SPU_LS_SIZE) {
+    { extern int spurs_job_ls_read(uint32_t, uint32_t, size_t, uint8_t*);
+      uint8_t jls[8];
+      if (value_ea && vm_base && ls_offset <= SPU_LS_SIZE &&
+          type <= SPU_LS_SIZE - ls_offset &&
+          spurs_job_ls_read(tid, ls_offset, type < 8 ? type : 8, jls)) {
           uint64_t v = 0;
           for (uint32_t k = 0; k < type && k < 8; k++)
-              v = (v << 8) | jls[ls_offset + k];
+              v = (v << 8) | jls[k];
           for (int k = 0; k < 8; k++)
               vm_base[value_ea + k] = (uint8_t)(v >> (56 - 8 * k));
           { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_LSREAD_TRACE") ? 1 : 0;

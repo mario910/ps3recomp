@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/log_sample.h"
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -26,6 +27,18 @@
  * as opposed to the 64-byte context handshake DMAs. The dispatcher's
  * YDKJ_CRI_RESUME poll-loop watches this to know real work arrived. */
 int g_cri_video_dma = 0;
+static int async_log_full;
+static unsigned async_log_samples[3][65];
+__attribute__((constructor)) static void async_log_init(void)
+{
+    const char* mode=getenv("SPURS_ASYNC_TRACE");
+    async_log_full=mode ? (mode[0] && mode[0]!='0') :
+        (getenv("SPURS_TASKSET_TRACE")!=NULL || ps3_log_verbose());
+}
+static int async_log_message(unsigned stage,int image)
+{
+    return async_log_full || ps3_log_sample(&async_log_samples[stage][image>=0 && image<64?image:64],8);
+}
 
 /* ---- fingerprint ------------------------------------------------------- */
 
@@ -38,6 +51,56 @@ uint64_t spu_workload_fingerprint(const void* data, size_t n)
         h *= 1099511628211ULL;                     /* FNV prime */
     }
     return h;
+}
+
+/* Job chains repeatedly submit the same raw binaries. Re-hashing each byte
+ * with FNV's serial multiply is expensive for thousands of geometry jobs.
+ * A cache hit still compares EVERY byte, so in-place changes and address reuse
+ * cannot select stale lifted code. Thread-local ownership avoids a global
+ * lock on the dispatch path; storage is bounded to 16 SPU-sized images. */
+enum { JOB_FP_CACHE_SIZE = 16 };
+typedef struct {
+    const uint8_t* source;
+    uint8_t* copy;
+    uint32_t size;
+    uint64_t fingerprint;
+} JobFingerprintEntry;
+static _Thread_local JobFingerprintEntry s_job_fp_cache[JOB_FP_CACHE_SIZE];
+
+void spu_workload_clear_job_cache(void)
+{
+    for (unsigned i = 0; i < JOB_FP_CACHE_SIZE; ++i) {
+        free(s_job_fp_cache[i].copy);
+        memset(&s_job_fp_cache[i], 0, sizeof s_job_fp_cache[i]);
+    }
+}
+
+static uint64_t spu_job_fingerprint(const uint8_t* image, uint32_t size)
+{
+    JobFingerprintEntry* cache = s_job_fp_cache;
+    enum { CACHE_SIZE = JOB_FP_CACHE_SIZE };
+    static _Thread_local unsigned next;
+    if (size > SPU_LS_SIZE) return spu_workload_fingerprint(image, size);
+    unsigned slot = CACHE_SIZE;
+    for (unsigned i = 0; i < CACHE_SIZE; ++i) {
+        if (cache[i].source != image || cache[i].size != size) continue;
+        if (memcmp(cache[i].copy, image, size) == 0)
+            return cache[i].fingerprint;
+        slot = i;
+        break;
+    }
+    uint64_t fingerprint = spu_workload_fingerprint(image, size);
+    if (slot == CACHE_SIZE) slot = next++ % CACHE_SIZE;
+    if (cache[slot].size != size || !cache[slot].copy) {
+        uint8_t* copy = (uint8_t*)realloc(cache[slot].copy, size);
+        if (!copy) return fingerprint;
+        cache[slot].copy = copy;
+    }
+    memcpy(cache[slot].copy, image, size);
+    cache[slot].source = image;
+    cache[slot].size = size;
+    cache[slot].fingerprint = fingerprint;
+    return fingerprint;
 }
 
 /* ---- registry ---------------------------------------------------------- */
@@ -487,7 +550,7 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
     spu_coh_notify_write(taskset_ea);
     spu_lockline_unlock();
     for (int i = 0; i < n_start; i++) {
-        fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
+        if(async_log_message(0,64))fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
                         "(after task %u exited)\n", start_t[i], taskset_ea, start_elf[i], done_task);
         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = start_t[i];
         spu_workload_dispatch_async(vm_base + start_elf[i], (uint32_t)start_sz[i], start_ctx[i]);
@@ -702,9 +765,9 @@ static void spu_async_run(spu_async_job* j)
                  * both audio tasks run task 1's descriptor). */
                 if (j->taskset_ea) {
                     spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
-                    fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
+                    if(async_log_message(1,j->image_id)){fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
                             "taskset=0x%08X task=%u\n", j->image_id,
-                            j->taskset_ea, j->taskid); fflush(stderr);
+                            j->taskset_ea, j->taskid); fflush(stderr);}
                 }
             }
             /* ---- Bink-layer probe + real-policy A/B (image 3 = binkspu) ----
@@ -842,7 +905,7 @@ static void spu_async_run(spu_async_job* j)
                   FILE* f = fopen(path, "wb");
                   if (f) { fwrite(ls, 1, SPU_LS_SIZE, f); fclose(f);
                       fprintf(stderr, "[spu_workload] wrote local store -> %s\n", path); } } }
-            fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
+            if(rc || async_log_message(2,j->image_id))fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
                     "(job ran to completion, did not loop)\n", j->image_id, rc);
             spu_serial_release();
             if (j->taskset_ea) spu_taskset_task_exited(j->taskset_ea, j->taskid);
@@ -879,12 +942,20 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
 static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
 #endif
 
+int spu_workload_job_image(const uint8_t* image, uint32_t size)
+{
+    int id = -1;
+    if (image && size && size <= SPU_LS_SIZE)
+        spu_workload_find_img(spu_job_fingerprint(image, size), &id);
+    return id;
+}
+
 int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
                               uint32_t job_ea, uint32_t job_desc_size)
 {
     if (!image || image_size == 0) return 0;
 
-    uint64_t fp = spu_workload_fingerprint(image, image_size);
+    uint64_t fp = spu_job_fingerprint(image, image_size);
     spu_lifted_entry_fn fn = NULL;
     int image_id = 0;
     for (unsigned i = 0; i < s_registry_count; i++)
@@ -1359,7 +1430,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
         if ((j->r3[0] >> 16) == 0x40) j->have_r3 = 1;   /* valid marker */
     }
 
-    fprintf(stderr,
+    if(async_log_message(0,image_id))fprintf(stderr,
         "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
         (unsigned long long)fp, args_ea, image_id);
     if (args_ea) { extern uint8_t* vm_base; const uint8_t* c = vm_base + args_ea;

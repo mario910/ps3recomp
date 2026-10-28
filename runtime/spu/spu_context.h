@@ -186,6 +186,10 @@ typedef struct spu_context {
      * spurs_policy.c memsets and calls the init immediately after; keep it so. */
     SPU_ALIGN16 uint8_t ls_store[SPU_LS_SIZE];
     uint8_t* ls;
+    /* Private MFC engine, published on first channel access. The context's
+     * execution owner retains it until spu_mfc_release; directory lookup is
+     * not needed on every DMA register write. Not a hardware/SPU-id cache. */
+    void* mfc_private;
 
     /* Program counter (local store address, 0-0x3FFFF) */
     uint32_t pc;
@@ -537,15 +541,27 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
     }
 }
 
+/* The env-armed LS debug probes (SPU_LS_WATCH, SPU_SMC_WATCH, the WWS policy
+ * dumps) cost several global and ctx re-reads per LS access: the byte-wise LS
+ * stores may alias them. A build may compile hot lifted images with
+ * SPU_LS_DEBUG_HOOKS=0; those images then ignore the probes, nothing else. */
+#ifndef SPU_LS_DEBUG_HOOKS
+#define SPU_LS_DEBUG_HOOKS 1
+#endif
+
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
+#if SPU_LS_DEBUG_HOOKS
     if (__builtin_expect(g_spu_ls_probe != 0, 0) || (ctx->image_id == 2 && ctx->policy_mode))
         spu_ls_read_probe(ctx, lsa);
+#endif
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
+#if SPU_LS_DEBUG_HOOKS
     spu_ls_watch_hit2(lsa, 0, p, (uint32_t)ctx->pc & SPU_LS_MASK,
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+#endif
 #if SPU_LS_FAST
     uint32_t w0, w1, w2, w3;
     memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
@@ -626,8 +642,10 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
      * why it resolves to an empty buffer: the resolved address, the whole
      * bufferSetArray (0xDF0), and the live loadCommands (0xC00) whose RunJob
      * command (commandNum==5) names the code buffer set. */
+#if SPU_LS_DEBUG_HOOKS
     if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode)
         spu_ls_write_probe_pre(ctx, lsa, val);
+#endif
 #if SPU_LS_FAST
     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
     uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
@@ -642,10 +660,12 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 3] = (uint8_t)w;
     }
 #endif
+#if SPU_LS_DEBUG_HOOKS
     spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK);
     if (__builtin_expect(g_spu_smc_watch != 0, 0))
         spu_ls_write_probe_smc(ctx, lsa, p);
+#endif
 }
 
 /* ---------------------------------------------------------------------------

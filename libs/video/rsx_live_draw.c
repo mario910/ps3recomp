@@ -103,6 +103,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <d3d12sdklayers.h>
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
+#include "rsx_pso_disk_cache.h"
 #include "rsx_vertex_formats.h"
 #include <sys/stat.h>
 
@@ -4581,8 +4582,7 @@ static ID3D12PipelineState* build_pso(
     g_ld_profile.total.create_pso_calls++;
     const LONGLONG create_begin = ld_profile_qpc();
 #endif
-    HRESULT hr = g.dev->lpVtbl->CreateGraphicsPipelineState(
-        g.dev, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+    HRESULT hr = rsx_pso_create_graphics(g.dev, &pd, &pso);
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.create_pso_qpc +=
         (u64)(ld_profile_qpc() - create_begin);

@@ -80,7 +80,17 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
  * test that stores through vm_write* paying one compare against a hot global.
  * Written once, under the lock; read unlocked, where a stale zero costs at most
  * one missed event on the very first reservation of the run. */
-static int s_coh_armed;
+#if defined(_MSC_VER)
+__declspec(align(64))
+#endif
+static struct {
+    int value;
+    unsigned char padding[64 - sizeof(int)];
+} s_coh_armed
+#if !defined(_MSC_VER)
+__attribute__((aligned(64)))
+#endif
+;
 
 /* Every live virtual context may retain a reservation between scheduling
  * quanta; physical SPU count is not a bound on this set. All access is under
@@ -96,8 +106,15 @@ unsigned long g_spu_lr_raise = 0;
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
-    s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
-    s_coh_armed = 1;
+    const unsigned char mask = (unsigned char)(1u << (line & 7));
+    /* Append-only lookup data is read on every PPU store. Rewriting an
+     * already-set bit/armed flag on every GETLLAR invalidates those cache
+     * lines on all PPU cores even though the lookup result never changed.
+     * Holder registration below must still run on EVERY reservation. */
+    if (!(__atomic_load_n(&s_coh_bitmap[line >> 3], __ATOMIC_ACQUIRE) & mask))
+        __atomic_fetch_or(&s_coh_bitmap[line >> 3], mask, __ATOMIC_RELEASE);
+    if (!__atomic_load_n(&s_coh_armed.value, __ATOMIC_ACQUIRE))
+        __atomic_store_n(&s_coh_armed.value, 1, __ATOMIC_RELEASE);
 
     if (!ctx) return;
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next)
@@ -170,9 +187,9 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
 
 int spu_coh_is_reserved(uint32_t addr)
 {
-    if (!s_coh_armed) return 0;
+    if (!__atomic_load_n(&s_coh_armed.value, __ATOMIC_ACQUIRE)) return 0;
     uint32_t line = addr >> SPU_COH_LINE_SHIFT;
-    return (s_coh_bitmap[line >> 3] >> (line & 7)) & 1u;
+    return (__atomic_load_n(&s_coh_bitmap[line >> 3], __ATOMIC_ACQUIRE) >> (line & 7)) & 1u;
 }
 
 /* A DMA PUT is issued BY an SPU, and hardware does not take that SPU's own

@@ -1,7 +1,33 @@
 /* Concurrent per-context MFC ownership, including more than eight live
  * contexts and stalled lists retained across interleaved context use. */
 
+#include <stdlib.h>
+#ifdef _WIN32
+#include <windows.h>
+typedef HANDLE pthread_t;
+typedef struct {void*(*fn)(void*);void* arg;} fixture_thread_start;
+static DWORD WINAPI fixture_thread_thunk(void* value)
+{
+    fixture_thread_start copy=*(fixture_thread_start*)value;free(value);
+    copy.fn(copy.arg);return 0;
+}
+static int pthread_create(pthread_t* out,void* attr,void*(*fn)(void*),void* arg)
+{
+    (void)attr;
+    fixture_thread_start* start=malloc(sizeof(*start));if(!start)return -1;
+    start->fn=fn;start->arg=arg;
+    *out=CreateThread(NULL,0,fixture_thread_thunk,start,0,NULL);
+    if(!*out){free(start);return -1;}return 0;
+}
+static int pthread_join(pthread_t thread,void** result)
+{
+    (void)result;
+    if(WaitForSingleObject(thread,30000)!=WAIT_OBJECT_0) exit(3);
+    CloseHandle(thread);return 0;
+}
+#else
 #include <pthread.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +45,30 @@ uint32_t ppu_vm_size = 0;
  * Harness
  * -----------------------------------------------------------------------*/
 static int g_pass, g_fail;
+static unsigned fixture_mfc_nodes(void)
+{
+    unsigned n=0;
+    for(unsigned bucket=0;bucket<MFC_DIRECTORY_BUCKETS;++bucket)
+        for(spu_mfc_slot* slot=s_mfc_directory[bucket].state.slots;slot;slot=slot->next)++n;
+    return n;
+}
+/* Win32 wait objects are inline; the POSIX compatibility layer lazily owns
+ * pthread objects. These fixture contexts have no remaining waiters. */
+static void fixture_free_context(spu_context* ctx)
+{
+#ifndef _WIN32
+    if(ctx->ch_wait_cv){
+        ps3_condvar* cv=ctx->ch_wait_cv;
+        if(pthread_cond_destroy(&cv->c) || pthread_mutex_destroy(&cv->m))abort();
+        free(cv);
+    }
+    if(ctx->ch_wait_lock){
+        if(pthread_rwlock_destroy(ctx->ch_wait_lock))abort();
+        free(ctx->ch_wait_lock);
+    }
+#endif
+    free(ctx);
+}
 
 static void check(int ok, const char* what)
 {
@@ -207,17 +257,18 @@ int main(void)
     helde[3]->queue_count = 7;
     helde[3]->tag_completed = 0;
     spu_mfc_release(held[3]);
+    CHECK(held[3]->mfc_private == NULL);
     mfc_engine* reusere = mfc_for(held[3]);
     CHECK(reusere->queue_count == 0);
     CHECK(reusere->tag_completed == 0xFFFFFFFFu);
     for (int i = 0; i < NCTX; i++) {
         spu_mfc_release(held[i]);
         spu_mfc_release(held[i]); /* idempotent, before a fresh claim */
-        free(held[i]);
+        fixture_free_context(held[i]);
     }
-    free(idle);
+    fixture_free_context(idle);
     for (int r = 0; r < ROUNDS; r++)
-        for (int w = 0; w < NCTX; w++) free(g_ctx[r][w]);
+        for (int w = 0; w < NCTX; w++) fixture_free_context(g_ctx[r][w]);
 
     /* Thread-exit cleanup forgets all abandoned owners in a stack range,
      * including adjacent list nodes, and preserves owners outside that range. */
@@ -230,14 +281,14 @@ int main(void)
     spu_mfc_forget_range((uintptr_t)range, (uintptr_t)(range + 3));
     CHECK(mfc_for(outside) == outside_engine);
     CHECK(outside_engine->tag_completed == 0x12345678);
-    CHECK(s_mfc_slots && s_mfc_slots->ctx == outside && !s_mfc_slots->next);
+    CHECK(fixture_mfc_nodes()==1 && mfc_bucket_for(outside)->state.slots->ctx==outside);
     free(range);
     spu_mfc_release(outside);
     free(outside);
 
     for (unsigned i = 0; i < 12; ++i) {
         CHECK(spu_run_lifted_job_img(transient_job, NULL, 0, 0) == 0);
-        CHECK(s_mfc_slots == NULL); /* stack context actually relinquished its node */
+        CHECK(fixture_mfc_nodes()==0); /* stack context actually relinquished its node */
     }
     printf("SPU MFC engine slots: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

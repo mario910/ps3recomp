@@ -346,8 +346,10 @@ void spu_depth_guard(spu_context* ctx)
      * not "where are we" but "what cycle got us here" -- one pc names a point,
      * a ring names the loop. */
     enum { RING = 24 };
-    static uint32_t s_ring[RING];
-    static uint32_t s_n;
+    /* Per host thread: this runs on every drain of every SPU worker, and a
+     * shared ring made them all write one cache line. */
+    static SPU_THREAD_LOCAL uint32_t s_ring[RING];
+    static SPU_THREAD_LOCAL uint32_t s_n;
     s_ring[s_n % RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
     s_n++;
 
@@ -396,6 +398,43 @@ int spu_tailret_enabled(void)
 typedef void (*spu_drain_fn)(spu_context*);
 extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
 
+/* The two per-step hooks of this loop, as the loop runs them hundreds of
+ * times per job (image41 ~540 steps, image39 ~9800). Same effects as calling
+ * yz_lockstep_tick then spu_task_launch_check: the full check still runs for
+ * any armed trace, the pm flow context, and a step to LS 0 (job end); the
+ * stack-reset scan is skipped only while nothing is registered for it. */
+extern volatile int g_yz_lockstep_on;
+extern volatile unsigned g_spu_stack_reset_n;
+extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
+static int spu_launch_check_slow(void)
+{
+    static int s = -1;
+    if (s < 0) {
+        const char* fast = getenv("SPU_DRAIN_FASTPATH");   /* 0 = always full hooks */
+        s = (getenv("SPU_EXITTRACE") || getenv("SPU_STEPTRACE") ||
+             getenv("SPU_JOBDRAIN") || (fast && fast[0] == '0')) ? 1 : 0;
+    }
+    return s;
+}
+static int spu_launch_no_ls0(void)
+{
+    static int s = -1;
+    if (s < 0) s = getenv("SPU_NO_LS0_END") ? 1 : 0;
+    return s;
+}
+static inline void spu_step_hooks(spu_context* ctx, void* fn)
+{
+    if (g_yz_lockstep_on != 0) yz_lockstep_tick(ctx);
+    if (spu_launch_check_slow() || g_pm_flow_ctx == (void*)ctx ||
+        (ctx->pc & SPU_LS_MASK) == 0) {
+        spu_task_launch_check(ctx, fn);
+        return;
+    }
+    t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+    if (g_spu_stack_reset_n) spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
+    if (!spu_launch_no_ls0()) ctx->steps++;
+}
+
 void spu_drain_call(spu_context* ctx, uint32_t return_pc)
 {
     spu_depth_guard(ctx);
@@ -417,8 +456,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             void (*fn)(spu_context*) = g_spu_trampoline_fn;
             g_spu_trampoline_fn = 0;
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
-            yz_lockstep_tick(ctx);
-            spu_task_launch_check(ctx, (void*)fn);
+            spu_step_hooks(ctx, (void*)fn);
             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
                 if (!ctx->int_enable) {   /* taken (a take clears the enable; a deferral leaves it) */
