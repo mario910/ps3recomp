@@ -2909,8 +2909,29 @@ static int jc_parallel_list(u32 chain, u32 first, u32 count, u32 stride, int ind
                               first, count, stride, chain, index, jc_pool_job);
 }
 
-/* Adjacent JOBLIST commands are not barriers. Only audited geometry image
- * 41 is eligible; never look through JTS/SYNC/FLUSH/JOB/branches/guards.
+/* SPURS_MERGE_EXTRA_IMAGES=39,36,34: images, besides geometry image 41, whose
+ * adjacent lists may be merged into one pool batch. Such titles often publish
+ * one job per JOBLIST command; on hardware consecutive commands without a
+ * barrier already run on different SPUs, but the walker ran them one by one. */
+static uint64_t jc_merge_extra_images(void)
+{
+    static uint64_t mask = UINT64_MAX;
+    uint64_t m = __atomic_load_n(&mask, __ATOMIC_RELAXED);
+    if (m != UINT64_MAX) return m;
+    m = 0;
+    for (const char* e = getenv("SPURS_MERGE_EXTRA_IMAGES"); e && *e;) {
+        char* end; long id = strtol(e, &end, 10);
+        if (end == e) break;
+        if (id > 0 && id < 64) m |= 1ull << id;
+        e = *end == ',' ? end + 1 : end;
+    }
+    __atomic_store_n(&mask, m, __ATOMIC_RELAXED);
+    return m;
+}
+
+/* Adjacent JOBLIST commands are not barriers. Geometry image 41 and the
+ * SPURS_MERGE_EXTRA_IMAGES set are eligible; never look through
+ * JTS/SYNC/FLUSH/JOB/branches/guards.
  * Bounded lookahead reads already-published command/descriptors, not results. */
 static int jc_merged_lists(u32 chain, u32 pc, int first_index, u32* list_count, u32* job_count)
 {
@@ -2949,8 +2970,10 @@ static int jc_merged_lists(u32 chain, u32 pc, int first_index, u32* list_count, 
         if (prior != n) break;
         u64 raw = vm_read64(first);
         u32 binary = (u32)(raw & ~7ull), size_qw = vm_read32(first + 8) >> 16;
-        if (!binary || (raw & ~7ull) >= 0x10000000ull || !size_qw || size_qw > SPU_LS_SIZE/16 ||
-            spu_workload_job_image(vm_base + binary, size_qw << 4) != 41) break;
+        if (!binary || (raw & ~7ull) >= 0x10000000ull || !size_qw || size_qw > SPU_LS_SIZE/16) break;
+        const int list_image = spu_workload_job_image(vm_base + binary, size_qw << 4);
+        if (list_image != 41 &&
+            !(list_image > 0 && list_image < 64 && (jc_merge_extra_images() >> list_image & 1))) break;
         unsigned j = 1;
         for (; j < count; ++j)
             if (vm_read64(first + j*stride) != raw ||
