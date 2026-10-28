@@ -313,7 +313,7 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
     /* Stage directly into the job's own zeroed local store. The old path
      * calloc'ed a second 256 KiB store, then zeroed ctx and copied all of it
      * again. Per-job ownership and the guest bytes are unchanged. */
-    spu_context_init(ctx,0);
+    spu_context_init_keep_ls_prefix(ctx,0,size_bin);   /* the binary covers [0, size_bin) */
     ctx->image_id=image_id;
     uint8_t* ls=ctx->ls;
 

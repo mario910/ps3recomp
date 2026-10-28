@@ -435,6 +435,21 @@ static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
     ctx->status = SPU_STATUS_STOPPED;
 }
 
+/* Same result as spu_context_init, except LS bytes [0, keep) are left as they
+ * are: for a caller that overwrites exactly that prefix next (SPURS job
+ * staging copies the job binary to LS 0), zeroing it first is wasted work. */
+static inline void spu_context_init_keep_ls_prefix(spu_context* ctx, uint32_t spu_id, uint32_t keep)
+{
+    if (keep > SPU_LS_SIZE) keep = SPU_LS_SIZE;
+    memset(ctx->gpr, 0, sizeof(ctx->gpr));
+    memset(ctx->ls_store + keep, 0, SPU_LS_SIZE - keep);
+    uint8_t* after = (uint8_t*)ctx->ls_store + SPU_LS_SIZE;
+    memset(after, 0, (size_t)((uint8_t*)(ctx + 1) - after));
+    ctx->ls     = ctx->ls_store;
+    ctx->spu_id = spu_id;
+    ctx->status = SPU_STATUS_STOPPED;
+}
+
 /* ---------------------------------------------------------------------------
  * Local store access helpers
  * -----------------------------------------------------------------------*/

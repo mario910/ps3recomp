@@ -64,6 +64,8 @@ typedef struct {
     uint8_t* copy;
     uint32_t size;
     uint64_t fingerprint;
+    int guard;              /* write-guard index, -1 = none (Windows) */
+    long writes;            /* that guard's write count when last validated */
 } JobFingerprintEntry;
 static _Thread_local JobFingerprintEntry s_job_fp_cache[JOB_FP_CACHE_SIZE];
 
@@ -75,6 +77,98 @@ void spu_workload_clear_job_cache(void)
     }
 }
 
+/* Write guard for cached job binaries (Windows). A cache hit used to memcmp the
+ * whole binary on every dispatch -- ~59 KB per geometry job, a measurable share
+ * of the menu's CPU time. Instead the binary's guest pages are made read-only
+ * once it is cached; any write to them (PPU or DMA) faults, and the handler
+ * below restores the protection and bumps the range's write count before the
+ * write proceeds. A hit then needs only: still protected, count unchanged.
+ * Every byte stays covered -- the comparison is replaced by write detection,
+ * not by sampling. A range written more than SPU_JOB_FP_REGUARD times stays
+ * unguarded (memcmp path), so pages shared with hot data cost nothing extra.
+ * SPU_JOB_FP_GUARD=0 disables it. The handler must run before the VM's
+ * commit-on-demand handler, which would otherwise just make the page writable:
+ * it is added (as first) when the first range is guarded, after VM setup. */
+#ifdef _WIN32
+enum { JOB_FP_GUARDS = 32, SPU_JOB_FP_REGUARD = 4 };
+typedef struct {
+    uintptr_t lo, hi;              /* page-aligned host range */
+    volatile LONG writes;          /* faults seen; a cached validation records it */
+    volatile LONG guarded;
+    LONG reguards;
+    DWORD old_protect;
+} JobFpGuard;
+extern uint8_t* vm_base;
+static JobFpGuard s_fp_guards[JOB_FP_GUARDS];
+static volatile LONG s_fp_guard_count;
+static SRWLOCK s_fp_guard_lock = SRWLOCK_INIT;
+static int s_fp_guard_mode = -1;
+
+static LONG CALLBACK job_fp_guard_veh(EXCEPTION_POINTERS* info)
+{
+    const EXCEPTION_RECORD* r = info->ExceptionRecord;
+    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2 ||
+        r->ExceptionInformation[0] != 1)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const uintptr_t addr = (uintptr_t)r->ExceptionInformation[1];
+    const LONG n = s_fp_guard_count;
+    for (LONG i = 0; i < n; i++) {
+        JobFpGuard* g = &s_fp_guards[i];
+        if (addr < g->lo || addr >= g->hi || !g->guarded) continue;
+        AcquireSRWLockExclusive(&s_fp_guard_lock);
+        if (g->guarded) {
+            DWORD ignored;
+            InterlockedIncrement(&g->writes);
+            VirtualProtect((void*)g->lo, g->hi - g->lo, g->old_protect, &ignored);
+            InterlockedExchange(&g->guarded, 0);
+        }
+        ReleaseSRWLockExclusive(&s_fp_guard_lock);
+        return EXCEPTION_CONTINUE_EXECUTION;   /* the write retries on a writable page */
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* Guard index for [image, image+size), protected if allowed; -1 if not. */
+static int job_fp_guard(const uint8_t* image, uint32_t size)
+{
+    if (s_fp_guard_mode < 0) {
+        const char* e = getenv("SPU_JOB_FP_GUARD");
+        s_fp_guard_mode = !(e && e[0] == '0');
+    }
+    if (!s_fp_guard_mode) return -1;
+    const uintptr_t lo = (uintptr_t)image & ~(uintptr_t)0xFFF;
+    const uintptr_t hi = ((uintptr_t)image + size + 0xFFF) & ~(uintptr_t)0xFFF;
+    int found = -1;
+    AcquireSRWLockExclusive(&s_fp_guard_lock);
+    for (LONG i = 0; i < s_fp_guard_count; i++)
+        if (s_fp_guards[i].lo == lo && s_fp_guards[i].hi == hi) { found = (int)i; break; }
+    if (found < 0 && s_fp_guard_count < JOB_FP_GUARDS) {
+        static int veh_added;
+        if (!veh_added) { AddVectoredExceptionHandler(1, job_fp_guard_veh); veh_added = 1; }
+        found = (int)s_fp_guard_count;
+        s_fp_guards[found].lo = lo; s_fp_guards[found].hi = hi;
+        InterlockedIncrement(&s_fp_guard_count);
+    }
+    if (found >= 0) {
+        JobFpGuard* g = &s_fp_guards[found];
+        if (!g->guarded && g->reguards < SPU_JOB_FP_REGUARD) {
+            DWORD old;
+            if (VirtualProtect((void*)lo, hi - lo, PAGE_READONLY, &old)) {
+                if (!g->reguards) g->old_protect = old;
+                g->reguards++;
+                { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
+                    fprintf(stderr, "[spu_workload] job binary write-guard #%d: guest %08X+%X (writes so far %ld)\n",
+                            found, (unsigned)((uintptr_t)image - (uintptr_t)vm_base), size, (long)g->writes); }
+                InterlockedExchange(&g->guarded, 1);
+            }
+        }
+        if (!g->guarded) found = -1;
+    }
+    ReleaseSRWLockExclusive(&s_fp_guard_lock);
+    return found;
+}
+#endif
+
 static uint64_t spu_job_fingerprint(const uint8_t* image, uint32_t size)
 {
     JobFingerprintEntry* cache = s_job_fp_cache;
@@ -84,11 +178,28 @@ static uint64_t spu_job_fingerprint(const uint8_t* image, uint32_t size)
     unsigned slot = CACHE_SIZE;
     for (unsigned i = 0; i < CACHE_SIZE; ++i) {
         if (cache[i].source != image || cache[i].size != size) continue;
+#ifdef _WIN32
+        if (cache[i].guard >= 0) {
+            const JobFpGuard* g = &s_fp_guards[cache[i].guard];
+            if (g->guarded && g->writes == cache[i].writes) return cache[i].fingerprint;
+        }
+        const int guard = job_fp_guard(image, size);
+        const long writes = guard >= 0 ? s_fp_guards[guard].writes : 0;
+        if (memcmp(cache[i].copy, image, size) == 0) {
+            cache[i].guard = guard; cache[i].writes = writes;
+            return cache[i].fingerprint;
+        }
+#else
         if (memcmp(cache[i].copy, image, size) == 0)
             return cache[i].fingerprint;
+#endif
         slot = i;
         break;
     }
+#ifdef _WIN32
+    const int guard = job_fp_guard(image, size);
+    const long writes = guard >= 0 ? s_fp_guards[guard].writes : 0;
+#endif
     uint64_t fingerprint = spu_workload_fingerprint(image, size);
     if (slot == CACHE_SIZE) slot = next++ % CACHE_SIZE;
     if (cache[slot].size != size || !cache[slot].copy) {
@@ -100,6 +211,11 @@ static uint64_t spu_job_fingerprint(const uint8_t* image, uint32_t size)
     cache[slot].source = image;
     cache[slot].size = size;
     cache[slot].fingerprint = fingerprint;
+#ifdef _WIN32
+    cache[slot].guard = guard; cache[slot].writes = writes;
+#else
+    cache[slot].guard = -1;
+#endif
     return fingerprint;
 }
 
