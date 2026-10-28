@@ -831,6 +831,8 @@ void spu_ch_wake(spu_context* ctx);
  * SPU_HOST_DEPTH_MAX overrides the limit. */
 void spu_depth_guard(spu_context* ctx);
 int  spu_tailret_enabled(void);
+extern int g_spu_tailret;                              /* -1 until spu_tailret_enabled ran */
+void spu_drain_step_hooks(spu_context* ctx, void* fn); /* spu_drain.c: lockstep + launch check */
 /* Take a pending SPU interrupt (spu_drain.c): srr0 <- ctx->pc, int_enable <- 0,
  * decode the guest-planted branch at LS 0 into ctx->pc, and return the
  * dispatcher to run instead of the interrupted transfer. Returns `tf`
@@ -899,7 +901,8 @@ static inline void spu_pchist_tick(const spu_context* ctx)
              * matching brsl/bisl never pops and a poll loop nests a frame \
              * per iteration until the host stack dies. Off by default --  \
              * this changes core dispatch for every title. */              \
-            if (spu_tailret_enabled() && (ctx)->host_depth > 0 &&          \
+            if ((g_spu_tailret >= 0 ? g_spu_tailret : spu_tailret_enabled()) && \
+                (ctx)->host_depth > 0 &&                                   \
                 (((uint32_t)(ctx)->pc & SPU_LS_MASK) ==                    \
                  ((ctx)->gpr[0]._u32[0] & SPU_LS_MASK))) {                 \
                 g_spu_trampoline_fn = 0;                                   \
@@ -907,8 +910,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
             }                                                              \
             void (*_tf)(spu_context*) = g_spu_trampoline_fn;    \
             g_spu_trampoline_fn = 0;                            \
-            yz_lockstep_tick(ctx);                             \
-            spu_task_launch_check((ctx), (void*)_tf);          \
+            spu_drain_step_hooks((ctx), (void*)_tf);           \
             if ((ctx)->int_enable &&                            \
                 ((ctx)->event_status & (ctx)->event_mask))      \
                 _tf = spu_take_interrupt((ctx), _tf);          \

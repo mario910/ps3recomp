@@ -372,11 +372,11 @@ void spu_depth_guard(spu_context* ctx)
 }
 
 /* See spu_context.h. Env-gated: SPU_TAILRET=1. */
+int g_spu_tailret = -1;   /* cached SPU_TAILRET for SPU_DRAIN's per-step test */
 int spu_tailret_enabled(void)
 {
-    static int s_on = -1;
-    if (s_on < 0) { const char* e = getenv("SPU_TAILRET"); s_on = (e && e[0] == 0x31) ? 1 : 0; }
-    return s_on;
+    if (g_spu_tailret < 0) { const char* e = getenv("SPU_TAILRET"); g_spu_tailret = (e && e[0] == 0x31) ? 1 : 0; }
+    return g_spu_tailret;
 }
 
 /* A return may use any register, not only r0. Running that branch target
@@ -437,6 +437,13 @@ static inline void spu_step_hooks(spu_context* ctx, void* fn)
     t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     if (g_spu_stack_reset_n) spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
     if (!spu_launch_no_ls0()) ctx->steps++;
+}
+
+/* The same hooks for SPU_DRAIN (spu_context.h), the top-level driver loop:
+ * one call per step instead of yz_lockstep_tick + spu_task_launch_check. */
+void spu_drain_step_hooks(spu_context* ctx, void* fn)
+{
+    spu_step_hooks(ctx, fn);
 }
 
 void spu_drain_call(spu_context* ctx, uint32_t return_pc)
