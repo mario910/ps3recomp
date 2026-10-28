@@ -212,6 +212,9 @@ typedef struct IoMapping {
 
 static IoMapping s_io_mappings[CELL_GCM_MAX_IO_MAPPINGS];
 static int s_io_mapping_count = 0;
+/* Bumped (release) after every change to s_io_mappings, so readers on SPU
+ * threads can cache a compact view of the active mappings. */
+static unsigned s_io_gen = 1;
 
 /* Callback handlers — these are GUEST OPD addresses passed by the
  * recompiled game, not host function pointers. Stored as uint32_t and
@@ -519,6 +522,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
 
     s_local_mem_allocated = 0;
     s_io_mapping_count = 0;
+    __atomic_fetch_add(&s_io_gen, 1, __ATOMIC_RELEASE);   /* see gcm_note_spu_put */
     /* Unmapped = 0xFFFF. The tables are static (zero-initialized), so without
      * this every unmapped EA page silently aliased io page 0 (and vice versa),
      * producing plausible-but-wrong offsets instead of a translation failure. */
@@ -553,6 +557,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
         s_io_mappings[0].size   = ioSize;
         s_io_mappings[0].active = 1;
         s_io_mapping_count = 1;
+        __atomic_fetch_add(&s_io_gen, 1, __ATOMIC_RELEASE);   /* see gcm_note_spu_put */
     }
 
     /* Zero the guest-visible control register (put/get/ref). */
@@ -1510,11 +1515,47 @@ void gcm_forget_spu_blocks(void)
     s_spu_blk_w = 0;
 }
 
+/* Compact, immutable view of the active IO mappings for gcm_note_spu_put. It
+ * runs on EVERY SPU PUT; scanning all 512 slots there cost ~5% of the active
+ * CPU time in Buzz's menu, almost all of it for vertex/index PUTs into RSX
+ * local memory, which no mapping covers. Rebuilt when s_io_gen moves; old
+ * views are leaked (mappings change a handful of times per run). */
+typedef struct { unsigned gen; u32 n, lo, hi; struct { u32 ea, size, io; } m[CELL_GCM_MAX_IO_MAPPINGS]; } GcmIoView;
+static GcmIoView* volatile s_io_view;
+
+static const GcmIoView* gcm_io_view(void)
+{
+    const unsigned gen = __atomic_load_n(&s_io_gen, __ATOMIC_ACQUIRE);
+    GcmIoView* v = __atomic_load_n(&s_io_view, __ATOMIC_ACQUIRE);
+    if (v && v->gen == gen) return v;
+    GcmIoView* fresh = (GcmIoView*)calloc(1, sizeof *fresh);
+    if (!fresh) return NULL;
+    fresh->gen = gen; fresh->lo = 0xFFFFFFFFu; fresh->hi = 0;
+    for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
+        const IoMapping* m = &s_io_mappings[i];
+        if (!m->active || !m->size) continue;
+        fresh->m[fresh->n].ea = m->ea; fresh->m[fresh->n].size = m->size; fresh->m[fresh->n].io = m->io;
+        fresh->n++;
+        if (m->ea < fresh->lo) fresh->lo = m->ea;
+        if (m->ea + m->size > fresh->hi) fresh->hi = m->ea + m->size;
+    }
+    __atomic_store_n(&s_io_view, fresh, __ATOMIC_RELEASE);
+    return fresh;
+}
+
 void gcm_note_spu_put(u32 ea, u32 size)
 {
     if (!size || size > 0x40000u) return;
-    u32 room = 0;
-    u32 io = gcm_ea2io_range(ea, &room);
+    const GcmIoView* view = gcm_io_view();
+    if (!view || ea < view->lo || ea >= view->hi) return;   /* not in RSX-visible memory */
+    /* Same first-match order as gcm_ea2io_range over the slots. */
+    u32 io = 0xFFFFFFFFu, room = 0;
+    for (u32 i = 0; i < view->n; i++)
+        if (ea >= view->m[i].ea && ea < view->m[i].ea + view->m[i].size) {
+            room = view->m[i].ea + view->m[i].size - ea;
+            io = view->m[i].io + (ea - view->m[i].ea);
+            break;
+        }
     if (io == 0xFFFFFFFFu || size > room) return;   /* not in RSX-visible memory */
 
     /* Coalesce with the previous block when an SPU emits one buffer in several
@@ -3111,6 +3152,7 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
         if (m) {
             m->ea = ea_page; m->io = io; m->size = 0x100000u; m->active = 1;
             s_io_mapping_count++;
+            __atomic_fetch_add(&s_io_gen, 1, __ATOMIC_RELEASE);   /* see gcm_note_spu_put */
         } else {
             printf("[cellGcmSys] WARNING: auto-map has no free IO mapping slot; "
                    "the FIFO will not be able to walk io 0x%08X\n", io);
@@ -3213,6 +3255,7 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
     mapping->size   = size;
     mapping->active = 1;
     s_io_mapping_count++;
+    __atomic_fetch_add(&s_io_gen, 1, __ATOMIC_RELEASE);   /* see gcm_note_spu_put */
 
     populate_offset_table(ea, io_offset, size);
 
@@ -3252,6 +3295,7 @@ s32 cellGcmMapEaIoAddress(u32 ea, u32 io, u32 size)
     mapping->size   = size;
     mapping->active = 1;
     s_io_mapping_count++;
+    __atomic_fetch_add(&s_io_gen, 1, __ATOMIC_RELEASE);   /* see gcm_note_spu_put */
 
     populate_offset_table(ea, io, size);
 
@@ -3301,6 +3345,7 @@ s32 cellGcmUnmapEaIoAddress(u32 ea)
     clear_offset_table(mapping->ea, mapping->io, mapping->size);
     mapping->active = 0;
     s_io_mapping_count--;
+    __atomic_fetch_add(&s_io_gen, 1, __ATOMIC_RELEASE);   /* see gcm_note_spu_put */
 
     return CELL_OK;
 }
@@ -3317,6 +3362,7 @@ s32 cellGcmUnmapIoAddress(u32 io)
     clear_offset_table(mapping->ea, mapping->io, mapping->size);
     mapping->active = 0;
     s_io_mapping_count--;
+    __atomic_fetch_add(&s_io_gen, 1, __ATOMIC_RELEASE);   /* see gcm_note_spu_put */
 
     return CELL_OK;
 }
@@ -3770,6 +3816,7 @@ void cellGcmTerminate(void)
     s_queue_handler    = NULL;
     s_local_mem_allocated = 0;
     s_io_mapping_count = 0;
+    __atomic_fetch_add(&s_io_gen, 1, __ATOMIC_RELEASE);   /* see gcm_note_spu_put */
     /* Unmapped = 0xFFFF. The tables are static (zero-initialized), so without
      * this every unmapped EA page silently aliased io page 0 (and vice versa),
      * producing plausible-but-wrong offsets instead of a translation failure. */
@@ -4103,6 +4150,7 @@ void cellGcm_syscall_iomap(u32 ea, u32 io, u32 size)
     if (m) {
         m->ea = ea; m->io = io; m->size = size; m->active = 1;
         s_io_mapping_count++;
+        __atomic_fetch_add(&s_io_gen, 1, __ATOMIC_RELEASE);   /* see gcm_note_spu_put */
     }
     if (!s_config.ioSize) { s_config.ioAddress = ea; s_config.ioSize = size; }
 }
