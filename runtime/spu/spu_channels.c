@@ -2496,7 +2496,7 @@ void spu_indirect_branch(spu_context* ctx)
           uint32_t w0 = ((uint32_t)ctx->ls[p] << 24) | ((uint32_t)ctx->ls[p+1] << 16) |
                         ((uint32_t)ctx->ls[p+2] << 8) | ctx->ls[p+3];
           static int s_iu = -1;
-          if (s_iu < 0) { const char* e = getenv("SPU_INTERP_UNLIFTED"); s_iu = e ? 1 : 0; }
+          if (s_iu < 0) { const char* e = getenv("SPU_INTERP_UNLIFTED"); s_iu = e && e[0] && e[0] != '0'; }
           if (s_iu && w0) {
               static int _n = 0;
               if (PS3_LOG_FIRST(_n, 8))
