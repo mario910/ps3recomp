@@ -2862,6 +2862,22 @@ static void jc_pool_job(u32 job, int index, u32 stride, u32 chain)
     jc_signal_done(chain, index); /* same worker's TLS mailbox */
 }
 
+/* getenv for the chain walker's per-command paths. getenv scans the whole
+ * environment (strchr per entry under the CRT lock); the walker asked for the
+ * same few variables on every JOBLIST command -- ~8% of its busy time in the
+ * menu's heaviest scene. The variables are fixed before launch, so cache by the
+ * literal's address (benign race: every thread stores the same value). */
+static const char* jc_getenv(const char* name)
+{
+    static const char* keys[32]; static const char* vals[32]; static volatile long used;
+    const long n = used;
+    for (long i = 0; i < n && i < 32; ++i) if (keys[i] == name) return vals[i];
+    const char* value = getenv(name);
+    const long slot = _InterlockedIncrement(&used) - 1;
+    if (slot < 32) { vals[slot] = value; _ReadWriteBarrier(); keys[slot] = name; }
+    return value;
+}
+
 static int jc_parallel_list(u32 chain, u32 first, u32 count, u32 stride, int index)
 {
     /* Independent compute lists only. Native service jobs may block on
@@ -2883,7 +2899,7 @@ static int jc_parallel_list(u32 chain, u32 first, u32 count, u32 stride, int ind
     u32 size_qw = vm_read32(first + 8) >> 16;
     if (!binary || binary >= 0x10000000u || !size_qw || size_qw > SPU_LS_SIZE / 16) return 0;
     int image = spu_workload_job_image(vm_base + binary, size_qw << 4);
-    const char* selected = getenv("SPURS_JOB_LIST_IMAGE");
+    const char* selected = jc_getenv("SPURS_JOB_LIST_IMAGE");
     /* SPURS_JOB_LIST_EXTRA_IMAGES=40,35: further images whose list jobs may
      * share the pool. Each still runs on an exclusive virtual-SPU number, as
      * list jobs do on separate SPUs; merged-list lookahead stays image 41. */
@@ -2941,9 +2957,9 @@ static int jc_merged_lists(u32 chain, u32 pc, int first_index, u32* list_count, 
         enabled = e && e[0] && e[0] != '0';
     }
     if (!enabled || first_index < 0) return 0;
-    const char* workers_option = getenv("SPURS_JOB_LIST_WORKERS");
+    const char* workers_option = jc_getenv("SPURS_JOB_LIST_WORKERS");
     unsigned workers = workers_option ? (unsigned)atoi(workers_option) : 0;
-    const char* selected = getenv("SPURS_JOB_LIST_IMAGE");
+    const char* selected = jc_getenv("SPURS_JOB_LIST_IMAGE");
     if (!workers || workers > 5 || (selected && atoi(selected) != 41)) return 0;
     u64 owner = vm_read64(chain + 0x78);
     struct SpursInst* instance = owner <= UINT32_MAX ? spurs_inst_find((u32)owner) : NULL;
@@ -3013,7 +3029,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc, u32* resume_pc)
         if (idle > 4096) break;
         const u64 requested_pc = vm_read64(jc_ea);
         if (native_abi && requested_pc != published_pc) {
-            if (getenv("SPURS_JOB_TRACE"))
+            if (jc_getenv("SPURS_JOB_TRACE"))
                 fprintf(stderr,"[jc-pc] chain=%08X old=%016llX new=%016llX current=%08X\n",
                         jc_ea,(unsigned long long)published_pc,(unsigned long long)requested_pc,pc);
             if (!requested_pc || requested_pc > 0xFFFFFFFFull || (requested_pc & 7)) return;
@@ -3093,7 +3109,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc, u32* resume_pc)
                        count, stride, (unsigned long long)first);
                 return;
             }
-            if (count && getenv("SPURS_LIST_PROFILE")) {
+            if (count && jc_getenv("SPURS_LIST_PROFILE")) {
                 static SPURS_JOB_TLS u32 seen_binary[32];
                 static SPURS_JOB_TLS unsigned seen_count;
                 u32 binary=(u32)(vm_read64((u32)first)&~7ull);
@@ -3232,11 +3248,11 @@ static s32 jc_start(u64 jc_ea, const char* who)
             jc_dump_commands(who, s_jobchains[i].entry_ea, 16);
         }
         if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
-        if (getenv("SPURS_JOB_KERNEL_MIRROR") || getenv("SPURS_JOB_ABI_STACK"))
+        if (jc_getenv("SPURS_JOB_KERNEL_MIRROR") || jc_getenv("SPURS_JOB_ABI_STACK"))
             _InterlockedExchange(&s_jobchains[i].kick_pending,1);
         /* Coalesce: a chain already being walked must not start twice. */
         if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
-            const char* persistent = getenv("SPURS_CHAIN_WORKERS");
+            const char* persistent = jc_getenv("SPURS_CHAIN_WORKERS");
             if (persistent && persistent[0] && persistent[0] != '0') {
                 if (!spurs_chain_worker_submit((unsigned)i, jc_thread))
                     _InterlockedExchange(&s_jobchains[i].running, 0);
