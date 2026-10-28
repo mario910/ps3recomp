@@ -597,6 +597,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           } }
         /* GET: main memory -> local store */
         memcpy(ls_ptr, ea_ptr, size);
+        { extern void (*g_spu_dma_observer)(spu_context*, uint32_t, uint32_t, uint32_t, uint32_t, const void*);
+          if (g_spu_dma_observer) g_spu_dma_observer(spu, 1, lsa, (uint32_t)ea, size, ls_ptr); }
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
          * dword = the completion-word EA arriving in a job buffer. */
         { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
@@ -712,6 +714,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * wake it now instead of at its timeout. NULL unless enabled. */
         { extern void (*g_spu_put_notify)(uint32_t ea, uint32_t size);
           if (g_spu_put_notify) g_spu_put_notify((uint32_t)ea, size); }
+        { extern void (*g_spu_dma_observer)(spu_context*, uint32_t, uint32_t, uint32_t, uint32_t, const void*);
+          if (g_spu_dma_observer) g_spu_dma_observer(spu, 2, lsa, (uint32_t)ea, size, ls_ptr); }
         /* Bink sync-area watch (armed by the PPU barrier probe): log SPU PUTs
          * that touch the per-SPU lane counters. */
         { extern uint32_t g_barrier_sync_watch;
@@ -1234,15 +1238,26 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * GPU catches up, and 256 reads take well under a millisecond, so a
      * count-only rule halted a healthy job and wedged the frame. Halt only once
      * the repeats have also lasted SPU_DMA_REPEAT_SECS (default 30) of wall
-     * time. Below that, back off 1 ms per repeat rather than spinning. */
-    { static SPU_THREAD_LOCAL uint32_t s_last_ea, s_last_lsa, s_rep;
+     * time. Below that, back off 1 ms per repeat rather than spinning.
+     * The count belongs to ONE run of a job: a new run on this thread (the
+     * same job staged again, which issues the same transfers by design) starts
+     * from zero. Carrying it across runs made a job that does a single
+     * transfer per run sleep 1 ms on every run once it had run 256 times in a
+     * row (found replaying captured jobs). SPU_DMA_REPEAT_ACROSS_RUNS=1 keeps
+     * the old cross-run count for A/B. */
+    { static SPU_THREAD_LOCAL uint32_t s_last_ea, s_last_lsa, s_rep, s_serial;
       static SPU_THREAD_LOCAL unsigned long long s_since;
-      static uint32_t s_limit = 0; static unsigned long long s_secs;
+      static uint32_t s_limit = 0; static unsigned long long s_secs; static int s_across;
       extern unsigned long long ps3_ms_now(void);
+      extern SPU_THREAD_LOCAL unsigned g_spu_run_serial;
       if (!s_limit) { const char* e = getenv("SPU_DMA_REPEAT_LIMIT");
                       s_limit = e ? (uint32_t)strtoul(e, 0, 0) : 256u;
                       e = getenv("SPU_DMA_REPEAT_SECS");
-                      s_secs = e ? strtoull(e, 0, 0) : 30u; }
+                      s_secs = e ? strtoull(e, 0, 0) : 30u;
+                      e = getenv("SPU_DMA_REPEAT_ACROSS_RUNS");
+                      s_across = e && e[0] == '1'; }
+      if (!s_across && s_serial != g_spu_run_serial) {
+          s_serial = g_spu_run_serial; s_last_ea = s_last_lsa = 0xFFFFFFFFu; s_rep = 0; s_since = 0; }
       if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
           if (++s_rep >= s_limit && !s_since) s_since = ps3_ms_now();
           if (s_rep >= s_limit && ps3_ms_now() - s_since >= s_secs * 1000u) {
@@ -1254,7 +1269,15 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                       (uint32_t)ea);
               fflush(stderr);
               spu_halt(spu);
-          } else if (s_rep >= s_limit) Sleep(1);
+          } else if (s_rep >= s_limit) {
+              static volatile long s_logged;
+              if (s_rep == s_limit && _InterlockedIncrement(&s_logged) <= 8)
+                  fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical transfers to "
+                          "ea=0x%08X lsa=0x%05X -- backing off 1 ms each\n",
+                          spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, s_limit,
+                          (uint32_t)ea, lsa);
+              Sleep(1);
+          }
       } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; s_since = 0; } }
 
     /* Mark tag as in-progress */

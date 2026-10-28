@@ -422,8 +422,12 @@ static int spu_launch_no_ls0(void)
     if (s < 0) s = getenv("SPU_NO_LS0_END") ? 1 : 0;
     return s;
 }
+/* Diagnostic step observer (job corpus replay prints a job's step order). */
+void (*g_spu_step_observer)(spu_context*, uint32_t) = 0;
+
 static inline void spu_step_hooks(spu_context* ctx, void* fn)
 {
+    if (g_spu_step_observer) g_spu_step_observer(ctx, (uint32_t)ctx->pc & SPU_LS_MASK);
     if (g_yz_lockstep_on != 0) yz_lockstep_tick(ctx);
     if (spu_launch_check_slow() || g_pm_flow_ctx == (void*)ctx ||
         (ctx->pc & SPU_LS_MASK) == 0) {

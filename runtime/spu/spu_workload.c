@@ -119,6 +119,14 @@ typedef struct {
 static spu_workload_entry s_registry[SPU_WORKLOAD_MAX];
 static unsigned           s_registry_count = 0;
 
+/* Entry of the registered job image `image_id` (job corpus replay). */
+spu_lifted_entry_fn spu_job_entry_for_image(int image_id)
+{
+    for (unsigned i = 0; i < s_registry_count; i++)
+        if (s_registry[i].image_id == image_id) return s_registry[i].fn;
+    return NULL;
+}
+
 void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
                                int image_id, const char* name)
 {

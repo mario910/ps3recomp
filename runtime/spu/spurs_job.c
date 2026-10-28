@@ -231,6 +231,47 @@ static void job_phase_report(int image,double start,double enter,double leave,do
     memset(stats,0,sizeof stats);last=end;
 }
 
+/* Job corpus hooks (port/job_corpus.cpp): called on the worker thread right
+ * before and after the lifted entry runs, with the fully staged context. */
+void (*g_spurs_job_capture_begin)(spu_context*, int, uint32_t) = 0;
+void (*g_spurs_job_capture_end)(spu_context*, int, uint32_t) = 0;
+
+static void spurs_job_enter(spu_lifted_entry_fn entry, int image_id, spu_context* ctx)
+{
+    (void)image_id;
+#if defined(SPU_NATIVE_RTZ_IMAGE) || defined(SPU_NATIVE_RTZ_EXTRA_IMAGE) || defined(SPU_NATIVE_RTZ_IMAGE39)
+    /* Only the configured, audited single-precision TUs use native RZ helpers.
+     * Save/restore even on the job's HALT/longjmp completion path: that jump
+     * is caught by spu_run_with_halt, not by this caller. Other images and
+     * host/PPU math keep their incoming environment. */
+    unsigned saved_mxcsr = _mm_getcsr();
+    int native_rtz = 0;
+#ifdef SPU_NATIVE_RTZ_IMAGE
+    native_rtz = image_id == SPU_NATIVE_RTZ_IMAGE;
+#endif
+#ifdef SPU_NATIVE_RTZ_EXTRA_IMAGE
+    native_rtz |= image_id == SPU_NATIVE_RTZ_EXTRA_IMAGE && spu_native_extra_fp_mode != 0;
+#endif
+#ifdef SPU_NATIVE_RTZ_IMAGE39
+    native_rtz |= image_id == SPU_NATIVE_RTZ_IMAGE39 && spu_native_image39_fp_mode != 0;
+#endif
+    if (native_rtz)
+        _mm_setcsr((saved_mxcsr & ~0x6000u) | 0x6000u | 0x8040u | 0x1f80u);
+#endif
+    spu_run_with_halt(entry, ctx);
+#if defined(SPU_NATIVE_RTZ_IMAGE) || defined(SPU_NATIVE_RTZ_EXTRA_IMAGE) || defined(SPU_NATIVE_RTZ_IMAGE39)
+    _mm_setcsr(saved_mxcsr);
+#endif
+}
+
+/* Replay a captured job: ctx already holds the entry registers and LS. */
+void spurs_job_run_prepared(spu_lifted_entry_fn entry, int image_id, spu_context* ctx)
+{
+    spurs_job_enter(entry, image_id, ctx);
+    spu_mfc_release(ctx);
+    spu_coh_unregister(ctx);
+}
+
 static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size, spu_context* ctx, int exchange)
 {
@@ -510,29 +551,9 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
     if (trace_job) fprintf(stderr,"[jobtrace] enter image=%d job=%08X sp=%05X available=%u\n",
                           image_id,job_ea,ctx->gpr[1]._u32[0],ctx->gpr[1]._u32[1]);
     const double phase_enter=phase_seconds?job_clock():0;
-#if defined(SPU_NATIVE_RTZ_IMAGE) || defined(SPU_NATIVE_RTZ_EXTRA_IMAGE) || defined(SPU_NATIVE_RTZ_IMAGE39)
-    /* Only the configured, audited single-precision TUs use native RZ helpers.
-     * Save/restore even on the job's HALT/longjmp completion path: that jump
-     * is caught by spu_run_with_halt, not by this caller. Other images and
-     * host/PPU math keep their incoming environment. */
-    unsigned saved_mxcsr = _mm_getcsr();
-    int native_rtz = 0;
-#ifdef SPU_NATIVE_RTZ_IMAGE
-    native_rtz = image_id == SPU_NATIVE_RTZ_IMAGE;
-#endif
-#ifdef SPU_NATIVE_RTZ_EXTRA_IMAGE
-    native_rtz |= image_id == SPU_NATIVE_RTZ_EXTRA_IMAGE && spu_native_extra_fp_mode != 0;
-#endif
-#ifdef SPU_NATIVE_RTZ_IMAGE39
-    native_rtz |= image_id == SPU_NATIVE_RTZ_IMAGE39 && spu_native_image39_fp_mode != 0;
-#endif
-    if (native_rtz)
-        _mm_setcsr((saved_mxcsr & ~0x6000u) | 0x6000u | 0x8040u | 0x1f80u);
-#endif
-    spu_run_with_halt(entry, ctx);
-#if defined(SPU_NATIVE_RTZ_IMAGE) || defined(SPU_NATIVE_RTZ_EXTRA_IMAGE) || defined(SPU_NATIVE_RTZ_IMAGE39)
-    _mm_setcsr(saved_mxcsr);
-#endif
+    if (g_spurs_job_capture_begin) g_spurs_job_capture_begin(ctx, image_id, job_ea);
+    spurs_job_enter(entry, image_id, ctx);
+    if (g_spurs_job_capture_end) g_spurs_job_capture_end(ctx, image_id, job_ea);
     const double phase_leave=phase_seconds?job_clock():0;
     if (trace_job) fprintf(stderr,"[jobtrace] exit image=%d job=%08X pc=%05X status=%X\n",
                           image_id,job_ea,ctx->pc,ctx->status);

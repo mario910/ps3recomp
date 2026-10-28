@@ -96,6 +96,14 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
 int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size);
 
+/* Job corpus capture/replay (see port/job_corpus.cpp). */
+extern void (*g_spurs_job_capture_begin)(spu_context*, int, uint32_t);
+extern void (*g_spurs_job_capture_end)(spu_context*, int, uint32_t);
+extern void (*g_spu_dma_observer)(spu_context*, uint32_t, uint32_t, uint32_t, uint32_t, const void*);
+void spurs_job_run_prepared(spu_lifted_entry_fn entry, int image_id, spu_context* ctx);
+spu_lifted_entry_fn spu_job_entry_for_image(int image_id);
+extern void (*g_spu_step_observer)(spu_context*, uint32_t);
+
 /* Fingerprint `image`, look up its lifted entry, and run it as a SPURS jobchain
  * job via spu_run_spurs_job. Runs SYNCHRONOUSLY on the caller's thread: a job
  * is not persistent (it runs to completion and returns to the manager), and a

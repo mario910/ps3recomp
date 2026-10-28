@@ -18,6 +18,8 @@ uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
 uint32_t g_barrier_sync_watch;
 void (*g_spu_put_hook)(uint32_t, uint32_t);
 void (*g_spu_put_notify)(uint32_t, uint32_t);
+void (*g_spu_dma_observer)(spu_context*, uint32_t, uint32_t, uint32_t, uint32_t, const void*);
+SPU_THREAD_LOCAL unsigned g_spu_run_serial;
 void* volatile g_sn_defer_ctx;
 volatile unsigned g_sn_defer;
 unsigned long long ps3_ms_now(void) { return 0; }

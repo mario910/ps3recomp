@@ -140,6 +140,11 @@ void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
 /* Same contract for the SPURS chain walker: a PUT may publish a command over
  * a parked jump-to-self. Installed only when that wake is enabled. */
 void (*g_spu_put_notify)(uint32_t ea, uint32_t size) = 0;
+/* Optional recorder of every DMA and atomic line transfer (job corpus capture).
+ * kind: 1 GET, 2 PUT, 3 GETLLAR, 4 PUTLLC ok, 5 PUTLLC failed, 6 PUTLLUC;
+ * data = the bytes moved (LS side). NULL unless a recorder is installed. */
+void (*g_spu_dma_observer)(spu_context* ctx, uint32_t kind, uint32_t lsa, uint32_t ea,
+                           uint32_t size, const void* data) = 0;
 
 void spu_halt(spu_context* ctx)
 {
@@ -201,6 +206,8 @@ void spu_stop(spu_context* ctx)
     if (s_halt) spu_halt(ctx);
 }
 
+SPU_THREAD_LOCAL unsigned g_spu_run_serial;
+
 /* Run a lifted SPU entry with a halt landing pad. Returns 1 if the job halted
  * (via spu_halt), 0 if it returned normally. */
 int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
@@ -222,6 +229,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * an earlier run would be restored over this job's arguments. */
     { extern void spu_irq_regs_forget(spu_context*); spu_irq_regs_forget(ctx); }
     ctx->steps = 0;   /* fresh run: step 0 is the entry */
+    g_spu_run_serial++;   /* per-run state keyed to this thread (spu_dma.h) */
     /* The host stack is empty here by definition, so no lifted caller frame
      * is live. A persistent context (a SPURS policy module re-entered every
      * scheduling quantum) otherwise carries the depth its last quantum
@@ -650,6 +658,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * Havok's SPU allocator (GH3 collide task, LS 0xA66C) re-issues the
          * GETLLAR until that bit is set, and spun forever on 0. PUTLLUC is 2. */
         ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 4;
+        if (g_spu_dma_observer) g_spu_dma_observer(ctx, 3, lsa, ea, MFC_ATOMIC_LINE, ls);
         ctx->dbg_getllar++;
         /* A GETLLAR re-issued millions of times on one line is an SPU spin-wait
          * that nobody is releasing (a ticket lock, a counter barrier). Say so
@@ -817,6 +826,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       ctx->atomic_stat ? "FAIL" : "OK",
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
         ctx->resv_valid = 0;                           /* reservation consumed */
+        if (g_spu_dma_observer)
+            g_spu_dma_observer(ctx, ctx->atomic_stat == 0 ? 4 : 5, lsa, ea, MFC_ATOMIC_LINE, ls);
         spu_lockline_unlock();
         if (ctx->atomic_stat == 0) {
             spu_taskset_line_committed(ea & ~127u);
@@ -837,6 +848,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * has already overwritten. */
         spu_coh_notify_write(ea);
         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
+        if (g_spu_dma_observer) g_spu_dma_observer(ctx, 6, lsa, ea, MFC_ATOMIC_LINE, ls);
         spu_lockline_unlock();
         spu_taskset_line_committed(ea & ~127u);
         if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
