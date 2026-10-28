@@ -2873,7 +2873,16 @@ static const char* jc_getenv(const char* name)
     return spurs_cached_env(name);
 }
 
-static int jc_parallel_list(u32 chain, u32 first, u32 count, u32 stride, int index)
+/* A pool group the walker would run now: owner instance, ranges, and how many
+ * JOBLIST commands / jobs it consumes. Planning reads only published
+ * commands and descriptors; it runs nothing. */
+typedef struct {
+    SpursPoolRange ranges[32];
+    unsigned range_count, workers, nspus;
+    u32 owner, lists, jobs;
+} JcGroup;
+
+static int jc_parallel_list(u32 chain, u32 first, u32 count, u32 stride, int index, JcGroup* group)
 {
     /* Independent compute lists only. Native service jobs may block on
      * other chains, so they must never occupy all the pool's workers. */
@@ -2916,8 +2925,12 @@ static int jc_parallel_list(u32 chain, u32 first, u32 count, u32 stride, int ind
         u32 job = first + n * stride;
         if (vm_read64(job) != raw || (vm_read32(job + 8) >> 16) != size_qw) return 0;
     }
-    return spurs_job_pool_run((u32)owner, instance->nspus, (unsigned)workers,
-                              first, count, stride, chain, index, jc_pool_job);
+    if (index < 0) return 0;
+    *group = (JcGroup){.ranges = {{first, stride, count, index}}, .range_count = 1,
+                       .workers = (unsigned)workers, .nspus = instance->nspus,
+                       .owner = (u32)owner, .lists = 1, .jobs = count};
+    unsigned total;
+    return spurs_job_pool_ranges_valid(group->ranges, 1, &total);
 }
 
 /* SPURS_MERGE_EXTRA_IMAGES=39,36,34: images, besides geometry image 41, whose
@@ -2944,7 +2957,7 @@ static uint64_t jc_merge_extra_images(void)
  * SPURS_MERGE_EXTRA_IMAGES set are eligible; never look through
  * JTS/SYNC/FLUSH/JOB/branches/guards.
  * Bounded lookahead reads already-published command/descriptors, not results. */
-static int jc_merged_lists(u32 chain, u32 pc, int first_index, u32* list_count, u32* job_count)
+static int jc_merged_lists(u32 chain, u32 pc, int first_index, JcGroup* group)
 {
     static SPURS_JOB_TLS int enabled = -1;
     if (enabled < 0) {
@@ -2959,7 +2972,7 @@ static int jc_merged_lists(u32 chain, u32 pc, int first_index, u32* list_count, 
     u64 owner = vm_read64(chain + 0x78);
     struct SpursInst* instance = owner <= UINT32_MAX ? spurs_inst_find((u32)owner) : NULL;
     if (!instance || instance->nspus <= workers) return 0;
-    SpursPoolRange ranges[32];
+    SpursPoolRange* ranges = group->ranges;
     unsigned n = 0, total = 0;
     for (; n < 32 && pc <= UINT32_MAX - n*8u; ++n) {
         u64 cmd = vm_read64(pc + n*8u);
@@ -2994,12 +3007,108 @@ static int jc_merged_lists(u32 chain, u32 pc, int first_index, u32* list_count, 
         total += count;
     }
     if (n < 2) return 0;
-    if (!spurs_job_pool_run_ranges((u32)owner, instance->nspus, workers, ranges, n, chain, jc_pool_job))
+    group->range_count = n; group->workers = workers; group->nspus = instance->nspus;
+    group->owner = (u32)owner; group->lists = n; group->jobs = total;
+    unsigned checked;
+    return spurs_job_pool_ranges_valid(ranges, n, &checked);
+}
+
+/* The JOBLIST at pc as the walker would pool it: merged with adjacent lists,
+ * else alone. Returns 0 if it must run serially (or is invalid; the walker
+ * reports that itself). */
+static int jc_plan_group(u32 chain, u32 pc, int first_index, JcGroup* group)
+{
+    u64 cmd = vm_read64(pc);
+    if ((cmd & 7) != 6) return 0;
+    u32 list = (u32)(cmd & ~7ull);
+    u32 count = vm_read32(list), stride = vm_read32(list + 4);
+    u64 first = vm_read64(list + 8);
+    if (count > 65536 || stride < 64 || stride > 256 || (stride & 15) ||
+        first > 0xFFFFFFFFull || first + (u64)count * stride > 0x100000000ull) return 0;
+    return jc_merged_lists(chain, pc, first_index, group) ||
+           jc_parallel_list(chain, (u32)first, count, stride, first_index, group);
+}
+
+/* SPURS_POOL_SEQUENCE=1: worker-side continuation between pool groups.
+ * When a group's last job returns, that worker walks on through the chain
+ * -- SYNC/FLUSH are satisfied, every earlier job has finished -- and queues
+ * the next poolable JOBLIST group itself instead of waking the walker to do
+ * it. It stops at anything else (JTS, JOB, guards, branches, labels, a
+ * changed published PC, a serial or invalid list) and leaves that command to
+ * the walker, so it never waits for a producer on a pool lane. */
+typedef struct {
+    u32 chain, pc;
+    int jobs, native_abi;
+    u64 published_pc;
+    u32 owner, pending_lists, pending_jobs;
+    unsigned stages;
+} JcSequence;
+
+enum { JC_SEQUENCE_STAGES = 256, JC_SEQUENCE_SKIPS = 16 };
+
+static int jc_sequence_enabled(void)
+{
+    static int enabled = -1;
+    int value = __atomic_load_n(&enabled, __ATOMIC_RELAXED);
+    if (value < 0) {
+        const char* e = getenv("SPURS_POOL_SEQUENCE");
+        value = e && e[0] && e[0] != '0' && !getenv("SPURS_LIST_PROFILE");
+        __atomic_store_n(&enabled, value, __ATOMIC_RELAXED);
+    }
+    return value;
+}
+
+/* Pool continuation (spurs_pool_next_fn): runs on the worker that completed
+ * the previous stage, after all of that stage's jobs returned. */
+static unsigned jc_sequence_next(void* context, SpursPoolRange out[32])
+{
+    JcSequence* sequence = context;
+    /* The finished stage consumed its commands and job indices. */
+    sequence->pc += sequence->pending_lists * 8u;
+    sequence->jobs += (int)sequence->pending_jobs;
+    sequence->pending_lists = sequence->pending_jobs = 0;
+    if (++sequence->stages >= JC_SEQUENCE_STAGES) return 0;
+    for (unsigned skipped = 0; skipped <= JC_SEQUENCE_SKIPS; ++skipped) {
+        if (sequence->native_abi && vm_read64(sequence->chain) != sequence->published_pc) return 0;
+        const u64 cmd = vm_read64(sequence->pc);
+        const u32 op = (u32)(cmd & 7);
+        if (cmd == 0x800000012ull) return 0;       /* JTS: the producer's turn */
+        if (op == 2 || op == 5) { sequence->pc += 8; continue; }   /* SYNC / FLUSH */
+        JcGroup group;
+        if (op != 6 || !jc_plan_group(sequence->chain, sequence->pc, sequence->jobs, &group) ||
+            group.owner != sequence->owner) return 0;
+        memcpy(out, group.ranges, group.range_count * sizeof *out);
+        sequence->pending_lists = group.lists;
+        sequence->pending_jobs = group.jobs;
+        return group.range_count;
+    }
+    return 0;
+}
+
+/* Runs a planned group and, with sequences enabled, the groups after it;
+ * advances pc/jobs past everything consumed. 0 if the pool declined. */
+static int jc_run_group(u32 chain, u32* pc, int* jobs, int native_abi, u64 published_pc,
+                        const JcGroup* group)
+{
+    if (!jc_sequence_enabled()) {
+        if (!spurs_job_pool_run_ranges(group->owner, group->nspus, group->workers,
+                                       group->ranges, group->range_count, chain, jc_pool_job))
+            return 0;
+        *pc += group->lists * 8u; *jobs += (int)group->jobs;
+        return 1;
+    }
+    JcSequence sequence = {chain, *pc, *jobs, native_abi, published_pc,
+                           group->owner, group->lists, group->jobs, 0};
+    if (!spurs_job_pool_run_sequence(group->owner, group->nspus, group->workers,
+                                     group->ranges, group->range_count, chain, jc_pool_job,
+                                     jc_sequence_next, &sequence))
         return 0;
-    *list_count = n; *job_count = total;
+    /* Commit the last stage; jc_sequence_next committed the earlier ones. */
+    *pc = sequence.pc + sequence.pending_lists * 8u;
+    *jobs = sequence.jobs + (int)sequence.pending_jobs;
     static SPURS_JOB_TLS unsigned reports;
-    if (reports++ < 4)
-        fprintf(stderr,"[ready-lists] chain=%08X lists=%u jobs=%u\n", chain,n,total);
+    if (sequence.stages && reports++ < 4)
+        fprintf(stderr, "[pool-sequence] chain=%08X stages=%u\n", chain, sequence.stages + 1);
     return 1;
 }
 
@@ -3121,24 +3230,20 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc, u32* resume_pc)
                 }
             }
             const uint64_t list_begin = PS3_FT_ON() ? ps3_ft_now() : 0;
-            u32 merged_count = 0, merged_jobs = 0;
-            if (jc_merged_lists(jc_ea, pc, jobs, &merged_count, &merged_jobs)) {
+            JcGroup group;
+            const u32 group_pc = pc;
+            const int group_jobs = jobs;
+            if (jc_plan_group(jc_ea, pc, jobs, &group) &&
+                jc_run_group(jc_ea, &pc, &jobs, native_abi, published_pc, &group)) {
                 if (list_begin) {
-                    ps3_ft_span(PS3_FT_CHAIN_POOL, GetCurrentThreadId(), jc_ea, merged_jobs,
-                                list_begin, ps3_ft_now());
-                    for (u32 n = 1; n < merged_count; ++n)
-                        ps3_ft_span(PS3_FT_CHAIN_CMD, GetCurrentThreadId(), jc_ea, 6, list_begin, list_begin);
+                    ps3_ft_span(PS3_FT_CHAIN_POOL, GetCurrentThreadId(), jc_ea,
+                                (u32)(jobs - group_jobs), list_begin, ps3_ft_now());
+                    for (u32 n = group_pc + 8; n < pc; n += 8)
+                        ps3_ft_span(PS3_FT_CHAIN_CMD, GetCurrentThreadId(), jc_ea,
+                                    (u32)(vm_read64(n) & 127), list_begin, list_begin);
                 }
-                jobs += (int)merged_jobs; idle = 0; pc += merged_count*8;
-                continue; /* all real work joined before the next command */
-            }
-            if (jc_parallel_list(jc_ea, (u32)first, count, stride, jobs)) {
-                if (list_begin) ps3_ft_span(PS3_FT_CHAIN_POOL, GetCurrentThreadId(), jc_ea, count,
-                                            list_begin, ps3_ft_now());
-                jobs += (int)count;
                 idle = 0;
-                pc += 8;
-                continue; /* all jobs, including completions, are finished */
+                continue; /* all real work joined before the next command */
             }
             for (u32 n = 0; n < count; ++n) {
                 int idx = jobs++;

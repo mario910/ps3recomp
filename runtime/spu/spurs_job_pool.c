@@ -17,6 +17,13 @@ typedef struct Batch {
     uint64_t queued_ns, finished_ns;
     const SpursPoolRange* ranges;
     unsigned range_count;
+    /* Sequence state. finished, not remaining == 0, releases the owner:
+     * between stages remaining is 0 while the last completer prepares the
+     * next stage in range_buf, which lives in the owner's stack Batch. */
+    int finished;
+    spurs_pool_next_fn next_stage;
+    void* context;
+    SpursPoolRange range_buf[32];
 } Batch;
 static struct {
     SRWLOCK admission, lock;
@@ -48,13 +55,62 @@ static unsigned claim(Batch* batch)
     return index;
 }
 
+int spurs_job_pool_ranges_valid(const SpursPoolRange* ranges, unsigned range_count,
+                                unsigned* total)
+{
+    if (!ranges || !range_count || range_count > 32) return 0;
+    unsigned count = 0;
+    for (unsigned n = 0; n < range_count; ++n) {
+        const SpursPoolRange* r = &ranges[n];
+        if (!r->count || !r->stride ||
+            (uint64_t)r->first + (uint64_t)r->count * r->stride > 0x100000000ull ||
+            r->first_index < 0 || r->count > 0x7fffffffu - (unsigned)r->first_index ||
+            r->count > 0x7fffffffu - count) return 0;
+        count += r->count;
+    }
+    *total = count;
+    return 1;
+}
+
+/* Caller holds pool.lock; the batch is not queued. */
+static void enqueue(Batch* batch)
+{
+    batch->next_batch = NULL;
+    if (pool.tail) pool.tail->next_batch = batch;
+    else pool.head = batch;
+    pool.tail = batch;
+}
+
+/* Caller holds pool.lock and has just completed one job of batch. The owner
+ * may return as soon as finished is set (and the lock is dropped), so nothing
+ * here touches the batch after that store. */
 static void complete(Batch* batch)
 {
-    if (!--batch->remaining) {
-        if (batch->queued_ns) batch->finished_ns = ps3_ft_now();
-        --pool.active_batches;
-        WakeAllConditionVariable(&pool.done);
+    if (--batch->remaining) return;
+    if (batch->next_stage) {
+        /* Every callback of this stage has returned: all workers that ran
+         * one decremented remaining under this lock first. The batch is
+         * fully claimed, so it is out of the queue; nothing else uses it. */
+        ReleaseSRWLockExclusive(&pool.lock);
+        unsigned ranges = batch->next_stage(batch->context, batch->range_buf), count = 0;
+        if (ranges && !spurs_job_pool_ranges_valid(batch->range_buf, ranges, &count))
+            abort(); /* the continuation broke its contract */
+        AcquireSRWLockExclusive(&pool.lock);
+        if (ranges) {
+            const SpursPoolRange* r = batch->range_buf;
+            batch->first = r->first; batch->stride = r->stride; batch->first_index = r->first_index;
+            batch->ranges = r; batch->range_count = ranges;
+            batch->count = batch->remaining = count; batch->next = 0;
+            if (batch->queued_ns) batch->queued_ns = ps3_ft_now();
+            enqueue(batch); /* at the tail: other chains keep their turn */
+            WakeAllConditionVariable(&pool.work);
+            return;
+        }
     }
+    if (batch->queued_ns) batch->finished_ns = ps3_ft_now();
+    batch->finished = 1;
+    --pool.active_batches;
+    WakeAllConditionVariable(&pool.done);
 }
 
 static void execute(Batch* batch, unsigned index)
@@ -114,17 +170,18 @@ int spurs_job_pool_run_ranges(uint32_t instance, unsigned nspus, unsigned worker
                               const SpursPoolRange* ranges, unsigned range_count,
                               uint32_t chain, spurs_pool_job_fn run)
 {
-    if (in_worker || !run || !instance || !chain || !ranges || !range_count ||
-        range_count > 32 || !workers || workers > 5 || nspus <= workers) return 0;
+    return spurs_job_pool_run_sequence(instance, nspus, workers, ranges, range_count,
+                                       chain, run, NULL, NULL);
+}
+
+int spurs_job_pool_run_sequence(uint32_t instance, unsigned nspus, unsigned workers,
+                                const SpursPoolRange* ranges, unsigned range_count,
+                                uint32_t chain, spurs_pool_job_fn run,
+                                spurs_pool_next_fn next, void* context)
+{
     unsigned count = 0;
-    for (unsigned n = 0; n < range_count; ++n) {
-        const SpursPoolRange* r = &ranges[n];
-        if (!r->count || !r->stride ||
-            (uint64_t)r->first + (uint64_t)r->count * r->stride > 0x100000000ull ||
-            r->first_index < 0 || r->count > 0x7fffffffu - (unsigned)r->first_index ||
-            r->count > 0x7fffffffu - count) return 0;
-        count += r->count;
-    }
+    if (in_worker || !run || !instance || !chain || !workers || workers > 5 ||
+        nspus <= workers || !spurs_job_pool_ranges_valid(ranges, range_count, &count)) return 0;
     AcquireSRWLockExclusive(&pool.admission);
     if (!pool.initialized) {
         pool.initialized = 1;
@@ -147,11 +204,17 @@ int spurs_job_pool_run_ranges(uint32_t instance, unsigned nspus, unsigned worker
     }
     Batch batch = {ranges[0].first, ranges[0].stride, chain, count, 0, count,
                    ranges[0].first_index, run, NULL,
-                   PS3_FT_ON() ? ps3_ft_now() : 0, 0, ranges, range_count};
+                   PS3_FT_ON() ? ps3_ft_now() : 0, 0, ranges, range_count, 0, NULL, NULL, {{0}}};
+    /* A borrowing caller would have to run continuations itself; keep that
+     * diagnostic mode on single stages. */
+    if (next && !pool.caller_help) {
+        memcpy(batch.range_buf, ranges, range_count * sizeof *ranges);
+        batch.ranges = batch.range_buf;
+        batch.next_stage = next;
+        batch.context = context;
+    }
     AcquireSRWLockExclusive(&pool.lock);
-    if (pool.tail) pool.tail->next_batch = &batch;
-    else pool.head = &batch;
-    pool.tail = &batch;
+    enqueue(&batch);
     ++pool.active_batches;
     /* Borrow an ID only while its dedicated worker is idle. The ID, not the
      * OS thread, owns Edge rings/RSX labels. Never add a fifth geometry lane
@@ -188,7 +251,7 @@ int spurs_job_pool_run_ranges(uint32_t instance, unsigned nspus, unsigned worker
         pool.borrowed_lanes &= ~(1u << lane);
         WakeAllConditionVariable(&pool.work);
     }
-    while (batch.remaining)
+    while (!batch.finished)
         SleepConditionVariableSRW(&pool.done, &pool.lock, INFINITE, 0);
     ReleaseSRWLockExclusive(&pool.lock);
     if (batch.finished_ns)
