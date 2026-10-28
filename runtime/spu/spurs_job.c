@@ -548,8 +548,11 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
     static unsigned trace_count[64];
     const int trace_job = options->trace && image_id >= 0 && image_id < 64
                           && __atomic_fetch_add(&trace_count[image_id],1,__ATOMIC_RELAXED) < 8;
-    if (trace_job) fprintf(stderr,"[jobtrace] enter image=%d job=%08X sp=%05X available=%u\n",
-                          image_id,job_ea,ctx->gpr[1]._u32[0],ctx->gpr[1]._u32[1]);
+    if (trace_job) fprintf(stderr,"[jobtrace] enter image=%d job=%08X sp=%05X available=%u"
+                          " sizeStack=%u sizeScratch=%u bin=%u io=%u out=%u abi=%d/%d/%d:%d\n",
+                          image_id,job_ea,ctx->gpr[1]._u32[0],ctx->gpr[1]._u32[1],
+                          size_stk,size_scr,size_bin,size_io,size_out,options->stack,
+                          (int)abi_stage_active,options->min_present,options->min_image);
     const double phase_enter=phase_seconds?job_clock():0;
     if (g_spurs_job_capture_begin) g_spurs_job_capture_begin(ctx, image_id, job_ea);
     spurs_job_enter(entry, image_id, ctx);
