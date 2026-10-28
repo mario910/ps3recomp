@@ -778,7 +778,7 @@ static HWND create_window(u32 width, u32 height, const char* title)
     HWND hwnd=CreateWindowExA(
         0, "ps3recomp_d3d12",
         title ? title : "ps3recomp (D3D12)",
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        WS_OVERLAPPEDWINDOW | (getenv("RSX_WINDOW_BACKGROUND") ? 0 : WS_VISIBLE),
         CW_USEDEFAULT, CW_USEDEFAULT,
         wr.right - wr.left, wr.bottom - wr.top,
         NULL, NULL, GetModuleHandle(NULL), NULL);
@@ -7550,7 +7550,15 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
     /* The launcher hides the console through STARTUPINFO. Explicitly show
      * the actual game window as well; WS_VISIBLE alone inherits SW_HIDE on
      * this first top-level window and leaves a functioning renderer invisible. */
-    ShowWindow(s_d3d.hwnd, SW_SHOWNORMAL);
+    /* RSX_WINDOW_BACKGROUND=1: show without taking focus, beneath other
+     * windows, so unattended runs do not interrupt the desktop. Not minimized:
+     * an iconic swap chain is occluded and stops presenting. */
+    if (getenv("RSX_WINDOW_BACKGROUND")) {
+        ShowWindow(s_d3d.hwnd, SW_SHOWNOACTIVATE);
+        SetWindowPos(s_d3d.hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    } else {
+        ShowWindow(s_d3d.hwnd, SW_SHOWNORMAL);
+    }
 
     /* Initialize D3D12 */
     if (init_d3d12(width, height) != 0) {
