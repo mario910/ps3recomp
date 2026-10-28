@@ -1860,6 +1860,68 @@ int spu_overlay_match_sig(const uint8_t hdr[16])
     return 0;
 }
 
+/* ---- Runtime-loaded code modules -----------------------------------------
+ * Code a program loads into its own local store and calls -- MultiStream's
+ * ATRAC decoder and DSP plugins -- belongs to no image and arrives from
+ * buffers whose EA varies, so it is identified by residence address and
+ * content: on the first branch into an unowned address inside a registered
+ * span, the span's bytes (minus one declared mutable window, e.g. init code
+ * whose memory the program reuses) are hashed with FNV-1a-64. A match makes
+ * that lift the span's resident code owner until a DMA writes into the span
+ * (spu_overlay_note_get drops it); a mismatch leaves the address unowned. */
+typedef struct { uint32_t lsa, size, skip_lo, skip_hi; uint64_t fnv; int image_id; } spu_rt_module;
+#define SPU_RT_MODULE_MAX 16
+static spu_rt_module s_rt_module[SPU_RT_MODULE_MAX];
+static int s_rt_module_count;
+
+/* Startup only, before any SPU runs. skip_lo == skip_hi: no mutable window. */
+void spu_runtime_code_register(uint32_t lsa, uint32_t size, uint32_t skip_lo, uint32_t skip_hi,
+                               uint64_t fnv, int image_id)
+{
+    if (s_rt_module_count >= SPU_RT_MODULE_MAX || !size || lsa + size > SPU_LS_SIZE ||
+        skip_lo > skip_hi || skip_hi > size) return;
+    s_rt_module[s_rt_module_count++] = (spu_rt_module){lsa, size, skip_lo, skip_hi, fnv, image_id};
+}
+
+static uint64_t spu_rt_fnv(const uint8_t* p, uint32_t n, uint64_t h)
+{
+    for (uint32_t i = 0; i < n; ++i) { h ^= p[i]; h *= 0x100000001B3ull; }
+    return h;
+}
+
+/* The image owning ctx->pc as verified runtime code, or 0. */
+static int spu_runtime_code_claim(spu_context* ctx)
+{
+    const uint32_t pc = ctx->pc & SPU_LS_MASK;
+    for (int i = 0; i < s_rt_module_count; ++i) {
+        const spu_rt_module* m = &s_rt_module[i];
+        if (pc < m->lsa || pc - m->lsa >= m->size) continue;
+        const uint8_t* base = ctx->ls + m->lsa;
+        uint64_t h = spu_rt_fnv(base, m->skip_lo, 0xCBF29CE484222325ull);
+        h = spu_rt_fnv(base + m->skip_hi, m->size - m->skip_hi, h);
+        static int s_log;
+        if (h != m->fnv) {
+            if (PS3_LOG_FIRST(s_log, 16))
+                fprintf(stderr, "[spu-rtcode] img=%d LS 0x%05X: content differs from lift %d\n",
+                        ctx->image_id, pc, m->image_id);
+            continue;
+        }
+        unsigned slot = 0;
+        while (slot < 4 && ctx->resident_code[slot].image_id &&
+               ctx->resident_code[slot].lsa != m->lsa) ++slot;
+        if (slot == 4) slot = 3;  /* evict: a re-claim costs one more hash */
+        ctx->resident_code[slot].lsa = m->lsa;
+        ctx->resident_code[slot].size = m->size;
+        ctx->resident_code[slot].source_ea = 0;
+        ctx->resident_code[slot].image_id = m->image_id;
+        if (PS3_LOG_FIRST(s_log, 16))
+            fprintf(stderr, "[spu-rtcode] img=%d LS 0x%05X..0x%05X -> lifted image %d\n",
+                    ctx->image_id, m->lsa, m->lsa + m->size, m->image_id);
+        return m->image_id;
+    }
+    return 0;
+}
+
 /* HLE of the taskset Policy Module's task-syscall entry (LS 0xA70). A SPURS task
  * (e.g. the cri_mpv task, image 22) reads syscallAddr from its SpursTasksetContext
  * (LS 0x27C4) and branches to it to perform a task syscall (EXIT/YIELD/WAIT/POLL).
@@ -2455,6 +2517,10 @@ void spu_indirect_branch(spu_context* ctx)
         }
     }
 
+    if (!fn && !code_owner && !ctx->policy_mode && s_rt_module_count) {
+        const int owner = spu_runtime_code_claim(ctx);
+        if (owner) fn = spu_lookup(ctx->pc, owner);
+    }
     if (!fn && !ctx->policy_mode && ctx->pc >= SPU_JM2_KERNEL_BASE) {
         static uint32_t seen[16]; static int n_seen = 0;
         int known = 0;
@@ -2497,6 +2563,24 @@ void spu_indirect_branch(spu_context* ctx)
                         ((uint32_t)ctx->ls[p+2] << 8) | ctx->ls[p+3];
           static int s_iu = -1;
           if (s_iu < 0) { const char* e = getenv("SPU_INTERP_UNLIFTED"); s_iu = e && e[0] && e[0] != '0'; }
+          /* SPU_UNLIFTED_LSDUMP=<dir>: the whole local store as it stands at
+           * the first branch into each unlifted target, i.e. runtime-loaded
+           * code after its loader applied relocations -- what a lift of it
+           * has to match. One file per target: ls_img<id>_<pc>.bin. */
+          { static int s_ld = -1; static char s_dir[400];
+            if (s_ld < 0) { const char* e = getenv("SPU_UNLIFTED_LSDUMP"); s_ld = e && *e;
+                            if (s_ld) snprintf(s_dir, sizeof s_dir, "%s", e); }
+            static uint32_t s_dumped[16]; static unsigned s_nd;
+            int seen = 0;
+            for (unsigned i = 0; i < s_nd; ++i) if (s_dumped[i] == p) seen = 1;
+            if (s_ld && !seen && s_nd < 16) {
+                s_dumped[s_nd++] = p;
+                char path[512];
+                snprintf(path, sizeof path, "%s/ls_img%d_%05X.bin", s_dir, ctx->image_id, p);
+                FILE* f = fopen(path, "wb");
+                if (f) { fwrite(ctx->ls, 1, SPU_LS_SIZE, f); fclose(f); }
+                fprintf(stderr, "[spu] LS dump at unlifted 0x%05X -> %s\n", p, path);
+            } }
           if (s_iu && w0) {
               static int _n = 0;
               if (PS3_LOG_FIRST(_n, 8))

@@ -19,11 +19,13 @@
  * Globals
  * -----------------------------------------------------------------------*/
 sys_timer_info g_sys_timers[SYS_TIMER_MAX];
-static unsigned s_short_spin_us;
+static unsigned s_short_spin_us, s_timer_tail_us;
 __attribute__((constructor)) static void timer_short_spin_options_init(void)
 {
     const char* e=getenv("PS3_SHORT_SLEEP_SPIN_US");int requested=e?atoi(e):0;
     s_short_spin_us=requested>=1 && requested<=100?(unsigned)requested:0;
+    e=getenv("PS3_USLEEP_TIMER_TAIL_US");requested=e?atoi(e):0;
+    s_timer_tail_us=requested>=1 && requested<=900?(unsigned)requested:0;
 }
 
 #ifdef _WIN32
@@ -255,6 +257,24 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         QueryPerformanceCounter(&qpc_start);
         const int64_t qpc_deadline = qpc_start.QuadPart +
             (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
+        /* PS3_USLEEP_TIMER_TAIL_US=<t>: block on a high-resolution waitable
+         * timer for all but the last t us, then spin only that tail to the
+         * same QPC deadline. A polling thread that sleeps ~800 us a thousand
+         * times a second (Buzz's MultiStream update thread) otherwise holds a
+         * full host core in the spin below. Never shorter than requested; the
+         * timer can only end early relative to the deadline, not past it. */
+        if (s_timer_tail_us && usec > s_timer_tail_us + 50) {
+            static _Thread_local HANDLE timer;
+            if (!timer) timer = CreateWaitableTimerExW(NULL, NULL,
+                                    0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                    TIMER_ALL_ACCESS);
+            if (timer) {
+                LARGE_INTEGER due;
+                due.QuadPart = -(LONGLONG)(usec - s_timer_tail_us) * 10;
+                if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
+                    WaitForSingleObject(timer, INFINITE);
+            }
+        }
         do {
             SwitchToThread();
             QueryPerformanceCounter(&qpc_now);
