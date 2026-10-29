@@ -19,13 +19,15 @@
  * Globals
  * -----------------------------------------------------------------------*/
 sys_timer_info g_sys_timers[SYS_TIMER_MAX];
-static unsigned s_short_spin_us, s_timer_tail_us;
+static unsigned s_short_spin_us, s_timer_tail_us, s_min_sleep_us;
 __attribute__((constructor)) static void timer_short_spin_options_init(void)
 {
     const char* e=getenv("PS3_SHORT_SLEEP_SPIN_US");int requested=e?atoi(e):0;
     s_short_spin_us=requested>=1 && requested<=100?(unsigned)requested:0;
     e=getenv("PS3_USLEEP_TIMER_TAIL_US");requested=e?atoi(e):0;
     s_timer_tail_us=requested>=1 && requested<=900?(unsigned)requested:0;
+    e=getenv("PS3_USLEEP_MIN_US");requested=e?atoi(e):0;
+    s_min_sleep_us=requested>=1 && requested<=2000?(unsigned)requested:0;
 }
 
 #ifdef _WIN32
@@ -227,6 +229,23 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         ppu_log_host_chain("usleep1ms"); } }
 
 #ifdef _WIN32
+    /* PS3_USLEEP_MIN_US=<n>: a sleep shorter than n us blocks for n us on a
+     * high-resolution timer instead of spinning. A guest polling with
+     * usleep(2) ~120k times a second (Buzz's ThreadPoolWorker) otherwise
+     * holds most of a host core; RPCS3's default timer precision likewise
+     * lets such sleeps last a host timer period. Never shorter than asked. */
+    if (s_min_sleep_us && usec > 0 && usec < s_min_sleep_us) {
+        static _Thread_local HANDLE short_timer;
+        if (!short_timer) short_timer = CreateWaitableTimerExW(NULL, NULL,
+                                  0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                  TIMER_ALL_ACCESS);
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)s_min_sleep_us * 10;
+        if (short_timer && SetWaitableTimer(short_timer, &due, 0, NULL, NULL, FALSE)) {
+            WaitForSingleObject(short_timer, INFINITE);
+            return CELL_OK;
+        }
+    }
     /* Use high-resolution sleep via waitable timer for better precision */
     if (usec >= 1000) {
         HANDLE timer = CreateWaitableTimerW(NULL, TRUE, NULL);

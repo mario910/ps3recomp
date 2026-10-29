@@ -13,6 +13,7 @@
  */
 
 #include "../../runtime/memory/vm.h"   /* vm_commit */
+#include "../../runtime/platform/thread_name.h"
 #include "cellAudio.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read64, vm_write32 */
 #include <stdio.h>
@@ -652,6 +653,7 @@ static int audio_start_mix_thread(void)
 #ifdef _WIN32
     s_mix_thread = (HANDLE)_beginthreadex(NULL, 0, audio_mix_thread_func,
                                            NULL, 0, NULL);
+    if (s_mix_thread) ps3_thread_name(s_mix_thread, "cellAudio mixer");
     if (!s_mix_thread) {
         s_mix_thread_running = 0;
         return -1;

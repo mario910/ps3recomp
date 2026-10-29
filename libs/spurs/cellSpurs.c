@@ -10,6 +10,7 @@
  */
 
 #include "cellSpurs.h"
+#include "../../runtime/platform/thread_name.h"
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ps3_log.h"
 #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
@@ -3358,7 +3359,7 @@ static s32 jc_start(u64 jc_ea, const char* who)
                     _InterlockedExchange(&s_jobchains[i].running, 0);
             } else {
                 HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
-                if (th) CloseHandle(th);
+                if (th) { ps3_thread_name(th, "SPURS chain %08X", s_jobchains[i].jc_ea); CloseHandle(th); }
                 else s_jobchains[i].running = 0;
             }
         }

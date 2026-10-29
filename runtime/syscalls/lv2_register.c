@@ -11,6 +11,7 @@
  */
 
 #include <stdlib.h>   /* calloc, free */
+#include "../platform/thread_name.h"
 #include "ps3emu/nid.h"   /* ps3_compute_nid (static inline) */
 #include "lv2_syscall_table.h"
 #include "lv2_lock_line.h"
@@ -1052,6 +1053,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                 t->host_thread = CreateThread(NULL, spu_host_stack_bytes(),
                                               spu_exec_thread_proc, t,
                                               STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+                if (t->host_thread) ps3_thread_name(t->host_thread, "SPU thread");
 #else
                 pthread_mutex_init(&t->finish_event.mu, NULL);
                 pthread_cond_init(&t->finish_event.cv, NULL);

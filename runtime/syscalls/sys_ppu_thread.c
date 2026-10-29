@@ -3,6 +3,7 @@
  */
 
 #include <setjmp.h>
+#include "../platform/thread_name.h"
 
 /* sys_ppu_thread_exit never returns on hardware. Returning CELL_OK to the
  * guest lets it run on past the call: Twisted Metal has a thread that exits
@@ -252,6 +253,7 @@ uint64_t ppu_thread_register_main(void)
         t->state    = PPU_THREAD_STATE_RUNNING;
         t->joinable = 0;                    /* nobody joins the main thread */
         strncpy(t->name, "main", sizeof(t->name) - 1);
+        ps3_thread_name(GetCurrentThread(), "PPU main");
         ps3_ft_name(1, "main");
 #ifdef _WIN32
         t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
@@ -469,6 +471,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     t->host_thread = (HANDLE)_beginthreadex(NULL, 256u * 1024 * 1024,
                                   (unsigned (__stdcall*)(void*))ppu_host_thread_proc, t,
                                   _initflag, (unsigned*)&t->host_tid);
+    if (t->host_thread) ps3_thread_name(t->host_thread, "PPU %s", t->name);
     if (t->host_thread == NULL) {
         t->state = PPU_THREAD_STATE_FREE;
         CloseHandle(t->finish_event);

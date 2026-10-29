@@ -1,4 +1,5 @@
 #include "spurs_chain_worker.h"
+#include "../platform/thread_name.h"
 #include <stdint.h>
 #include <limits.h>
 
@@ -44,6 +45,7 @@ int spurs_chain_worker_submit(unsigned slot, DWORD (WINAPI *run)(LPVOID))
         w->run = run;
         w->thread = CreateThread(NULL, 1u << 20, execute,
                                  (LPVOID)(uintptr_t)slot, 0, NULL);
+        if (w->thread) ps3_thread_name(w->thread, "SPURS chain worker %u", (unsigned)slot);
         if (!w->thread) {
             ReleaseSRWLockExclusive(&w->lock);
             return 0;

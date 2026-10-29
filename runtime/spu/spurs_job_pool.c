@@ -1,4 +1,5 @@
 #include "spurs_job_pool.h"
+#include "../platform/thread_name.h"
 #include "spurs_job_ls.h"
 #include "../platform/win32_compat.h"
 #include "ps3emu/ps3_ftrace.h"
@@ -192,6 +193,7 @@ int spurs_job_pool_run_sequence(uint32_t instance, unsigned nspus, unsigned work
             HANDLE thread = CreateThread(NULL, 1024 * 1024, job_worker,
                                           (LPVOID)(uintptr_t)(n + 1), 0, NULL);
             if (!thread) break;
+            ps3_thread_name(thread, "SPURS pool lane %u", n + 1);
             pool.threads[pool.workers++] = thread;
         }
         fprintf(stderr, "[job-pool] instance=%08X workers=%u virtual-SPUs=1..%u (0 reserved)\n",
