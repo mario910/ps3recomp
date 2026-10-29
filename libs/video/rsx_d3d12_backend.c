@@ -28,6 +28,7 @@
 #include "rsx_d3d12_fp_abi.h"
 #include "rsx_fp_decompiler.h"
 #include "rsx_texture_layout.h"
+#include "rsx_rt_region.h"
 #include "rsx_d3d12_texture_format.h"
 #include <stdio.h>
 #include <string.h>
@@ -294,6 +295,7 @@ typedef struct {
     int tex_rt[4];      /* pre-pass: OffRT index sampled by unit, -1 = none */
     u32 tex_color_grid; /* units reading guest AA sample-grid storage */
     u32 tex_rt_sub;     /* units reading a target's region (rsx_d3d12_rt_sub.inc) */
+    u32 tex_rt_region[4]; /* independent atlas-cell resource per texture unit */
     u32 sampler_set;   /* immutable group of four sampler descriptors */
     int tex_slot;       /* legacy single-slot path (atlas); -1 = none */
     int vs_idx;         /* VPVSEntry slot for this draw's vertex program (-1 = primary) */
@@ -321,6 +323,9 @@ typedef struct {
      * (wave's debug tiles) position quads with this, not with constants --
      * forcing full-target viewports drew every tile window-sized. */
     u32 vp_x, vp_y, vp_w, vp_h;
+    u32 rt_pitch[4];
+    u32 sc_x, sc_y, sc_w, sc_h;
+    int sc_set;
     /* Ordered clear op (offscreen surfaces only; display clears stay the
      * frame-start backbuffer clear). is_clear records also set is_vp so the
      * legacy replay pass skips them. */
@@ -333,6 +338,13 @@ typedef struct {
 
 /* Offscreen render target (render-to-texture). Persistent across frames --
  * pass N's output is sampled by pass N+1 and possibly by later frames. */
+#define MAX_RT_SUBREGIONS 16
+typedef struct {
+    ID3D12Resource* res;
+    D3D12_RESOURCE_STATES state;
+    rsx_rt_rect rect;
+    u64 copied_generation;
+} RtSubregion;
 typedef struct {
     ID3D12Resource*       res;
     ID3D12Resource*       up;          /* init-upload staging (kept alive) */
@@ -344,11 +356,17 @@ typedef struct {
     D3D12_RESOURCE_STATES packed_state;
     u32 sx,sy;
     int packed_dirty;
-    ID3D12Resource*       sub;         /* top-left region sampled as a smaller texture */
-    D3D12_RESOURCE_STATES sub_state;
-    u32 sub_w, sub_h;
-    int sub_dirty;
+    u32 pitch;
+    u64 generation;
+    RtSubregion sub[MAX_RT_SUBREGIONS];
 } OffRT;
+static void rt_sub_release(OffRT* r) {
+    for(unsigned i=0;i<MAX_RT_SUBREGIONS;++i) {
+        if(r->sub[i].res)r->sub[i].res->lpVtbl->Release(r->sub[i].res);
+        memset(&r->sub[i],0,sizeof(r->sub[i]));
+    }
+}
+static void rt_sub_dirty(OffRT* r) {r->packed_dirty=1;++r->generation;}
 #define MAX_OFF_RTS  16  /* demosaic double-buffers its 6-surface pass chain */
 #define MAX_ZETA_RTS 16
 typedef struct {
@@ -1855,9 +1873,9 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
             fprintf(mf,"zeta op=%u raw=%08X ea=%08X pitch=%u dims=%ux%u surface_format=%08X depth=%X clear=%X\n",
                     d,r->zeta_raw,r->zeta_ea,r->zeta_pitch,r->zeta_w,r->zeta_h,r->zeta_format,r->depth_key,r->clear_mask);
             if (r->is_clear)
-                fprintf(mf, "op%03u CLEAR rt=0x%08X mrt=0x%X/0x%X/0x%X cc=(%.3f,%.3f,%.3f,%.3f)\n",
+                fprintf(mf, "op%03u CLEAR rt=0x%08X mrt=0x%X/0x%X/0x%X cc=(%.3f,%.3f,%.3f,%.3f) scissor=%u,%u,%ux%u set=%d\n",
                         d, r->rt_off, r->rt_mrt[0], r->rt_mrt[1], r->rt_mrt[2],
-                        r->cc[0], r->cc[1], r->cc[2], r->cc[3]);
+                        r->cc[0], r->cc[1], r->cc[2], r->cc[3],r->sc_x,r->sc_y,r->sc_w,r->sc_h,r->sc_set);
             else {
                 fprintf(mf, "op%03u DRAW  rt=0x%08X mrt=0x%X/0x%X/0x%X vp=%u,%u,%ux%u fp=0x%08X vs=%d "
                             "n=%u cmask=%X blend=%d bk=0x%X t0=0x%08X t1=0x%08X t2=0x%08X t3=0x%08X\n",
@@ -1868,11 +1886,12 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
                 if(r->tex_color_grid)fprintf(mf,"      color_grid_units=%X actual_fp_reads=%X\n",r->tex_color_grid,r->fp_texture_mask);
                 for (int u = 0; u < 4; u++)
                     if (r->tex[u].set)
-                        fprintf(mf, "      t%d off=0x%08X fmt=0x%02X (%s%s) %ux%u remap=0x%04X\n", u,
+                        fprintf(mf, "      t%d off=0x%08X fmt=0x%02X (%s%s) %ux%u remap=0x%04X guest_pitch=%u rt=%d region=%u selected=%d\n", u,
                                 r->tex[u].off, r->tex[u].fmt,
                                 (r->tex[u].fmt & 0x20) ? "LN" : "SZ",
                                 (r->tex[u].fmt & 0x40) ? ",NR" : "",
-                                r->tex[u].w, r->tex[u].h, r->tex[u].ctrl1 & 0xFFFF);
+                                r->tex[u].w, r->tex[u].h, r->tex[u].ctrl1 & 0xFFFF,
+                                r->tex[u].pitch,r->tex_rt[u],r->tex_rt_region[u],(r->tex_rt_sub>>u)&1u);
                 if (getenv("RSX_CAP_UI_CONSTANTS") &&
                     (ndraws - d <= 128 || getenv("RSX_CAP_ALL_CONSTANTS")) &&
                     r->is_vp && s_d3d.vp_cb_mapped) {
@@ -3752,6 +3771,9 @@ static int zeta_enabled(void);
 static void record_zeta(D3D12DrawRecord* dr,const rsx_state* st)
 {
     if(!dr || !st)return;
+    memcpy(dr->rt_pitch,st->surface_color_pitch,sizeof(dr->rt_pitch));
+    dr->sc_x=st->scissor_x;dr->sc_y=st->scissor_y;
+    dr->sc_w=st->scissor_w;dr->sc_h=st->scissor_h;dr->sc_set=1;
     extern u32 cellGcmResolveLocated(int local,u32 offset);
     dr->zeta_raw=st->surface_zeta_offset;
     dr->zeta_ea=cellGcmResolveLocated(st->surface_zeta_dma!=0xFEED0001u,st->surface_zeta_offset);
@@ -4043,7 +4065,7 @@ static int off_rt_find(u32 off)
 static int color_grid_enabled(void){
     static int en=-1;if(en<0){const char*e=getenv("RSX_PACK_AA_COLOR");en=e&&e[0]=='1';}return en;
 }
-static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
+static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt, u32 guest_pitch)
 {
     if (!off || !s_d3d.rt_rtv_heap || !s_d3d.srv_heap) return -1;
     if (!w) w = s_d3d.width;
@@ -4063,13 +4085,17 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
     int slot = off_rt_find(off);
     if (slot >= 0) {
         OffRT* r = &s_d3d.off_rt[slot];
-        if (r->w == w && r->h == h && r->dxgi == (u32)want_fmt && r->sx==sx && r->sy==sy) { r->used = 1; return slot; }
+        if (r->w == w && r->h == h && r->dxgi == (u32)want_fmt && r->sx==sx && r->sy==sy) {
+            if(r->pitch!=guest_pitch){r->pitch=guest_pitch;rt_sub_dirty(r);}
+            r->used = 1; return slot;
+        }
         /* The frame in flight still references this resource -- releasing it here
          * is "was deleted prior to closing the command list" (D3D12 message 921),
          * and every draw recorded against it silently lands nowhere while the
          * replacement reads back empty. Let the GPU finish first. Recreations are
          * rare (a surface changing size), so the stall costs nothing. */
         wait_for_gpu();
+        rt_sub_release(r);
         r->res->lpVtbl->Release(r->res); r->res = NULL;   /* dims/format changed */
         if (r->up) { r->up->lpVtbl->Release(r->up); r->up = NULL; }
         if (r->packed) {r->packed->lpVtbl->Release(r->packed);r->packed=NULL;}
@@ -4084,7 +4110,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
             s_d3d.off_rt[slot].res->lpVtbl->Release(s_d3d.off_rt[slot].res);
             s_d3d.off_rt[slot].res = NULL;
             if(s_d3d.off_rt[slot].packed){s_d3d.off_rt[slot].packed->lpVtbl->Release(s_d3d.off_rt[slot].packed);s_d3d.off_rt[slot].packed=NULL;}
-            if(s_d3d.off_rt[slot].sub){s_d3d.off_rt[slot].sub->lpVtbl->Release(s_d3d.off_rt[slot].sub);s_d3d.off_rt[slot].sub=NULL;}
+            rt_sub_release(&s_d3d.off_rt[slot]);
             if (s_d3d.off_rt[slot].up) {
                 s_d3d.off_rt[slot].up->lpVtbl->Release(s_d3d.off_rt[slot].up);
                 s_d3d.off_rt[slot].up = NULL;
@@ -4107,6 +4133,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
             &IID_ID3D12Resource, (void**)&r->res)))
         return -1;
     r->off = off; r->w = w; r->h = h; r->dxgi = (u32)want_fmt;
+    r->pitch=guest_pitch;rt_sub_dirty(r);
     r->sx=sx;r->sy=sy;r->packed_dirty=1;
     r->st = D3D12_RESOURCE_STATE_COPY_DEST;
     r->used = 1;
@@ -4844,10 +4871,10 @@ static void render_frame(void)
     for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
         D3D12DrawRecord* dr = &s_d3d.draws[_d];
         if (dr->is_vp && dr->rt_off)
-            off_rt_get(dr->rt_off, dr->rt_w, dr->rt_h, dr->rt_fmt);
+            off_rt_get(dr->rt_off, dr->rt_w, dr->rt_h, dr->rt_fmt, dr->rt_pitch[0]);
         for (int _m = 0; _m < 3; _m++)
             if (dr->is_vp && dr->rt_mrt[_m])
-                off_rt_get(dr->rt_mrt[_m], dr->rt_w, dr->rt_h, dr->rt_fmt);
+                off_rt_get(dr->rt_mrt[_m], dr->rt_w, dr->rt_h, dr->rt_fmt, dr->rt_pitch[_m+1]);
     }
 
     for(int i=0;i<MAX_ZETA_RTS;++i)s_d3d.zeta[i].used=0;
@@ -4948,6 +4975,7 @@ static void render_frame(void)
         double _sv0 = perf_on() ? perf_now() : 0.0;
         dr->tex_color_grid=0;
         dr->tex_rt_sub=0;
+        memset(dr->tex_rt_region,0,sizeof(dr->tex_rt_region));
         for (int _u = 0; _u < 4; _u++) {
             u32 wslot = DRAW_SRV_BASE + _d * 4 + (u32)_u;
             dr->tex_rt[_u] = -1;
@@ -4991,6 +5019,19 @@ static void render_frame(void)
                         ID3D12Resource* sub=rt_sub_source(exact,dr,_u);
                         srv_write(wslot,sub?sub:color_grid_source(exact,dr,_u),(DXGI_FORMAT)s_d3d.off_rt[exact].dxgi,
                                   D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                        continue;
+                    }
+                }
+            }
+            /* A validated interior atlas address is stronger ownership evidence
+             * than the old dimension-only subviewport guess or a CPU upload. */
+            if(dr->tex[_u].set && (dr->fp_texture_mask&(1u<<_u))) {
+                int atlas=rt_sub_find_interior(dr,(unsigned)_u);
+                if(atlas>=0) {
+                    ID3D12Resource* region=rt_sub_source(atlas,dr,(unsigned)_u);
+                    if(region) {
+                        dr->tex_rt[_u]=atlas;
+                        srv_write(wslot,region,(DXGI_FORMAT)s_d3d.off_rt[atlas].dxgi,D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
                         continue;
                     }
                 }
@@ -5341,7 +5382,7 @@ static void render_frame(void)
                 if(!dr->is_clear)for(unsigned u=0;u<4;++u)
                     if((dr->tex_color_grid&(1u<<u)) && color_grid_pack(dr->tex_rt[u]))cur_rt=-2;
                 if(!dr->is_clear)for(unsigned u=0;u<4;++u)
-                    if((dr->tex_rt_sub&(1u<<u)) && rt_sub_copy(dr->tex_rt[u]))cur_rt=-2;
+                    if((dr->tex_rt_sub&(1u<<u)) && rt_sub_copy(dr->tex_rt[u],dr->tex_rt_region[u]))cur_rt=-2;
                 /* The reduced-viewport passes (this title's reflection, drawn
                  * into a region of the same target) finish here -- snapshot
                  * before the full-screen scene overwrites them. */
@@ -5446,6 +5487,12 @@ static void render_frame(void)
                 if (dr->is_clear) {
                     D3D12_CPU_DESCRIPTOR_HANDLE rh =
                         (cur_rt >= 0) ? off_rt_rtv(cur_rt) : rtv_handle;
+                    const u32 cw=cur_rt>=0?s_d3d.off_rt[cur_rt].w:s_d3d.width;
+                    const u32 ch=cur_rt>=0?s_d3d.off_rt[cur_rt].h:s_d3d.height;
+                    const rsx_rt_rect cr=rsx_rt_clear_rect(cw,ch,
+                        dr->sc_set?dr->sc_x:0,dr->sc_set?dr->sc_y:0,
+                        dr->sc_set?dr->sc_w:cw,dr->sc_set?dr->sc_h:ch);
+                    const D3D12_RECT color_rect={(LONG)cr.x,(LONG)cr.y,(LONG)(cr.x+cr.w),(LONG)(cr.y+cr.h)};
                     /* RT_CLEARDBG=1: clear offscreen targets to magenta rather
                      * than the guest colour. "0.000% nonzero" cannot tell an
                      * untouched surface from one written black, and that
@@ -5460,27 +5507,32 @@ static void render_frame(void)
                         D3D12_CLEAR_FLAGS zf = (D3D12_CLEAR_FLAGS)
                             (((dr->clear_mask & 0x1u) ? D3D12_CLEAR_FLAG_DEPTH : 0) |
                              ((dr->clear_mask & 0x2u) ? D3D12_CLEAR_FLAG_STENCIL : 0));
-                        s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list, dsv_handle,
-                            zf, dr->clear_z, dr->clear_s, 0, NULL);
+                        const u32 zw=wantz>=0?s_d3d.zeta[wantz].w:s_d3d.width;
+                        const u32 zh=wantz>=0?s_d3d.zeta[wantz].h:s_d3d.height;
+                        const rsx_rt_rect zr=rsx_rt_clear_rect(zw,zh,
+                            dr->sc_set?dr->sc_x:0,dr->sc_set?dr->sc_y:0,
+                            dr->sc_set?dr->sc_w:zw,dr->sc_set?dr->sc_h:zh);
+                        const D3D12_RECT depth_rect={(LONG)zr.x,(LONG)zr.y,(LONG)(zr.x+zr.w),(LONG)(zr.y+zr.h)};
+                        if(zr.w&&zr.h)s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list, dsv_handle,
+                            zf, dr->clear_z, dr->clear_s, 1, &depth_rect);
                         if(wantz>=0)s_d3d.zeta[wantz].dirty=1;
                     }
-                    if (!(dr->clear_mask & 0xF0u))
+                    if (!(dr->clear_mask & 0xF0u) || !cr.w || !cr.h)
                         continue;
                     { static int cd = -1;
                       if (cd < 0) { const char* e = getenv("RT_CLEARDBG"); cd = e ? atoi(e) : 0; }
                       if (cd && cur_rt >= 0) {
                           const float mag[4] = {1.0f, 0.0f, 1.0f, 1.0f};
-                          s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(s_d3d.cmd_list, rh, mag, 0, NULL);
+                          s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(s_d3d.cmd_list, rh, mag, 1, &color_rect);
                       } else
-                          s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(s_d3d.cmd_list, rh, dr->cc, 0, NULL); }
+                          s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(s_d3d.cmd_list, rh, dr->cc, 1, &color_rect); }
                     for (int _m = 0; _m < 3; _m++)
                         if (cur_m[_m] >= 0) {
                             D3D12_CPU_DESCRIPTOR_HANDLE rhm = off_rt_rtv(cur_m[_m]);
-                            s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(s_d3d.cmd_list, rhm, dr->cc, 0, NULL);
-                            s_d3d.off_rt[cur_m[_m]].packed_dirty=1;
-                            s_d3d.off_rt[cur_m[_m]].sub_dirty=1;
+                            s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(s_d3d.cmd_list, rhm, dr->cc, 1, &color_rect);
+                            rt_sub_dirty(&s_d3d.off_rt[cur_m[_m]]);
                         }
-                    if(cur_rt>=0)s_d3d.off_rt[cur_rt].packed_dirty=s_d3d.off_rt[cur_rt].sub_dirty=1;
+                    if(cur_rt>=0)rt_sub_dirty(&s_d3d.off_rt[cur_rt]);
                     continue;
                 }
                 /* Per-draw pipeline: prefer the guest's own compiled FP; fall
@@ -5591,8 +5643,8 @@ static void render_frame(void)
                 s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list,
                     dr->vertex_count, 1, s_d3d.vp_record_memory?0:dr->vb_byte_offset / 256, 0);
                 if(dr->cmask){
-                    if(cur_rt>=0)s_d3d.off_rt[cur_rt].packed_dirty=s_d3d.off_rt[cur_rt].sub_dirty=1;
-                    for(unsigned m=0;m<3;++m)if(cur_m[m]>=0)s_d3d.off_rt[cur_m[m]].packed_dirty=s_d3d.off_rt[cur_m[m]].sub_dirty=1;
+                    if(cur_rt>=0)rt_sub_dirty(&s_d3d.off_rt[cur_rt]);
+                    for(unsigned m=0;m<3;++m)if(cur_m[m]>=0)rt_sub_dirty(&s_d3d.off_rt[cur_m[m]]);
                 }
                 if(wantz>=0 && (dr->depth_key&3u)==3u)s_d3d.zeta[wantz].dirty=1;
                 /* VP_SUBMIT=<N>: prove the VP pass actually reaches the GPU.
@@ -7798,7 +7850,7 @@ void rsx_d3d12_backend_shutdown(void)
     if(s_d3d.zeta_pack_root)s_d3d.zeta_pack_root->lpVtbl->Release(s_d3d.zeta_pack_root);
     if(s_d3d.zeta_pack_pso)s_d3d.zeta_pack_pso->lpVtbl->Release(s_d3d.zeta_pack_pso);
     for(int i=0;i<MAX_OFF_RTS;++i)if(s_d3d.off_rt[i].packed)s_d3d.off_rt[i].packed->lpVtbl->Release(s_d3d.off_rt[i].packed);
-    for(int i=0;i<MAX_OFF_RTS;++i)if(s_d3d.off_rt[i].sub)s_d3d.off_rt[i].sub->lpVtbl->Release(s_d3d.off_rt[i].sub);
+    for(int i=0;i<MAX_OFF_RTS;++i)rt_sub_release(&s_d3d.off_rt[i]);
     if(s_color_grid_root){s_color_grid_root->lpVtbl->Release(s_color_grid_root);s_color_grid_root=NULL;}
     if(s_color_grid_pso){s_color_grid_pso->lpVtbl->Release(s_color_grid_pso);s_color_grid_pso=NULL;}
     free(s_fp_capture); s_fp_capture=NULL;
