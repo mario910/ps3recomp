@@ -272,6 +272,7 @@ typedef struct {
     } tex[4];
     int tex_rt[4];      /* pre-pass: OffRT index sampled by unit, -1 = none */
     u32 tex_color_grid; /* units reading guest AA sample-grid storage */
+    u32 tex_rt_sub;     /* units reading a target's region (rsx_d3d12_rt_sub.inc) */
     u32 sampler_set;   /* immutable group of four sampler descriptors */
     int tex_slot;       /* legacy single-slot path (atlas); -1 = none */
     int vs_idx;         /* VPVSEntry slot for this draw's vertex program (-1 = primary) */
@@ -322,6 +323,10 @@ typedef struct {
     D3D12_RESOURCE_STATES packed_state;
     u32 sx,sy;
     int packed_dirty;
+    ID3D12Resource*       sub;         /* top-left region sampled as a smaller texture */
+    D3D12_RESOURCE_STATES sub_state;
+    u32 sub_w, sub_h;
+    int sub_dirty;
 } OffRT;
 #define MAX_OFF_RTS  16  /* demosaic double-buffers its 6-surface pass chain */
 #define MAX_ZETA_RTS 16
@@ -3978,6 +3983,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
             s_d3d.off_rt[slot].res->lpVtbl->Release(s_d3d.off_rt[slot].res);
             s_d3d.off_rt[slot].res = NULL;
             if(s_d3d.off_rt[slot].packed){s_d3d.off_rt[slot].packed->lpVtbl->Release(s_d3d.off_rt[slot].packed);s_d3d.off_rt[slot].packed=NULL;}
+            if(s_d3d.off_rt[slot].sub){s_d3d.off_rt[slot].sub->lpVtbl->Release(s_d3d.off_rt[slot].sub);s_d3d.off_rt[slot].sub=NULL;}
             if (s_d3d.off_rt[slot].up) {
                 s_d3d.off_rt[slot].up->lpVtbl->Release(s_d3d.off_rt[slot].up);
                 s_d3d.off_rt[slot].up = NULL;
@@ -4163,6 +4169,7 @@ static void off_rt_transition(int slot, D3D12_RESOURCE_STATES to)
  * later batch samples -- but presenting it would show a half-built frame. */
 #include "rsx_d3d12_zeta.inc"
 #include "rsx_d3d12_color_grid.inc"
+#include "rsx_d3d12_rt_sub.inc"
 static int s_present_this_frame = 1;
 
 /* Resolve a DRAW_*_TEX value: a hex raw offset, or the literal "duck" for the
@@ -4834,6 +4841,7 @@ static void render_frame(void)
          * texture, or a null SRV. */
         double _sv0 = perf_on() ? perf_now() : 0.0;
         dr->tex_color_grid=0;
+        dr->tex_rt_sub=0;
         for (int _u = 0; _u < 4; _u++) {
             u32 wslot = DRAW_SRV_BASE + _d * 4 + (u32)_u;
             dr->tex_rt[_u] = -1;
@@ -4874,7 +4882,8 @@ static void render_frame(void)
                     }
                     if(exact_first) {
                         dr->tex_rt[_u]=exact;
-                        srv_write(wslot,color_grid_source(exact,dr,_u),(DXGI_FORMAT)s_d3d.off_rt[exact].dxgi,
+                        ID3D12Resource* sub=rt_sub_source(exact,dr,_u);
+                        srv_write(wslot,sub?sub:color_grid_source(exact,dr,_u),(DXGI_FORMAT)s_d3d.off_rt[exact].dxgi,
                                   D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
                         continue;
                     }
@@ -4928,7 +4937,8 @@ static void render_frame(void)
                 int rt = known_rt>=-1 ? known_rt : off_rt_find(dr->tex[_u].raw);
                 if (rt >= 0) {
                     dr->tex_rt[_u] = rt;
-                    srv_write(wslot, color_grid_source(rt,dr,_u), (DXGI_FORMAT)s_d3d.off_rt[rt].dxgi,
+                    ID3D12Resource* sub = rt_sub_source(rt, dr, _u);
+                    srv_write(wslot, sub ? sub : color_grid_source(rt,dr,_u), (DXGI_FORMAT)s_d3d.off_rt[rt].dxgi,
                               D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
                     continue;
                 }
@@ -5217,6 +5227,8 @@ static void render_frame(void)
                     if(dr->tex_zeta[u]>=0 && zeta_pack(dr->tex_zeta[u]))cur_rt=-2;
                 if(!dr->is_clear)for(unsigned u=0;u<4;++u)
                     if((dr->tex_color_grid&(1u<<u)) && color_grid_pack(dr->tex_rt[u]))cur_rt=-2;
+                if(!dr->is_clear)for(unsigned u=0;u<4;++u)
+                    if((dr->tex_rt_sub&(1u<<u)) && rt_sub_copy(dr->tex_rt[u]))cur_rt=-2;
                 /* The reduced-viewport passes (this title's reflection, drawn
                  * into a region of the same target) finish here -- snapshot
                  * before the full-screen scene overwrites them. */
@@ -5353,8 +5365,9 @@ static void render_frame(void)
                             D3D12_CPU_DESCRIPTOR_HANDLE rhm = off_rt_rtv(cur_m[_m]);
                             s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(s_d3d.cmd_list, rhm, dr->cc, 0, NULL);
                             s_d3d.off_rt[cur_m[_m]].packed_dirty=1;
+                            s_d3d.off_rt[cur_m[_m]].sub_dirty=1;
                         }
-                    if(cur_rt>=0)s_d3d.off_rt[cur_rt].packed_dirty=1;
+                    if(cur_rt>=0)s_d3d.off_rt[cur_rt].packed_dirty=s_d3d.off_rt[cur_rt].sub_dirty=1;
                     continue;
                 }
                 /* Per-draw pipeline: prefer the guest's own compiled FP; fall
@@ -5465,8 +5478,8 @@ static void render_frame(void)
                 s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list,
                     dr->vertex_count, 1, s_d3d.vp_record_memory?0:dr->vb_byte_offset / 256, 0);
                 if(dr->cmask){
-                    if(cur_rt>=0)s_d3d.off_rt[cur_rt].packed_dirty=1;
-                    for(unsigned m=0;m<3;++m)if(cur_m[m]>=0)s_d3d.off_rt[cur_m[m]].packed_dirty=1;
+                    if(cur_rt>=0)s_d3d.off_rt[cur_rt].packed_dirty=s_d3d.off_rt[cur_rt].sub_dirty=1;
+                    for(unsigned m=0;m<3;++m)if(cur_m[m]>=0)s_d3d.off_rt[cur_m[m]].packed_dirty=s_d3d.off_rt[cur_m[m]].sub_dirty=1;
                 }
                 if(wantz>=0 && (dr->depth_key&3u)==3u)s_d3d.zeta[wantz].dirty=1;
                 /* VP_SUBMIT=<N>: prove the VP pass actually reaches the GPU.
@@ -7614,6 +7627,7 @@ void rsx_d3d12_backend_shutdown(void)
     if(s_d3d.zeta_pack_root)s_d3d.zeta_pack_root->lpVtbl->Release(s_d3d.zeta_pack_root);
     if(s_d3d.zeta_pack_pso)s_d3d.zeta_pack_pso->lpVtbl->Release(s_d3d.zeta_pack_pso);
     for(int i=0;i<MAX_OFF_RTS;++i)if(s_d3d.off_rt[i].packed)s_d3d.off_rt[i].packed->lpVtbl->Release(s_d3d.off_rt[i].packed);
+    for(int i=0;i<MAX_OFF_RTS;++i)if(s_d3d.off_rt[i].sub)s_d3d.off_rt[i].sub->lpVtbl->Release(s_d3d.off_rt[i].sub);
     if(s_color_grid_root){s_color_grid_root->lpVtbl->Release(s_color_grid_root);s_color_grid_root=NULL;}
     if(s_color_grid_pso){s_color_grid_pso->lpVtbl->Release(s_color_grid_pso);s_color_grid_pso=NULL;}
     free(s_fp_capture); s_fp_capture=NULL;
