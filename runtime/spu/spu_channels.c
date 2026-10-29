@@ -2259,6 +2259,26 @@ static int spu_smc_microstep(spu_context* ctx)
               fprintf(stderr, "[spu-smc] microstep img=%d pc=0x%05X word 0x%08X not in the"
                       " microstep set -- handing to the interpreter (steps=%d)\n",
                       ctx->image_id, pc, w, steps); }
+        /* SPU_INTERP_ENTRIES=1: every distinct (image, entry pc) that falls
+         * back to the interpreter here, once -- an indirect target the lift
+         * has no entry for, i.e. a candidate extra function start. */
+        { static int s_ie = -1;
+          if (s_ie < 0) { const char* e = getenv("SPU_INTERP_ENTRIES"); s_ie = e && e[0] == '1'; }
+          if (s_ie) {
+              static volatile uint32_t seen[256]; static volatile long n_seen;
+              const uint32_t key = ((uint32_t)ctx->image_id << 20) | (ctx->pc & SPU_LS_MASK);
+              int known = 0;
+              for (long i = 0; i < n_seen && i < 256; ++i) if (seen[i] == key) { known = 1; break; }
+              if (!known) {
+                  const long slot = _InterlockedIncrement(&n_seen) - 1;
+                  if (slot < 256) {
+                      seen[slot] = key;
+                      fprintf(stderr, "[spu-interp-entry] img=%d pc=0x%05X first-word=0x%08X lr=0x%05X\n",
+                              ctx->image_id, ctx->pc & SPU_LS_MASK, w,
+                              ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+                  }
+              }
+          } }
         ctx->pc = pc;
         /* Stop at the drain's return point too: it sits mid-function, so it is
          * no lifted entry, and a job's return would otherwise run on through
