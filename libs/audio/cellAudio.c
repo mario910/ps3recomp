@@ -376,7 +376,7 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
          * it, unlike PS3_NO_AUDIO, which sends the title down its no-audio
          * path. For unattended runs. */
         static int mute = -1;
-        if (mute < 0) mute = getenv("PS3_MUTE") ? 1 : 0;
+        if (mute < 0) { const char* e = getenv("PS3_MUTE"); mute = e && e[0] && e[0] != '0'; }
         memcpy(buf, stereo_samples, num_samples * 2 * sizeof(float));
         s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, num_samples,
                                                mute ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
