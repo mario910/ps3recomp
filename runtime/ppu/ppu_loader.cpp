@@ -32,6 +32,7 @@
 #endif
 
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
+#include "ppu_tls_image.h"
 #define PPU_NO_INLINE_LOADS   /* this file defines the out-of-line accessors */
 #include "ppu_recomp.h"
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE timeline */
@@ -1222,6 +1223,12 @@ extern "C" uint32_t ppu_vm_size = 0;
  * the free window just below the mmapper region (0x11000000) and above any
  * game's high data segments, so it doesn't collide with the static image. */
 static uint32_t g_tls_vaddr = 0, g_tls_filesz = 0, g_tls_memsz = 0;
+extern "C" int ppu_tls_copy_template(uint32_t destination, uint32_t capacity)
+{
+    const uint64_t limit = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
+    return ps3_ppu_tls_copy_image(vm_base, limit, destination, capacity,
+                                 g_tls_vaddr, g_tls_filesz, g_tls_memsz);
+}
 #define PPU_TLS_IMG   VM_PPU_TLS_BASE
 #define PPU_TLS_TP    (PPU_TLS_IMG + 0x7000u)
 
