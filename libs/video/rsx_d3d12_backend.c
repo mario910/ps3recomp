@@ -3006,6 +3006,21 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
 {
     if (cube || depth < 2) depth = 1;
     const int vol = depth > 1;   /* volume: slices consecutive, mip 0 only */
+    /* RSX_VOL_DUMP=<dir>: raw guest bytes of each volume texture, once, for
+     * offline inspection of its slice layout (vol_<off>_<w>x<h>x<d>_f<fmt>_m<mips>_p<pitch>.bin). */
+    if (vol && vm_base) { static const char* dir = (const char*)1; static u32 seen[32]; static int ns;
+      if (dir == (const char*)1) dir = getenv("RSX_VOL_DUMP");
+      int known = 0; for (int i = 0; i < ns; i++) if (seen[i] == off) known = 1;
+      if (dir && !known && ns < 32) {
+          seen[ns++] = off;
+          rsx_tex_layout vl; rsx_texture_layout_pitched(fmt, w, h, source_pitch, &vl);
+          const u64 bytes = (u64)vl.face_bytes * depth * 2u;   /* 2x: room for mips/padding */
+          char path[512];
+          snprintf(path, sizeof path, "%s/vol_%08X_%ux%ux%u_f%02X_m%u_p%u.bin", dir, off, w, h, depth, fmt, mips, source_pitch);
+          FILE* f = fopen(path, "wb");
+          if (f) { fwrite(vm_base + off, 1, (size_t)bytes, f); fclose(f); }
+          fprintf(stderr, "[tex3d] dumped %s\n", path);
+      } }
     /* TEX_BUDGET=<n>: cap texture uploads per frame. Off by default -- it was
      * tried against the TDR and does not help, because PERF shows the upload
      * path costing 0.01s for 775 calls. Kept because it is the right lever if a
@@ -3246,7 +3261,28 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * mip chain -- which is exactly what the dumps showed, every face after the
      * first a progressively smaller copy of the first. */
     u32 _face_bytes = cube ? rsx_texture_cube_face_stride(fmt,w,h,mips,source_pitch) : tl.face_bytes;
-    const u32 _nfaces     = cube ? 6u : depth;   /* a volume's slices, mip 0 */
+    u32 _nfaces = cube ? 6u : depth;   /* a volume's slices, mip 0 */
+    /* A compressed volume is not a stack of 2D images: slices come in groups
+     * of four, and inside a group each 4x4 block is followed by the same block
+     * of the group's next slices (block-major, slice-minor; a last short group
+     * has fewer). Decoding slices as consecutive images sheared Buzz Quiz
+     * World's star and logo flip-books into horizontal streaks. Write each
+     * slice's blocks in row order straight into the upload buffer; linear
+     * volumes keep the generic per-slice path below. */
+    if (vol && dxt) {
+        const u32 bw = (w + 3) / 4, bh = blkrows, blk = blkrow / bw;
+        const u8* src0 = vm_base + off;
+        for (u32 z = 0; z < depth; z++) {
+            const u32 group = z / 4u, gsize = (depth - group * 4u < 4u) ? depth - group * 4u : 4u;
+            const u8* gbase = src0 + (u64)group * 4u * bw * bh * blk;
+            u8* dst = (u8*)mapped + (u64)z * pitch * bh;
+            for (u32 by = 0; by < bh; by++)
+                for (u32 bx = 0; bx < bw; bx++)
+                    memcpy(dst + (u64)by * pitch + (u64)bx * blk,
+                           gbase + ((u64)(by * bw + bx) * gsize + (z & 3u)) * blk, blk);
+        }
+        _nfaces = 0;   /* done: skip the per-face conversion */
+    }
     const u32 _off0 = off; u8* const _map0 = (u8*)mapped;
     for (u32 _f = 0; _f < _nfaces; _f++) {
     off    = _off0 + _f * _face_bytes;
