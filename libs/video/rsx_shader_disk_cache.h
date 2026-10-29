@@ -30,6 +30,14 @@ static const char* rsx_shader_cache_dir(void)
     return dir[0] ? dir : NULL;
 }
 
+/* Time spent in D3DCompile on cache misses since the backend last reset
+ * these (once per presented frame): what a [slow-frame] report charges to
+ * shader compilation. Single translation unit (the D3D12 backend). */
+static double s_rsx_stall_hlsl_ms;
+static unsigned s_rsx_stall_hlsl_n;
+static double s_rsx_stall_disk_ms;   /* cache hits: file open + read */
+static unsigned s_rsx_stall_disk_n;
+
 static uint64_t rsx_shader_fnv(uint64_t h, const void* data, size_t n)
 {
     const unsigned char* p = (const unsigned char*)data;
@@ -55,6 +63,7 @@ static HRESULT rsx_d3d_compile_cached(const char* src, size_t src_len, const cha
     char path[600];
     snprintf(path, sizeof path, "%s\\%016llx.dxbc", dir, (unsigned long long)h);
 
+    LARGE_INTEGER disk_t0; QueryPerformanceCounter(&disk_t0);
     FILE* f = fopen(path, "rb");
     if (f) {
         RsxShaderCacheHeader hd;
@@ -76,13 +85,22 @@ static HRESULT rsx_d3d_compile_cached(const char* src, size_t src_len, const cha
             fclose(f);
             *code = blob;
             if (errors) *errors = NULL;
+            LARGE_INTEGER disk_t1, disk_f;
+            QueryPerformanceCounter(&disk_t1); QueryPerformanceFrequency(&disk_f);
+            s_rsx_stall_disk_ms += (double)(disk_t1.QuadPart - disk_t0.QuadPart) * 1000.0 / (double)disk_f.QuadPart;
+            s_rsx_stall_disk_n++;
             return S_OK;
         }
         if (blob) blob->lpVtbl->Release(blob);
         fclose(f);
     }
 
+    LARGE_INTEGER compile_t0, compile_t1, compile_f;
+    QueryPerformanceCounter(&compile_t0);
     HRESULT hr = D3DCompile(src, src_len, name, NULL, NULL, entry, target, flags, 0, code, errors);
+    QueryPerformanceCounter(&compile_t1); QueryPerformanceFrequency(&compile_f);
+    s_rsx_stall_hlsl_ms += (double)(compile_t1.QuadPart - compile_t0.QuadPart) * 1000.0 / (double)compile_f.QuadPart;
+    s_rsx_stall_hlsl_n++;
     if (SUCCEEDED(hr) && *code) {
         char tmp[620];
         snprintf(tmp, sizeof tmp, "%s.%lu.tmp", path, (unsigned long)GetCurrentThreadId());

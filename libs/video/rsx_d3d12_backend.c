@@ -135,6 +135,15 @@ static int rsx_pso_cache_open(ID3D12Device* device)
     return 1;
 }
 
+/* Pipeline-library misses compiled since the last presented frame
+ * ([slow-frame] report). */
+static double s_rsx_stall_pso_ms;
+static unsigned s_rsx_stall_pso_n;
+static long long s_rsx_stall_tex_qpc;   /* texture binds/uploads, QPC ticks */
+static double s_rsx_stall_psolib_ms;     /* pipeline-library loads (hits and misses) */
+static unsigned s_rsx_stall_psolib_n;
+static long long s_rsx_stall_fp_qpc, s_rsx_stall_vs_qpc;   /* whole pipeline / VS lookups */
+
 HRESULT rsx_pso_create_graphics(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
                                 ID3D12PipelineState** out)
 {
@@ -148,10 +157,20 @@ HRESULT rsx_pso_create_graphics(ID3D12Device* device, const D3D12_GRAPHICS_PIPEL
              (unsigned long long)rsx_pso_hash_desc(desc, 14695981039346656037ull),
              (unsigned long long)rsx_pso_hash_desc(desc, 0x9E3779B97F4A7C15ull));
     ID3D12PipelineLibrary* lib = s_pso_cache.lib;
+    LARGE_INTEGER load_t0, load_t1, load_f;
+    QueryPerformanceCounter(&load_t0);
     HRESULT hr = lib->lpVtbl->LoadGraphicsPipeline(lib, name, desc, &IID_ID3D12PipelineState, (void**)out);
+    QueryPerformanceCounter(&load_t1); QueryPerformanceFrequency(&load_f);
+    s_rsx_stall_psolib_ms += (double)(load_t1.QuadPart - load_t0.QuadPart) * 1000.0 / (double)load_f.QuadPart;
+    s_rsx_stall_psolib_n++;
     if (SUCCEEDED(hr) && *out) { ReleaseSRWLockExclusive(&s_pso_cache.lock); return hr; }
     *out = NULL;
+    LARGE_INTEGER create_t0, create_t1, create_f;
+    QueryPerformanceCounter(&create_t0);
     hr = device->lpVtbl->CreateGraphicsPipelineState(device, desc, &IID_ID3D12PipelineState, (void**)out);
+    QueryPerformanceCounter(&create_t1); QueryPerformanceFrequency(&create_f);
+    s_rsx_stall_pso_ms += (double)(create_t1.QuadPart - create_t0.QuadPart) * 1000.0 / (double)create_f.QuadPart;
+    s_rsx_stall_pso_n++;
     if (SUCCEEDED(hr) && *out && SUCCEEDED(lib->lpVtbl->StorePipeline(lib, name, *out))) {
         s_pso_cache.stored++;
         s_pso_cache.last_store = GetTickCount64();
@@ -2137,7 +2156,16 @@ static u32 vp_hash_ucode(const u8* p, u32 n)
     return h ? h : 1u;
 }
 
+static int vp_get_vs_impl(const rsx_state* st);
+/* Timed for [slow-frame]; the work is vp_get_vs_impl. */
 static int vp_get_vs(const rsx_state* st)
+{
+    LARGE_INTEGER t0, t1; QueryPerformanceCounter(&t0);
+    const int r = vp_get_vs_impl(st);
+    QueryPerformanceCounter(&t1); s_rsx_stall_vs_qpc += t1.QuadPart - t0.QuadPart;
+    return r;
+}
+static int vp_get_vs_impl(const rsx_state* st)
 {
     extern int rsx_vp_decompile(const uint8_t*, u32, char*, u32);
     if (!st || st->vp_ucode_bytes < 16) return -1;
@@ -5025,10 +5053,13 @@ static void render_frame(void)
                     double _tt = perf_on() ? perf_now() : 0.0;
                     int _cube = dr->tex[_u].cube && (dr_cube_mask(dr) & (1u << _u));
                     int _vol = !_cube && (dr_vol_mask(dr) & (1u << _u));
+                    LARGE_INTEGER _up0, _up1; QueryPerformanceCounter(&_up0);
                     int ts = vp_upload_tex_slot(dr->tex[_u].off, dr->tex[_u].w,
                                                 dr->tex[_u].h, dr->tex[_u].fmt,
                                                 _cube, dr->tex[_u].mips, dr->tex[_u].pitch,
                                                 _vol ? dr->tex[_u].depth : 1u);
+                    QueryPerformanceCounter(&_up1);
+                    s_rsx_stall_tex_qpc += _up1.QuadPart - _up0.QuadPart;
                     if (perf_on()) { s_perf_tex += perf_now() - _tt; s_perf_ntex++;
                         s_perf_texbytes += (u64)dr->tex[_u].w * dr->tex[_u].h * 4u; }
                     /* Both forms of the offset are in hand here; the filters
@@ -5061,11 +5092,13 @@ static void render_frame(void)
         }
         if (perf_on()) s_perf_srv += perf_now() - _sv0;
         double _ps0 = perf_on() ? perf_now() : 0.0;
+        LARGE_INTEGER _fp0, _fp1; QueryPerformanceCounter(&_fp0);
         ID3D12PipelineState* draw_pso = dr->fp_addr ? vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
                                        dr_num_rts(dr),
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
                                        dr->fp_exp32, dr->cmask, dr->cull, dr_cube_mask(dr) | (dr_vol_mask(dr) << 8),dr->depth_key,dr) : NULL;
+        QueryPerformanceCounter(&_fp1); s_rsx_stall_fp_qpc += _fp1.QuadPart - _fp0.QuadPart;
         /* Pin before the next lookup can evict this PSO. Replay uses this
          * exact pipeline, not a second lookup into the mutating FIFO cache. */
         rsx_frame_refs_pin(&s_draw_pipelines, _d, draw_pso, pipeline_retain);
@@ -6041,6 +6074,34 @@ skip_dump_consider: ;
         static u64 s_tframes = 0;
         if(presented)s_tframes++;
         ULONGLONG tnow = GetTickCount64();
+        /* [slow-frame]: a presented frame more than 100 ms after the previous
+         * one (after boot), with what the backend itself spent inside it:
+         * HLSL compiles (cache misses), shader-cache file hits, pipeline
+         * compiles (library misses), texture binds/uploads. Whatever is left
+         * of the interval was spent waiting on the guest (PPU/SPU/FIFO). */
+        { static LARGE_INTEGER prev; static ULONGLONG first_tick;
+          LARGE_INTEGER now, freq; QueryPerformanceCounter(&now); QueryPerformanceFrequency(&freq);
+          if (!first_tick) first_tick = tnow;
+          if (presented) {
+              const double ms = prev.QuadPart ? (double)(now.QuadPart - prev.QuadPart) * 1000.0 / (double)freq.QuadPart : 0.0;
+              if (ms > 100.0 && s_d3d.frame_count > 600) {
+                  static unsigned reported;
+                  if (reported++ < 200)
+                      fprintf(stderr, "[slow-frame] t=%.1fs frame=%llu interval=%.0f ms draws=%u"
+                              " hlsl=%u/%.0fms cache-hits=%u/%.0fms pso-lib=%u/%.0fms pso=%u/%.0fms tex=%.0fms fp-path=%.0fms vs-path=%.0fms\n",
+                              (double)(tnow - first_tick) / 1000.0, (unsigned long long)s_d3d.frame_count, ms,
+                              s_dbg_last_draws, s_rsx_stall_hlsl_n, s_rsx_stall_hlsl_ms,
+                              s_rsx_stall_disk_n, s_rsx_stall_disk_ms, s_rsx_stall_psolib_n, s_rsx_stall_psolib_ms,
+                              s_rsx_stall_pso_n, s_rsx_stall_pso_ms,
+                              (double)s_rsx_stall_tex_qpc * 1000.0 / (double)freq.QuadPart,
+                              (double)s_rsx_stall_fp_qpc * 1000.0 / (double)freq.QuadPart,
+                              (double)s_rsx_stall_vs_qpc * 1000.0 / (double)freq.QuadPart);
+              }
+              prev = now;
+              s_rsx_stall_hlsl_ms = s_rsx_stall_disk_ms = s_rsx_stall_pso_ms = s_rsx_stall_psolib_ms = 0.0;
+              s_rsx_stall_hlsl_n = s_rsx_stall_disk_n = s_rsx_stall_pso_n = s_rsx_stall_psolib_n = 0;
+              s_rsx_stall_tex_qpc = s_rsx_stall_fp_qpc = s_rsx_stall_vs_qpc = 0;
+          } }
         if (s_tt0 == 0) s_tt0 = tnow;
         if (tnow - s_tt0 >= 1000 && s_d3d.hwnd) {
             extern char g_rsx_title_base[128];
