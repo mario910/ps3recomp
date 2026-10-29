@@ -186,6 +186,10 @@ typedef struct spu_context {
      * spurs_policy.c memsets and calls the init immediately after; keep it so. */
     SPU_ALIGN16 uint8_t ls_store[SPU_LS_SIZE];
     uint8_t* ls;
+    /* Private MFC engine, published on first channel access. The context's
+     * execution owner retains it until spu_mfc_release; directory lookup is
+     * not needed on every DMA register write. Not a hardware/SPU-id cache. */
+    void* mfc_private;
 
     /* Program counter (local store address, 0-0x3FFFF) */
     uint32_t pc;
@@ -431,6 +435,21 @@ static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
     ctx->status = SPU_STATUS_STOPPED;
 }
 
+/* Same result as spu_context_init, except LS bytes [0, keep) are left as they
+ * are: for a caller that overwrites exactly that prefix next (SPURS job
+ * staging copies the job binary to LS 0), zeroing it first is wasted work. */
+static inline void spu_context_init_keep_ls_prefix(spu_context* ctx, uint32_t spu_id, uint32_t keep)
+{
+    if (keep > SPU_LS_SIZE) keep = SPU_LS_SIZE;
+    memset(ctx->gpr, 0, sizeof(ctx->gpr));
+    memset(ctx->ls_store + keep, 0, SPU_LS_SIZE - keep);
+    uint8_t* after = (uint8_t*)ctx->ls_store + SPU_LS_SIZE;
+    memset(after, 0, (size_t)((uint8_t*)(ctx + 1) - after));
+    ctx->ls     = ctx->ls_store;
+    ctx->spu_id = spu_id;
+    ctx->status = SPU_STATUS_STOPPED;
+}
+
 /* ---------------------------------------------------------------------------
  * Local store access helpers
  * -----------------------------------------------------------------------*/
@@ -537,15 +556,27 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
     }
 }
 
+/* The env-armed LS debug probes (SPU_LS_WATCH, SPU_SMC_WATCH, the WWS policy
+ * dumps) cost several global and ctx re-reads per LS access: the byte-wise LS
+ * stores may alias them. A build may compile hot lifted images with
+ * SPU_LS_DEBUG_HOOKS=0; those images then ignore the probes, nothing else. */
+#ifndef SPU_LS_DEBUG_HOOKS
+#define SPU_LS_DEBUG_HOOKS 1
+#endif
+
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
+#if SPU_LS_DEBUG_HOOKS
     if (__builtin_expect(g_spu_ls_probe != 0, 0) || (ctx->image_id == 2 && ctx->policy_mode))
         spu_ls_read_probe(ctx, lsa);
+#endif
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
+#if SPU_LS_DEBUG_HOOKS
     spu_ls_watch_hit2(lsa, 0, p, (uint32_t)ctx->pc & SPU_LS_MASK,
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+#endif
 #if SPU_LS_FAST
     uint32_t w0, w1, w2, w3;
     memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
@@ -626,8 +657,10 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
      * why it resolves to an empty buffer: the resolved address, the whole
      * bufferSetArray (0xDF0), and the live loadCommands (0xC00) whose RunJob
      * command (commandNum==5) names the code buffer set. */
+#if SPU_LS_DEBUG_HOOKS
     if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode)
         spu_ls_write_probe_pre(ctx, lsa, val);
+#endif
 #if SPU_LS_FAST
     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
     uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
@@ -642,10 +675,12 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 3] = (uint8_t)w;
     }
 #endif
+#if SPU_LS_DEBUG_HOOKS
     spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK);
     if (__builtin_expect(g_spu_smc_watch != 0, 0))
         spu_ls_write_probe_smc(ctx, lsa, p);
+#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -796,6 +831,8 @@ void spu_ch_wake(spu_context* ctx);
  * SPU_HOST_DEPTH_MAX overrides the limit. */
 void spu_depth_guard(spu_context* ctx);
 int  spu_tailret_enabled(void);
+extern int g_spu_tailret;                              /* -1 until spu_tailret_enabled ran */
+void spu_drain_step_hooks(spu_context* ctx, void* fn); /* spu_drain.c: lockstep + launch check */
 /* Take a pending SPU interrupt (spu_drain.c): srr0 <- ctx->pc, int_enable <- 0,
  * decode the guest-planted branch at LS 0 into ctx->pc, and return the
  * dispatcher to run instead of the interrupted transfer. Returns `tf`
@@ -864,7 +901,8 @@ static inline void spu_pchist_tick(const spu_context* ctx)
              * matching brsl/bisl never pops and a poll loop nests a frame \
              * per iteration until the host stack dies. Off by default --  \
              * this changes core dispatch for every title. */              \
-            if (spu_tailret_enabled() && (ctx)->host_depth > 0 &&          \
+            if ((g_spu_tailret >= 0 ? g_spu_tailret : spu_tailret_enabled()) && \
+                (ctx)->host_depth > 0 &&                                   \
                 (((uint32_t)(ctx)->pc & SPU_LS_MASK) ==                    \
                  ((ctx)->gpr[0]._u32[0] & SPU_LS_MASK))) {                 \
                 g_spu_trampoline_fn = 0;                                   \
@@ -872,8 +910,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
             }                                                              \
             void (*_tf)(spu_context*) = g_spu_trampoline_fn;    \
             g_spu_trampoline_fn = 0;                            \
-            yz_lockstep_tick(ctx);                             \
-            spu_task_launch_check((ctx), (void*)_tf);          \
+            spu_drain_step_hooks((ctx), (void*)_tf);           \
             if ((ctx)->int_enable &&                            \
                 ((ctx)->event_status & (ctx)->event_mask))      \
                 _tf = spu_take_interrupt((ctx), _tf);          \

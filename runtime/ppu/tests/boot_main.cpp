@@ -599,7 +599,7 @@ static __declspec(thread) char   s_dbg_capbuf[16384];
 static __declspec(thread) char*  s_dbg_cap = NULL;
 static __declspec(thread) size_t s_dbg_capn = 0;
 
-extern "C" const char* g_hle_inflight[];   /* ppu_hle.cpp; 64 entries */
+extern "C" const char* ps3_hle_inflight_name(unsigned);   /* ppu_hle.cpp; 64 slots */
 extern "C" void ppu_report_guest_lrs(void); /* ppu_loader.cpp */
 
 static void dump_threads(const char* label, HMODULE self)
@@ -618,7 +618,7 @@ static void dump_threads(const char* label, HMODULE self)
      * case this answers. */
     { int any = 0;
       for (unsigned t = 0; t < 64u; t++) {
-          const char* n = g_hle_inflight[t];
+          const char* n = ps3_hle_inflight_name(t);
           if (!n) continue;
           if (!any) { dbg_printf("[WATCHDOG] guest threads inside an HLE:\n"); any = 1; }
           dbg_printf("[WATCHDOG]   guest-tid %-3u in %s\n", t, n);

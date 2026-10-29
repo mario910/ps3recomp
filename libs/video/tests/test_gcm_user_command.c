@@ -21,6 +21,17 @@ ps3_guest_caller_fn g_ps3_guest_caller;
 static unsigned calls;
 static uint32_t last;
 static atomic_int paused, resume_pump;
+static atomic_uint stress_ack;
+enum { STRESS_COMMANDS = 10000 };
+static void* producer_thread(void* unused)
+{
+    (void)unused;
+    for (unsigned n = 1; n <= STRESS_COMMANDS; ++n) {
+        cellGcmQueueUserCommand(0x1000 + n);
+        while (atomic_load(&stress_ack) != n) sched_yield();
+    }
+    return NULL;
+}
 static void* pump_thread(void* unused)
 {
     (void)unused; ppu_gcm_pump(); return NULL;
@@ -36,6 +47,7 @@ static void callback(uint32_t opd, uint64_t a, uint64_t b, uint64_t c,
     if (opd == 0x200) { cellGcmQueueUserCommand(0xDD); return; }
     assert(opd == 0x100 && !b && !c && !d && !e && !f && !h && !i);
     calls++; last = (uint32_t)a;
+    if (a > 0x1000) atomic_store(&stress_ack, (unsigned)a - 0x1000);
     if (a == 0xAA) { cellGcmQueueUserCommand(0xBB); ppu_gcm_pump(); }
     return;
 }
@@ -81,5 +93,20 @@ int main(void)
     ppu_gcm_pump(); assert(calls == 7);
     cellGcmSetUserHandler(NULL);
     cellGcmQueueUserCommand(7); ppu_gcm_pump(); assert(calls == 7);
+    /* Idle fast peeks must not consume a publication racing the next call.
+     * One producer waits for an acknowledgement before replacing the slot,
+     * so every command (rather than only the last coalesced cause) is owed. */
+    cellGcmSetUserHandler((CellGcmUserHandler)(uintptr_t)0x100);
+    for (unsigned n = 0; n < 100000; ++n) ppu_gcm_pump();
+    assert(calls == 7);
+    assert(pthread_create(&worker, NULL, producer_thread, NULL) == 0);
+    while (atomic_load(&stress_ack) != STRESS_COMMANDS) {
+        ppu_gcm_pump();
+        sched_yield();
+    }
+    assert(pthread_join(worker, NULL) == 0);
+    assert(calls == 7 + STRESS_COMMANDS && last == 0x1000 + STRESS_COMMANDS);
+    for (unsigned n = 0; n < 100000; ++n) ppu_gcm_pump();
+    assert(calls == 7 + STRESS_COMMANDS);
     puts("Deferred GCM user-command checks passed");
 }

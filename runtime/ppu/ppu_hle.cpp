@@ -20,6 +20,9 @@
 #include <chrono>
 #include "ppu_recomp.h"   /* ppu_context */
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
+#include "hle_nid_index.h"
+#include "hle_inflight.h"
+#include "ps3emu/ps3_ftrace.h"
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
 #include <stdlib.h>       /* getenv */
 #include <stdint.h>
@@ -32,11 +35,19 @@
 static ps3_nid_entry  g_hle_storage[HLE_NID_CAP];
 static ps3_nid_table  g_hle_nids;
 static int            g_hle_inited = 0;
+static HleNidIndex<HLE_NID_CAP * 2> g_hle_index;
+static ps3_nid_entry* hle_find(uint32_t nid)
+{
+    int i = g_hle_index.find(nid);
+    return i >= 0 ? &g_hle_storage[i] : nullptr;
+}
 
 extern "C" void ps3_hle_register(uint32_t nid, const char* name, void* handler)
 {
     if (!g_hle_inited) { ps3_nid_table_init(&g_hle_nids, g_hle_storage, HLE_NID_CAP); g_hle_inited = 1; }
-    ps3_nid_table_add(&g_hle_nids, nid, name, handler);
+    uint32_t index = g_hle_nids.count;
+    if (ps3_nid_table_add(&g_hle_nids, nid, name, handler) == 0)
+        g_hle_index.insert(nid, index);
 }
 
 extern "C" uint32_t ps3_hle_count(void) { return g_hle_inited ? g_hle_nids.count : 0; }
@@ -48,10 +59,12 @@ typedef void (*hle_ctx_fn)(ppu_context*);
 #define HLE_CTX_CAP 256
 static struct { uint32_t nid; hle_ctx_fn fn; const char* name; } g_ctx[HLE_CTX_CAP];
 static uint32_t g_ctx_count = 0;
+static HleNidIndex<HLE_CTX_CAP * 2> g_ctx_index;
 
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn fn)
 {
     if (g_ctx_count < HLE_CTX_CAP) {
+        g_ctx_index.insert(nid, g_ctx_count);
         g_ctx[g_ctx_count].nid = nid; g_ctx[g_ctx_count].fn = fn;
         g_ctx[g_ctx_count].name = name ? name : "?";   /* named in the milestone log */
         g_ctx_count++;
@@ -64,10 +77,9 @@ extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn 
  * "unresolved NID" error it cannot distinguish from a real failure. */
 extern "C" int ps3_hle_has(uint32_t nid)
 {
-    for (uint32_t i = 0; i < g_ctx_count; i++)
-        if (g_ctx[i].nid == nid) return 1;
+    if (g_ctx_index.find(nid) >= 0) return 1;
     if (!g_hle_inited) return 0;
-    ps3_nid_entry* e = ps3_nid_table_find(&g_hle_nids, nid);
+    ps3_nid_entry* e = hle_find(nid);
     return (e && e->handler) ? 1 : 0;
 }
 
@@ -92,7 +104,21 @@ extern "C" const char* g_last_hle_name = "";
  * returned), so the CTR the watchdog prints is not the answer either. This is:
  * set on entry, cleared on every exit path by the guard below. */
 #define PS3_HLE_INFLIGHT_MAX 64
-extern "C" const char* g_hle_inflight[PS3_HLE_INFLIGHT_MAX] = { nullptr };
+static HleInflightSlots<PS3_HLE_INFLIGHT_MAX> g_hle_inflight_slots;
+extern "C" const char* ps3_hle_inflight_name(unsigned thread)
+{
+    return g_hle_inflight_slots.get(thread);
+}
+
+static void hle_note_dispatch(uint32_t nid, const char* name)
+{
+    /* Repeated polling of the SAME import need not bounce the global crash
+     * breadcrumb between cores. In-flight metadata below remains per-call. */
+    if (__atomic_load_n(&g_last_hle_nid, __ATOMIC_RELAXED) != nid)
+        __atomic_store_n(&g_last_hle_nid, nid, __ATOMIC_RELAXED);
+    if (__atomic_load_n(&g_last_hle_name, __ATOMIC_RELAXED) != name)
+        __atomic_store_n(&g_last_hle_name, name, __ATOMIC_RELAXED);
+}
 
 /* Real-PRX bridge: a loaded system PRX (libsre = cellSpurs/cellSync) may export
  * this NID. If so, dispatch into the REAL recompiled Sony code (its OPD -> our
@@ -100,6 +126,8 @@ extern "C" const char* g_hle_inflight[PS3_HLE_INFLIGHT_MAX] = { nullptr };
  * HLE stub. prx_resolve_export returns 0 when no PRX exports the NID, so this is
  * a no-op when no PRX is loaded. */
 extern "C" uint32_t prx_resolve_export(uint32_t nid);
+extern "C" int32_t cellSpursEventFlagTryWait(void*, uint16_t*, uint32_t);
+extern "C" int spurs_event_flag_busy_probe(uint32_t, uint16_t);
 extern "C" void     ps3_indirect_call(ppu_context* ctx);
 extern "C" uint32_t vm_read32(uint64_t a);
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
@@ -221,6 +249,17 @@ static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx,
     for (int j = 0; j < ht_used; j++) ht_n[j] = 0;
 }
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
+extern "C" int ps3_spurs_try_busy_native(uint32_t flag)
+{
+    constexpr uint32_t nid = 0x6D2D9339u;
+    if (g_ctx_index.find(nid) >= 0 || prx_resolve_export(nid)) return -1;
+    ps3_nid_entry* implementation = hle_find(nid);
+    if (!implementation || implementation->handler != (void*)cellSpursEventFlagTryWait)
+        return -1;
+    if (ppu_gcm_pump) ppu_gcm_pump();
+    return spurs_event_flag_busy_probe(flag, 1);
+}
+
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
@@ -259,15 +298,44 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * base (e.g. func_002B03AC's `*(r2-0x4B34)` FMOD list head -> null -> infinite walk
      * -> no draws). Snapshot the caller r2+sp now and restore BOTH the live r2 and the
      * ABI slot on every exit path (offset 40 = 0x28 is the reserved TOC doubleword). */
-    struct _TocGuard { ppu_context* c; uint64_t toc, sp;
-        ~_TocGuard(){ c->gpr[2] = toc; vm_write64(sp + 0x28, toc);
+    struct _TocGuard { ppu_context* c; uint64_t toc, sp, trace_start; uint32_t nid, lr; const char* previous_hle;
+        ~_TocGuard(){
+                      if (trace_start) {
+                          uint64_t end = ps3_ft_now();
+                          if (end - trace_start >= ps3_ft_min_ns())
+                              ps3_ft_span(PS3_FT_HLE, (uint32_t)c->thread_id, nid, lr, trace_start, end);
+                      }
+                      c->gpr[2] = toc; vm_write64(sp + 0x28, toc);
                       unsigned t = (unsigned)c->thread_id;
-                      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr; }
-    } _tg{ ctx, ctx->gpr[2], ctx->gpr[1] };
+                      g_hle_inflight_slots.set(t, previous_hle); }
+    } _tg{ ctx, ctx->gpr[2], ctx->gpr[1], PS3_FT_ON() ? ps3_ft_now() : 0, nid, (uint32_t)ctx->lr,
+           g_hle_inflight_slots.get((unsigned)ctx->thread_id) };
     /* Deliver any pending vblank/flip tick on THIS (guest) thread, serialized with
      * guest execution -- the vblank ticker only marks ticks pending; the handlers
      * run here so guest code never executes concurrently on the ticker thread. */
     if (ppu_gcm_pump) ppu_gcm_pump();
+
+    /* Opt-in native completion poll, selected by the port's audited LR.
+     * Keep the normal pump, TOC guard, trace span and real event handler.
+     * Never supersede a PRX or context override, nor another registered
+     * implementation. Only bypass generic dispatch/diagnostic lookup work. */
+    static const uint32_t native_poll_lr = [] {
+        const char* value = getenv("SPURS_NATIVE_POLL_LR");
+        return value ? (uint32_t)strtoul(value, nullptr, 0) : 0u;
+    }();
+    if (native_poll_lr && nid == 0x6D2D9339u && ctx->lr == native_poll_lr &&
+        g_ctx_index.find(nid) < 0 && !prx_resolve_export(nid)) {
+        ps3_nid_entry* native = hle_find(nid);
+        if (native && native->handler == (void*)cellSpursEventFlagTryWait) {
+            ppu_prof_stamp(ctx, native_poll_lr);
+            hle_note_dispatch(nid, native->name);
+            g_hle_inflight_slots.set((unsigned)ctx->thread_id, native->name);
+            ctx->gpr[3] = (uint32_t)cellSpursEventFlagTryWait(
+                (void*)(uintptr_t)ctx->gpr[3], (uint16_t*)(uintptr_t)ctx->gpr[4],
+                (uint32_t)ctx->gpr[5]);
+            return;
+        }
+    }
 
     /* YDKJ_TUNERFIX (at the top so it wins over any registered handler): the
      * profiler-presence query sysPrxForUser 0xE0998DBF, called by libsre
@@ -283,20 +351,11 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     }
     /* Guest-PC breadcrumb for the sampling profiler (see lv2_syscall). */
     ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
-    g_last_hle_nid = nid;
-    /* Stamp the NAME here too, not only where a handler is found below.
-     *
-     * These are read as a pair -- the watchdog prints "last HLE call = <nid>
-     * (<name>)" -- but they were written at different points: the nid on every
-     * dispatch, the name only when a handler resolved. So an UNIMPLEMENTED nid
-     * advanced the number and left the previous implemented call's name behind,
-     * and the pair printed as one confident fact.
-     *
-     * Guitar Hero III wedges on sys_spinlock_unlock (0x5267CB35) and the
-     * watchdog reported it as "cellPadInit" -- which for a game that needs a
-     * guitar controller is an extremely convincing wrong answer. Placeholder
-     * now, overwritten with the real name once the handler is known. */
-    g_last_hle_name = "(unimplemented)";
+    /* Publish the breadcrumb at the actual dispatch below, after resolving
+     * its name. A placeholder on EVERY call followed by the real name caused
+     * two global cache-line writes even when both pollers called one import.
+     * Unimplemented imports still publish an explicit unimplemented name;
+     * never attach an old resolved handler's name to a newly unresolved NID. */
 
     /* Boot trace: log the first N HLE calls (PS3_HLE_TRACE=N). Invaluable for
      * new-SDK bring-up (e.g. PSL1GHT) where the failure is "nothing happens". */
@@ -419,6 +478,8 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             }
         }
         if (opd) {
+            hle_note_dispatch(nid, "(PRX)");
+            g_hle_inflight_slots.set((unsigned)ctx->thread_id, "(PRX)");
             uint32_t code = vm_read32(opd);
             uint32_t toc  = vm_read32(opd + 4);
             { static int64_t st=-2; if(st==-2){const char*e=getenv("SPURS_TRACE"); st=e?1:0;}
@@ -661,8 +722,8 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         }
     }
 
-    for (uint32_t i = 0; i < g_ctx_count; i++)
-        if (g_ctx[i].nid == nid) {
+    { int i = g_ctx_index.find(nid);
+        if (i >= 0) {
             ps3_msf("hle:%s", g_ctx[i].name);
             /* Record the name here too. This loop dispatches every
              * ps3_hle_register_ctx handler -- which is the whole sysPrxForUser
@@ -674,17 +735,17 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
              * Guitar Hero III wedges in sys_spinlock_unlock and was reported as
              * "cellPadInit", which for a game that needs a guitar controller is
              * a very convincing wrong answer to chase. */
-            g_last_hle_name = g_ctx[i].name;
+            hle_note_dispatch(nid, g_ctx[i].name);
             { unsigned t = (unsigned)ctx->thread_id;
-              if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = g_ctx[i].name; }
+              g_hle_inflight_slots.set(t, g_ctx[i].name); }
             g_ctx[i].fn(ctx);
-            { unsigned t = (unsigned)ctx->thread_id;
-              if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr; }
             return;
         }
+    }
 
-    ps3_nid_entry* e = g_hle_inited ? ps3_nid_table_find(&g_hle_nids, nid) : nullptr;
+    ps3_nid_entry* e = g_hle_inited ? hle_find(nid) : nullptr;
     if (!e || !e->handler) {
+        hle_note_dispatch(nid, "(unimplemented)");
         /* Recorded before the diagnostic paths below, several of which return
          * early. An import moving between resolved and unresolved is exactly the
          * kind of change the gate exists to catch. */
@@ -752,14 +813,14 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         ctx->gpr[3] = 0;   /* CELL_OK-ish so the game keeps going */
         return;
     }
-    g_last_hle_name = e->name;
+    hle_note_dispatch(nid, e->name);
     { static long s_ht = -1;
       if (s_ht < 0) { const char* ev = getenv("PS3_HLE_TOP"); s_ht = ev ? atol(ev) : 0;
                       if (s_ht < 0) s_ht = 0; }
       if (s_ht > 0) hle_top_note(nid, e->name, ctx, s_ht); }
     ps3_msf("hle:%s", e->name);
     { unsigned t = (unsigned)ctx->thread_id;
-      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = e->name; }
+      g_hle_inflight_slots.set(t, e->name); }
     if (nid == 0xD0B1D189u /*cellGcmSetTile*/ || nid == 0xDC09357Eu /*SetDisplayBuffer*/) {
         static int _g=0; if (PS3_LOG_FIRST(_g, 8))
             fprintf(stderr, "[hle-trace] %s lr=0x%08X cia=0x%08X r3..r8=%08X %08X %08X %08X %08X %08X\n",

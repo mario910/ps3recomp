@@ -12,11 +12,11 @@ if os.name == 'nt':
 root = Path(__file__).resolve().parents[1]
 spu = root / 'runtime/spu'
 common = ['spu_drain.c', 'spu_lockstep.c', 'spu_coherency.c', 'spu_workload.c',
-          'spurs_policy.c', 'spurs_job.c', 'spu_tsp_weak.c', 'spu_vm_pagemap.c',
+          'spurs_policy.c', 'spurs_job.c', 'spurs_job_ls.c', 'spu_tsp_weak.c', 'spu_vm_pagemap.c',
           'spurs_policy_blob_weak.c', 'spu_interp.c']
 failed = []
 with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
-    for name in ['test_spu_mfc_slots', 'test_spu_mfc_shared_lookup', 'test_spu_coherency', 'test_spu_lockline_peer', 'test_spu_registry_allocation']:
+    for name in ['test_spu_mfc_slots', 'test_spu_mfc_sharded', 'test_spu_mfc_shared_lookup', 'test_spu_coherency', 'test_spu_lockline_peer', 'test_spu_registry_allocation']:
         binary = Path(tmp) / name
         command = [os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
                    '-I' + str(root / 'include'), '-I' + str(spu),

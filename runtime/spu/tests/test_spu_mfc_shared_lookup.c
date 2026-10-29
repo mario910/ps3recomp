@@ -2,7 +2,9 @@
  * Real production lookup and real platform locks are used. Every wait is bounded. */
 #include "../../platform/win32_compat.h"
 #include <stdatomic.h>
+#ifndef _WIN32
 #include <pthread.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -11,6 +13,12 @@ static atomic_int fixture_exclusive_attempts;
 static atomic_int fixture_gate;
 static atomic_int fixture_arrived;
 static atomic_int fixture_gate_timeout;
+static atomic_int fixture_shared_attempts;
+static void fixture_shared(SRWLOCK* lock)
+{
+    if (lock == fixture_lock) atomic_fetch_add(&fixture_shared_attempts, 1);
+    AcquireSRWLockShared(lock);
+}
 static void fixture_exclusive(SRWLOCK* lock)
 {
     if (lock == fixture_lock) {
@@ -30,10 +38,12 @@ static void fixture_exclusive(SRWLOCK* lock)
     AcquireSRWLockExclusive(lock);
 }
 #define AcquireSRWLockExclusive fixture_exclusive
+#define AcquireSRWLockShared fixture_shared
 #define main registry_previous_main
 #include "test_spu_mfc_slots.c"
 #undef main
 #undef AcquireSRWLockExclusive
+#undef AcquireSRWLockShared
 
 struct lookup_request {
     spu_context* ctx;
@@ -93,6 +103,11 @@ int main(void)
     spu_context* ctx = calloc(1, sizeof(*ctx));
     CHECK(ctx != NULL);
     (void)mfc_for(ctx);
+    atomic_store(&fixture_shared_attempts, 0);
+    atomic_store(&fixture_exclusive_attempts, 0);
+    for (unsigned n = 0; n < 100000; ++n) CHECK(mfc_for(ctx) != NULL);
+    CHECK(atomic_load(&fixture_shared_attempts) == 0);
+    CHECK(atomic_load(&fixture_exclusive_attempts) == 0);
     read_lock_case(ctx, 0);
     read_lock_case(ctx, 1);
     CHECK(s_mfc_slots == NULL);

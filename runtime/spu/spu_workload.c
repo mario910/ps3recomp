@@ -6,6 +6,7 @@
  * spu_workload_dispatch(); the registry is populated by the title's lifted set.
  */
 #include "spu_workload.h"
+#include "../platform/thread_name.h"
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
 #include "../ps3_log.h"      /* ps3_log_verbose */
 #include <stdio.h>
@@ -13,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/log_sample.h"
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -26,6 +28,18 @@
  * as opposed to the 64-byte context handshake DMAs. The dispatcher's
  * YDKJ_CRI_RESUME poll-loop watches this to know real work arrived. */
 int g_cri_video_dma = 0;
+static int async_log_full;
+static unsigned async_log_samples[3][65];
+__attribute__((constructor)) static void async_log_init(void)
+{
+    const char* mode=getenv("SPURS_ASYNC_TRACE");
+    async_log_full=mode ? (mode[0] && mode[0]!='0') :
+        (getenv("SPURS_TASKSET_TRACE")!=NULL || ps3_log_verbose());
+}
+static int async_log_message(unsigned stage,int image)
+{
+    return async_log_full || ps3_log_sample(&async_log_samples[stage][image>=0 && image<64?image:64],8);
+}
 
 /* ---- fingerprint ------------------------------------------------------- */
 
@@ -38,6 +52,172 @@ uint64_t spu_workload_fingerprint(const void* data, size_t n)
         h *= 1099511628211ULL;                     /* FNV prime */
     }
     return h;
+}
+
+/* Job chains repeatedly submit the same raw binaries. Re-hashing each byte
+ * with FNV's serial multiply is expensive for thousands of geometry jobs.
+ * A cache hit still compares EVERY byte, so in-place changes and address reuse
+ * cannot select stale lifted code. Thread-local ownership avoids a global
+ * lock on the dispatch path; storage is bounded to 16 SPU-sized images. */
+enum { JOB_FP_CACHE_SIZE = 16 };
+typedef struct {
+    const uint8_t* source;
+    uint8_t* copy;
+    uint32_t size;
+    uint64_t fingerprint;
+    int guard;              /* write-guard index, -1 = none (Windows) */
+    long writes;            /* that guard's write count when last validated */
+} JobFingerprintEntry;
+static _Thread_local JobFingerprintEntry s_job_fp_cache[JOB_FP_CACHE_SIZE];
+
+void spu_workload_clear_job_cache(void)
+{
+    for (unsigned i = 0; i < JOB_FP_CACHE_SIZE; ++i) {
+        free(s_job_fp_cache[i].copy);
+        memset(&s_job_fp_cache[i], 0, sizeof s_job_fp_cache[i]);
+    }
+}
+
+/* Write guard for cached job binaries (Windows). A cache hit used to memcmp the
+ * whole binary on every dispatch -- ~59 KB per geometry job, a measurable share
+ * of the menu's CPU time. Instead the binary's guest pages are made read-only
+ * once it is cached; any write to them (PPU or DMA) faults, and the handler
+ * below restores the protection and bumps the range's write count before the
+ * write proceeds. A hit then needs only: still protected, count unchanged.
+ * Every byte stays covered -- the comparison is replaced by write detection,
+ * not by sampling. A range written more than SPU_JOB_FP_REGUARD times stays
+ * unguarded (memcmp path), so pages shared with hot data cost nothing extra.
+ * SPU_JOB_FP_GUARD=0 disables it. The handler must run before the VM's
+ * commit-on-demand handler, which would otherwise just make the page writable:
+ * it is added (as first) when the first range is guarded, after VM setup. */
+#ifdef _WIN32
+enum { JOB_FP_GUARDS = 32, SPU_JOB_FP_REGUARD = 4 };
+typedef struct {
+    uintptr_t lo, hi;              /* page-aligned host range */
+    volatile LONG writes;          /* faults seen; a cached validation records it */
+    volatile LONG guarded;
+    LONG reguards;
+    DWORD old_protect;
+} JobFpGuard;
+extern uint8_t* vm_base;
+static JobFpGuard s_fp_guards[JOB_FP_GUARDS];
+static volatile LONG s_fp_guard_count;
+static SRWLOCK s_fp_guard_lock = SRWLOCK_INIT;
+static int s_fp_guard_mode = -1;
+
+static LONG CALLBACK job_fp_guard_veh(EXCEPTION_POINTERS* info)
+{
+    const EXCEPTION_RECORD* r = info->ExceptionRecord;
+    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2 ||
+        r->ExceptionInformation[0] != 1)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const uintptr_t addr = (uintptr_t)r->ExceptionInformation[1];
+    const LONG n = s_fp_guard_count;
+    for (LONG i = 0; i < n; i++) {
+        JobFpGuard* g = &s_fp_guards[i];
+        if (addr < g->lo || addr >= g->hi || !g->guarded) continue;
+        AcquireSRWLockExclusive(&s_fp_guard_lock);
+        if (g->guarded) {
+            DWORD ignored;
+            InterlockedIncrement(&g->writes);
+            VirtualProtect((void*)g->lo, g->hi - g->lo, g->old_protect, &ignored);
+            InterlockedExchange(&g->guarded, 0);
+        }
+        ReleaseSRWLockExclusive(&s_fp_guard_lock);
+        return EXCEPTION_CONTINUE_EXECUTION;   /* the write retries on a writable page */
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* Guard index for [image, image+size), protected if allowed; -1 if not. */
+static int job_fp_guard(const uint8_t* image, uint32_t size)
+{
+    if (s_fp_guard_mode < 0) {
+        const char* e = getenv("SPU_JOB_FP_GUARD");
+        s_fp_guard_mode = !(e && e[0] == '0');
+    }
+    if (!s_fp_guard_mode) return -1;
+    const uintptr_t lo = (uintptr_t)image & ~(uintptr_t)0xFFF;
+    const uintptr_t hi = ((uintptr_t)image + size + 0xFFF) & ~(uintptr_t)0xFFF;
+    int found = -1;
+    AcquireSRWLockExclusive(&s_fp_guard_lock);
+    for (LONG i = 0; i < s_fp_guard_count; i++)
+        if (s_fp_guards[i].lo == lo && s_fp_guards[i].hi == hi) { found = (int)i; break; }
+    if (found < 0 && s_fp_guard_count < JOB_FP_GUARDS) {
+        static int veh_added;
+        if (!veh_added) { AddVectoredExceptionHandler(1, job_fp_guard_veh); veh_added = 1; }
+        found = (int)s_fp_guard_count;
+        s_fp_guards[found].lo = lo; s_fp_guards[found].hi = hi;
+        InterlockedIncrement(&s_fp_guard_count);
+    }
+    if (found >= 0) {
+        JobFpGuard* g = &s_fp_guards[found];
+        if (!g->guarded && g->reguards < SPU_JOB_FP_REGUARD) {
+            DWORD old;
+            if (VirtualProtect((void*)lo, hi - lo, PAGE_READONLY, &old)) {
+                if (!g->reguards) g->old_protect = old;
+                g->reguards++;
+                { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
+                    fprintf(stderr, "[spu_workload] job binary write-guard #%d: guest %08X+%X (writes so far %ld)\n",
+                            found, (unsigned)((uintptr_t)image - (uintptr_t)vm_base), size, (long)g->writes); }
+                InterlockedExchange(&g->guarded, 1);
+            }
+        }
+        if (!g->guarded) found = -1;
+    }
+    ReleaseSRWLockExclusive(&s_fp_guard_lock);
+    return found;
+}
+#endif
+
+static uint64_t spu_job_fingerprint(const uint8_t* image, uint32_t size)
+{
+    JobFingerprintEntry* cache = s_job_fp_cache;
+    enum { CACHE_SIZE = JOB_FP_CACHE_SIZE };
+    static _Thread_local unsigned next;
+    if (size > SPU_LS_SIZE) return spu_workload_fingerprint(image, size);
+    unsigned slot = CACHE_SIZE;
+    for (unsigned i = 0; i < CACHE_SIZE; ++i) {
+        if (cache[i].source != image || cache[i].size != size) continue;
+#ifdef _WIN32
+        if (cache[i].guard >= 0) {
+            const JobFpGuard* g = &s_fp_guards[cache[i].guard];
+            if (g->guarded && g->writes == cache[i].writes) return cache[i].fingerprint;
+        }
+        const int guard = job_fp_guard(image, size);
+        const long writes = guard >= 0 ? s_fp_guards[guard].writes : 0;
+        if (memcmp(cache[i].copy, image, size) == 0) {
+            cache[i].guard = guard; cache[i].writes = writes;
+            return cache[i].fingerprint;
+        }
+#else
+        if (memcmp(cache[i].copy, image, size) == 0)
+            return cache[i].fingerprint;
+#endif
+        slot = i;
+        break;
+    }
+#ifdef _WIN32
+    const int guard = job_fp_guard(image, size);
+    const long writes = guard >= 0 ? s_fp_guards[guard].writes : 0;
+#endif
+    uint64_t fingerprint = spu_workload_fingerprint(image, size);
+    if (slot == CACHE_SIZE) slot = next++ % CACHE_SIZE;
+    if (cache[slot].size != size || !cache[slot].copy) {
+        uint8_t* copy = (uint8_t*)realloc(cache[slot].copy, size);
+        if (!copy) return fingerprint;
+        cache[slot].copy = copy;
+    }
+    memcpy(cache[slot].copy, image, size);
+    cache[slot].source = image;
+    cache[slot].size = size;
+    cache[slot].fingerprint = fingerprint;
+#ifdef _WIN32
+    cache[slot].guard = guard; cache[slot].writes = writes;
+#else
+    cache[slot].guard = -1;
+#endif
+    return fingerprint;
 }
 
 /* ---- registry ---------------------------------------------------------- */
@@ -55,6 +235,14 @@ typedef struct {
 
 static spu_workload_entry s_registry[SPU_WORKLOAD_MAX];
 static unsigned           s_registry_count = 0;
+
+/* Entry of the registered job image `image_id` (job corpus replay). */
+spu_lifted_entry_fn spu_job_entry_for_image(int image_id)
+{
+    for (unsigned i = 0; i < s_registry_count; i++)
+        if (s_registry[i].image_id == image_id) return s_registry[i].fn;
+    return NULL;
+}
 
 void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
                                int image_id, const char* name)
@@ -487,7 +675,7 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
     spu_coh_notify_write(taskset_ea);
     spu_lockline_unlock();
     for (int i = 0; i < n_start; i++) {
-        fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
+        if(async_log_message(0,64))fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
                         "(after task %u exited)\n", start_t[i], taskset_ea, start_elf[i], done_task);
         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = start_t[i];
         spu_workload_dispatch_async(vm_base + start_elf[i], (uint32_t)start_sz[i], start_ctx[i]);
@@ -702,9 +890,9 @@ static void spu_async_run(spu_async_job* j)
                  * both audio tasks run task 1's descriptor). */
                 if (j->taskset_ea) {
                     spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
-                    fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
+                    if(async_log_message(1,j->image_id)){fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
                             "taskset=0x%08X task=%u\n", j->image_id,
-                            j->taskset_ea, j->taskid); fflush(stderr);
+                            j->taskset_ea, j->taskid); fflush(stderr);}
                 }
             }
             /* ---- Bink-layer probe + real-policy A/B (image 3 = binkspu) ----
@@ -842,7 +1030,7 @@ static void spu_async_run(spu_async_job* j)
                   FILE* f = fopen(path, "wb");
                   if (f) { fwrite(ls, 1, SPU_LS_SIZE, f); fclose(f);
                       fprintf(stderr, "[spu_workload] wrote local store -> %s\n", path); } } }
-            fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
+            if(rc || async_log_message(2,j->image_id))fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
                     "(job ran to completion, did not loop)\n", j->image_id, rc);
             spu_serial_release();
             if (j->taskset_ea) spu_taskset_task_exited(j->taskset_ea, j->taskid);
@@ -879,12 +1067,20 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
 static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
 #endif
 
+int spu_workload_job_image(const uint8_t* image, uint32_t size)
+{
+    int id = -1;
+    if (image && size && size <= SPU_LS_SIZE)
+        spu_workload_find_img(spu_job_fingerprint(image, size), &id);
+    return id;
+}
+
 int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
                               uint32_t job_ea, uint32_t job_desc_size)
 {
     if (!image || image_size == 0) return 0;
 
-    uint64_t fp = spu_workload_fingerprint(image, image_size);
+    uint64_t fp = spu_job_fingerprint(image, image_size);
     spu_lifted_entry_fn fn = NULL;
     int image_id = 0;
     for (unsigned i = 0; i < s_registry_count; i++)
@@ -1359,7 +1555,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
         if ((j->r3[0] >> 16) == 0x40) j->have_r3 = 1;   /* valid marker */
     }
 
-    fprintf(stderr,
+    if(async_log_message(0,image_id))fprintf(stderr,
         "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
         (unsigned long long)fp, args_ea, image_id);
     if (args_ea) { extern uint8_t* vm_base; const uint8_t* c = vm_base + args_ea;
@@ -1396,6 +1592,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     HANDLE th = CreateThread(NULL, 256u << 20, spu_async_thread, j,
                              STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (!th) { free(j); return 0; }
+    ps3_thread_name(th, "SPU workload");
     CloseHandle(th);   /* detached */
 #else
     /* Same 256 MB reservation, for the same reason: pthread stacks are

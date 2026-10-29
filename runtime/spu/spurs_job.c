@@ -38,14 +38,59 @@
 #include "spu_coherency.h"
 #include "spu_workload.h"
 #include "spu_context.h"
+#include "spurs_job_ls.h"
+#include "spurs_job_options.h"
+#if defined(SPU_NATIVE_RTZ_IMAGE) || defined(SPU_NATIVE_RTZ_EXTRA_IMAGE) || defined(SPU_NATIVE_RTZ_IMAGE39)
+#include <immintrin.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 #include "ps3emu/log_first.h"
+#include "ps3emu/ps3_ftrace.h"
+#ifndef _WIN32
+#include "../platform/win32_compat.h"
+#endif
 
 extern uint8_t* vm_base;
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
+
+/* Capture short jobs without also tracing millions of sub-microsecond HLE
+ * calls. This affects diagnostics only, and is immutable after startup. */
+static int job_trace_all;
+__attribute__((constructor)) static void job_trace_options_init(void)
+{
+    const char* all = getenv("SPURS_JOB_TRACE_ALL");
+    job_trace_all = all && all[0] == '1' && all[1] == '\0';
+}
+
+#ifdef SPU_NATIVE_RTZ_EXTRA_IMAGE
+#include "spu_native_extra_fp.h"
+int spu_native_extra_fp_mode;
+__attribute__((constructor)) static void native_extra_fp_init(void)
+{
+    const char* mode = getenv("SPURS_NATIVE_EXTRA_FP");
+    /* Reject malformed values; never change the environment for mode 0. */
+    if (mode && (mode[0] == '1' || mode[0] == '2') && mode[1] == '\0')
+        spu_native_extra_fp_mode = mode[0] - '0';
+}
+#endif
+
+#ifdef SPU_NATIVE_RTZ_IMAGE39
+#include "spu_native_extra_fp.h"
+int spu_native_image39_fp_mode;
+__attribute__((constructor)) static void native_image39_fp_init(void)
+{
+    const char* mode = getenv("SPURS_NATIVE_IMAGE39_FP");
+    if (mode && (mode[0] == '1' || mode[0] == '2') && mode[1] == '\0')
+        spu_native_image39_fp_mode = mode[0] - '0';
+}
+#endif
 
 /* ---- guest reads (big-endian) ------------------------------------------ */
 static uint32_t g32(uint32_t ea)
@@ -119,15 +164,8 @@ enum {
  * The job context is a stack local, so by the time the PPU looks there is
  * nothing to read and every poll fails. Retain the store and let the syscall
  * resolve a chain handle to it. */
-static uint8_t  s_job_ls[SPU_LS_SIZE];
-static int      s_job_ls_valid;
-uint32_t        g_spurs_job_ls_handle;   /* set by the chain walker */
-
-const uint8_t* spurs_job_ls_for_handle(uint32_t handle)
-{
-    if (!s_job_ls_valid || !handle || handle != g_spurs_job_ls_handle) return 0;
-    return s_job_ls;
-}
+/* Storage and copying are chain-owned in spurs_job_ls.c, not one global LS
+ * with a separately raced handle written by unrelated chain walkers. */
 
 /* Last outbound mailbox posted by a finished job (see below). */
 /* THREAD-LOCAL. A job's answer is read back by the completion event that
@@ -153,12 +191,105 @@ SPURS_JOB_TLS int g_spurs_job_mbox_valid;
  * key per-SPU resources on it (Edge output rings, one RSX label per SPU), and
  * two jobs that both think they are SPU 0 corrupt each other's ring. */
 SPURS_JOB_TLS uint32_t g_spurs_job_spu_num;
+static SPURS_JOB_TLS uint32_t s_job_owner;
+void spurs_job_set_owner(uint32_t chain_ea) { s_job_owner=chain_ea; }
 void spurs_job_set_spu_num(uint32_t n) { g_spurs_job_spu_num = n; }
+uint32_t spurs_job_get_spu_num(void) { return g_spurs_job_spu_num; }
 
-int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
-                      uint32_t job_ea, uint32_t job_desc_size)
+static SPURS_JOB_TLS spu_context* s_spare_context;
+void spurs_job_release_thread_context(void)
+{
+#ifdef _WIN32
+    _aligned_free(s_spare_context);
+#else
+    free(s_spare_context);
+#endif
+    s_spare_context = NULL;
+}
+
+static double job_clock(void)
+{
+    struct timespec t;timespec_get(&t,TIME_UTC);
+    return t.tv_sec+t.tv_nsec*1e-9;
+}
+static void job_phase_report(int image,double start,double enter,double leave,double end,int seconds,unsigned used_mfc,unsigned used_atomic)
+{
+    struct Phase {unsigned n,mfc,atomic;double setup,run,post;};
+    static SPURS_JOB_TLS struct Phase stats[64];
+    static SPURS_JOB_TLS double last;
+    if(image>=0 && image<64){
+        struct Phase* p=&stats[image];p->n++;p->mfc+=used_mfc;p->atomic+=used_atomic;
+        p->setup+=enter-start;p->run+=leave-enter;p->post+=end-leave;
+    }
+    if(!last)last=end;
+    if(end-last<seconds)return;
+    for(unsigned i=0;i<64;++i)if(stats[i].n){
+        struct Phase* p=&stats[i];
+        fprintf(stderr,"[jobphase] image=%u n=%u setup=%.3fs run=%.3fs post=%.3fs average=%.1fus mfc=%u atomic=%u\n",
+                i,p->n,p->setup,p->run,p->post,(p->setup+p->run+p->post)*1e6/p->n,p->mfc,p->atomic);
+    }
+    memset(stats,0,sizeof stats);last=end;
+}
+
+/* Job corpus hooks (port/job_corpus.cpp): called on the worker thread right
+ * before and after the lifted entry runs, with the fully staged context. */
+void (*g_spurs_job_capture_begin)(spu_context*, int, uint32_t) = 0;
+void (*g_spurs_job_capture_end)(spu_context*, int, uint32_t) = 0;
+
+static void spurs_job_enter(spu_lifted_entry_fn entry, int image_id, spu_context* ctx)
+{
+    (void)image_id;
+#if defined(SPU_NATIVE_RTZ_IMAGE) || defined(SPU_NATIVE_RTZ_EXTRA_IMAGE) || defined(SPU_NATIVE_RTZ_IMAGE39)
+    /* Only the configured, audited single-precision TUs use native RZ helpers.
+     * Save/restore even on the job's HALT/longjmp completion path: that jump
+     * is caught by spu_run_with_halt, not by this caller. Other images and
+     * host/PPU math keep their incoming environment. */
+    unsigned saved_mxcsr = _mm_getcsr();
+    int native_rtz = 0;
+#ifdef SPU_NATIVE_RTZ_IMAGE
+    native_rtz = image_id == SPU_NATIVE_RTZ_IMAGE;
+#endif
+#ifdef SPU_NATIVE_RTZ_EXTRA_IMAGE
+    native_rtz |= image_id == SPU_NATIVE_RTZ_EXTRA_IMAGE && spu_native_extra_fp_mode != 0;
+#endif
+#ifdef SPU_NATIVE_RTZ_IMAGE39
+    native_rtz |= image_id == SPU_NATIVE_RTZ_IMAGE39 && spu_native_image39_fp_mode != 0;
+#endif
+    if (native_rtz)
+        _mm_setcsr((saved_mxcsr & ~0x6000u) | 0x6000u | 0x8040u | 0x1f80u);
+#endif
+    spu_run_with_halt(entry, ctx);
+#if defined(SPU_NATIVE_RTZ_IMAGE) || defined(SPU_NATIVE_RTZ_EXTRA_IMAGE) || defined(SPU_NATIVE_RTZ_IMAGE39)
+    _mm_setcsr(saved_mxcsr);
+#endif
+}
+
+/* Replay a captured job: ctx already holds the entry registers and LS. */
+void spurs_job_run_prepared(spu_lifted_entry_fn entry, int image_id, spu_context* ctx)
+{
+    spurs_job_enter(entry, image_id, ctx);
+    spu_mfc_release(ctx);
+    spu_coh_unregister(ctx);
+}
+
+static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
+                      uint32_t job_ea, uint32_t job_desc_size, spu_context* ctx, int exchange)
 {
     if (!entry || !job_ea) return -1;
+    const uint32_t job_owner = s_job_owner;
+    const uint64_t trace_start = PS3_FT_ON() ? ps3_ft_now() : 0;
+    static SPURS_JOB_TLS int phase_seconds=-1;
+    if(phase_seconds<0){const char* e=getenv("SPURS_JOB_PHASEPROF");phase_seconds=e?atoi(e):0;}
+    const double phase_start=phase_seconds?job_clock():0;
+    static SPURS_JOB_TLS int cache_options = -1;
+    static SPURS_JOB_TLS SpursJobOptions option_cache;
+    if (cache_options < 0) {
+        const char* mode = getenv("SPURS_JOB_CACHE_ENV");
+        cache_options = mode && mode[0] && mode[0] != '0';
+    }
+    SpursJobOptions live_options;
+    const SpursJobOptions* options = spurs_job_options_for_call(
+        &option_cache, &live_options, cache_options);
 
     /* ---- descriptor ---------------------------------------------------- */
     uint32_t ea_bin   = (uint32_t)(g64(job_ea + JH_EA_BINARY) & ~1ull);
@@ -179,8 +310,12 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         return -1;
     }
 
-    uint8_t* ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
-    if (!ls) return -1;
+    /* Stage directly into the job's own zeroed local store. The old path
+     * calloc'ed a second 256 KiB store, then zeroed ctx and copied all of it
+     * again. Per-job ownership and the guest bytes are unchanged. */
+    spu_context_init_keep_ls_prefix(ctx,0,size_bin);   /* the binary covers [0, size_bin) */
+    ctx->image_id=image_id;
+    uint8_t* ls=ctx->ls;
 
     /* ---- binary at LS 0 (PIC, so delta 0 keeps the lifted addresses) ---- */
     memcpy(ls, vm_base + ea_bin, size_bin);
@@ -274,6 +409,16 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         ls32(ls, 0x1CC, JOB_DMA_TAG);
         memset(ls + 0x210, 0, 0x10);
     }
+    /* PIC raw jobs call the same resident SPURS services as JOBCRT Ver13.
+     * Their absolute LS 0x1C0 reads need the kernel's SPURS pointer and ID,
+     * not the instruction bytes of a job we relocated to LS zero. */
+    if (s_job_owner && options->kernel) {
+        memset(ls + 0x1C0,0,16);
+        ls32(ls,0x1C0,g32(s_job_owner+0x78));
+        ls32(ls,0x1C4,g32(s_job_owner+0x7C));
+        ls32(ls,0x1C8,g_spurs_job_spu_num);
+        ls32(ls,0x1CC,JOB_DMA_TAG);
+    }
     ls32(ls, ctx_ls + JC_SIZE_JOB_DESC,
          ((dsz == 64 ? 0u : (dsz / 128u) & 0xFu) << 28) | jm_iface);
     ls16(ls, ctx_ls + JC_NUM_IO_BUFFER,    (uint16_t)n_dma);
@@ -298,7 +443,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * its DMA and atomic EAs from these words, so when a job spins on a
      * lock-line address that is not backed, this is what to read first. */
     { static int _d = 0;
-      if (getenv("SPURS_JOB_DESCDUMP") && PS3_LOG_FIRST(_d, 4)) {
+      if (options->desc_dump && PS3_LOG_FIRST(_d, 4)) {
           fprintf(stderr, "[spurs-job] desc @0x%08X (%u bytes):", job_ea, dsz);
           for (uint32_t o = 0; o < dsz && o < 128; o += 4) {
               if ((o & 31) == 0) fprintf(stderr, "\n    +%02X:", o);
@@ -309,7 +454,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
            * data (past JH_SIZE) and dump what they point at. The job reads its
            * parameters from there, so a wild DMA/atomic address usually
            * originates in one of these blocks. */
-          if (atoi(getenv("SPURS_JOB_DESCDUMP")) >= 2) {
+          if (options->desc_detail >= 2) {
               for (uint32_t o = JH_SIZE; o < dsz && o < 128; o += 4) {
                   uint32_t v = g32(job_ea + o);
                   if (v < 0x10000u || v >= 0xD0000000u) continue;
@@ -328,7 +473,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * The header's input-DMA-list/io fields are legitimately zero for it. Dump
      * the user data + that command block so the bail path is attributable. */
     uint32_t dump_cmd = 0;
-    if (getenv("SPURS_JOB_DUMP")) {
+    if (options->dump) {
         uint64_t ud  = g64(job_ea + JH_SIZE);        /* desc+0x30 */
         uint32_t cmd = (uint32_t)ud;                 /* low word = EA */
         fprintf(stderr, "[spurs-job] job 0x%08X userdata: %016llX %016llX %016llX %016llX\n",
@@ -363,10 +508,6 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     }
 
     /* ---- enter the job -------------------------------------------------- */
-    spu_context ctx;
-    spu_context_init(&ctx, 0);
-    ctx.image_id = image_id;
-    memcpy(ctx.ls, ls, SPU_LS_SIZE);
     /* SPU stack grows down. A function saves its link register in its
      * caller's frame, at 16($sp), so the entry's first store lands 16 bytes
      * above $sp. The cache buffers start right at stack_top: with $sp at
@@ -374,18 +515,29 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * cacheBuffer[0] (Twisted Metal's Edge jobs read their viewport there and
      * got width = height = 0). Leave the caller's 32-byte frame inside the
      * stack. */
-    ctx.gpr[1]._u32[0] = (stack_top - 32u) & ~15u;
+    ctx->gpr[1]._u32[0] = (stack_top - 32u) & ~15u;
+    /* SPU ABI R1.word1 is AVAILABLE STACK SPACE, not unused padding.
+     * GCC prologues subtract the frame size from every word and use
+     * xswd/heqi to detect a negative word1. Leaving it zero made a valid
+     * Quiz World job halt on its first checked stack frame (PC 0xFA8). */
+    static unsigned abi_stage_active;
+    if (options->stage_present && image_id >= options->stage_image)
+        __atomic_store_n(&abi_stage_active,1,__ATOMIC_RELEASE);
+    if (options->stack ||
+        __atomic_load_n(&abi_stage_active,__ATOMIC_ACQUIRE) ||
+        (options->min_present && image_id >= options->min_image))
+        ctx->gpr[1]._u32[1] = size_stk > 32u ? size_stk - 32u : 0u;
     /* Link register: where the job returns when it is done. The job manager
      * would pass an address inside itself; 0 makes the job re-enter its own
      * entry at LS 0 and run a bogus second lap. */
-    ctx.gpr[0]._u32[0] = 0x3FF00u;                   /* SPU_JOB_RETURN_LS */
-    ctx.gpr[3]._u32[0] = ctx_ls;                     /* CellSpursJobContext2* */
-    ctx.gpr[4]._u32[0] = desc_ls;                    /* CellSpursJob256*      */
+    ctx->gpr[0]._u32[0] = 0x3FF00u;                   /* SPU_JOB_RETURN_LS */
+    ctx->gpr[3]._u32[0] = ctx_ls;                     /* CellSpursJobContext2* */
+    ctx->gpr[4]._u32[0] = desc_ls;                    /* CellSpursJob256*      */
 
     { static int _n = 0;
       if (PS3_LOG_FIRST(_n, 4))
           fprintf(stderr, "[spurs-job] ENTER r3=%08X r4=%08X r1=%08X entry-fn image=%d\n",
-                  ctx.gpr[3]._u32[0], ctx.gpr[4]._u32[0], ctx.gpr[1]._u32[0],
+                  ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0], ctx->gpr[1]._u32[0],
                   image_id); }
     /* NOTE: after its work the job's runtime jumps to LS 0 ("return to the
      * jm2 kernel" -- real layout has the kernel at 0, jobs above; we load the
@@ -393,7 +545,30 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * and trips its parameter guard, which HALTS -- ending the run. So the
      * HALT-ASSERT heqi 0x1650 seen once per jm2 job is NORMAL COMPLETION
      * noise, not a failure: the job's real work finished before the jump. */
-    spu_run_with_halt(entry, &ctx);
+    static unsigned trace_count[64];
+    const int trace_job = options->trace && image_id >= 0 && image_id < 64
+                          && __atomic_fetch_add(&trace_count[image_id],1,__ATOMIC_RELAXED) < 8;
+    if (trace_job) fprintf(stderr,"[jobtrace] enter image=%d job=%08X sp=%05X available=%u"
+                          " sizeStack=%u sizeScratch=%u bin=%u io=%u out=%u abi=%d/%d/%d:%d\n",
+                          image_id,job_ea,ctx->gpr[1]._u32[0],ctx->gpr[1]._u32[1],
+                          size_stk,size_scr,size_bin,size_io,size_out,options->stack,
+                          (int)abi_stage_active,options->min_present,options->min_image);
+    const double phase_enter=phase_seconds?job_clock():0;
+    if (g_spurs_job_capture_begin) g_spurs_job_capture_begin(ctx, image_id, job_ea);
+    spurs_job_enter(entry, image_id, ctx);
+    if (g_spurs_job_capture_end) g_spurs_job_capture_end(ctx, image_id, job_ea);
+    const double phase_leave=phase_seconds?job_clock():0;
+    if (trace_job) fprintf(stderr,"[jobtrace] exit image=%d job=%08X pc=%05X status=%X\n",
+                          image_id,job_ea,ctx->pc,ctx->status);
+    if (trace_job && ctx->stop_code == 0x3FFF) {
+        fprintf(stderr,"[jobtrace] STOP3FFF r3=%08X r4=%08X arg64=%08X/%08X line:",
+                ctx->gpr[3]._u32[0],ctx->gpr[4]._u32[0],ctx->gpr[2]._u32[0],ctx->gpr[6]._u32[0]);
+        for (unsigned i=0;i<128;i+=16) {
+            const uint8_t* q=ctx->ls+0x80+i;
+            fprintf(stderr," +%02X=%02X%02X%02X%02X",i,q[0],q[1],q[2],q[3]);
+        }
+        fprintf(stderr,"\n");
+    }
 
     /* Capture the job's outbound mailbox. These are LS POINTERS TO STRINGS for
      * the SPU printf service, NOT query results -- value 0x83C0 from the sound
@@ -401,29 +576,28 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * comment here claimed they carried the title's bus counts; they do not,
      * and feeding them into the completion event turned 0x40000000 into a 1 GB
      * allocation request. Kept because the printf service needs them. */
-    memcpy(s_job_ls, ctx.ls, SPU_LS_SIZE);   /* keep the store readable */
+    if (!exchange) spurs_job_ls_publish(job_owner, ctx->ls);
     /* TEMP SPURS_JOB_LSWORD=<img>:<lsa>: after a job of that image, print the
      * LS word at lsa and every other LS offset holding the same value. */
     { static int img = -2; static uint32_t lsa; static int n = 0;
       if (img == -2) { const char* e = getenv("SPURS_JOB_LSWORD"); img = -1;
           if (e) { img = atoi(e); const char* c = strchr(e, ':'); lsa = c ? (uint32_t)strtoul(c + 1, 0, 16) : 0; } }
       if (img == image_id && n++ < 3) {
-          const uint8_t* q = ctx.ls + (lsa & 0x3FFFC);
+          const uint8_t* q = ctx->ls + (lsa & 0x3FFFC);
           uint32_t v = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
           fprintf(stderr, "[lsword] img=%d job=0x%08X LS[0x%05X]=0x%08X io=0x%05X also at:", image_id, job_ea, lsa, v, io_ls);
           for (uint32_t o = 0; o + 4 <= SPU_LS_SIZE; o += 4) {
-              const uint8_t* p = ctx.ls + o;
+              const uint8_t* p = ctx->ls + o;
               if (o != (lsa & 0x3FFFC) && ((uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]) == v)
                   fprintf(stderr, " 0x%05X", o);
           }
           fprintf(stderr, "\n");
       } }
-    s_job_ls_valid = 1;
 
-    g_spurs_job_mbox      = spu_channel_has_data(&ctx.ch_out_mbox)
-                          ? ctx.ch_out_mbox.value : 0;
-    g_spurs_job_mbox_intr = spu_channel_has_data(&ctx.ch_out_intr_mbox)
-                          ? ctx.ch_out_intr_mbox.value : 0;
+    g_spurs_job_mbox      = spu_channel_has_data(&ctx->ch_out_mbox)
+                          ? ctx->ch_out_mbox.value : 0;
+    g_spurs_job_mbox_intr = spu_channel_has_data(&ctx->ch_out_intr_mbox)
+                          ? ctx->ch_out_intr_mbox.value : 0;
     g_spurs_job_mbox_valid = g_spurs_job_mbox || g_spurs_job_mbox_intr;
     { uint32_t _cb = g32(job_ea + 0x4C);
       g_spurs_job_cmd = _cb ? (g32(_cb) >> 16) : 0; }
@@ -433,9 +607,9 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
           fprintf(stderr, "[spurs-job] job 0x%08X posted mbox=0x%08X intr=0x%08X\n",
                   job_ea, g_spurs_job_mbox, g_spurs_job_mbox_intr); }
 
-    if (getenv("SPURS_JOB_DUMP")) {
+    if (options->dump) {
         fprintf(stderr, "[spurs-job] job 0x%08X exit: status=0x%X stop=0x%X pc=0x%05X\n",
-                job_ea, ctx.status, ctx.stop_code, ctx.pc);
+                job_ea, ctx->status, ctx->stop_code, ctx->pc);
         /* Post-run view of the same command block: the game polls result/status
          * fields the job writes back -- a before/after diff shows whether the
          * handler delivered its completion or the PPU waits on stale state. */
@@ -450,9 +624,73 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         fflush(stderr);
     }
 
-    spu_mfc_release(&ctx);
-    spu_coh_unregister(&ctx);   /* stack local: out of the reserver set */
-    { extern void spu_mfc_release(spu_context*); spu_mfc_release(&ctx); }
-    free(ls);
+    const unsigned phase_mfc=phase_seconds && ctx->mfc_private!=NULL;
+    const unsigned phase_atomic=phase_seconds && ctx->dbg_getllar!=0;
+    spu_mfc_release(ctx);
+    spu_coh_unregister(ctx);   /* no outstanding reservation may retain ctx */
+    /* The snapshot's only reader is the printf service, which follows a
+     * mailbox the job posted. SPURS_JOB_LS_PUBLISH=mbox hands over only such
+     * jobs' LS; others keep their context on this thread, warm in its cache,
+     * and the snapshot keeps the last job that did post, the one it names. */
+    static SPURS_JOB_TLS int publish_mbox_only = -1;
+    if (publish_mbox_only < 0) {
+        const char* option = getenv("SPURS_JOB_LS_PUBLISH");
+        publish_mbox_only = option && !strcmp(option, "mbox");
+    }
+    if (exchange && publish_mbox_only && !g_spurs_job_mbox_valid) {
+        spurs_job_release_thread_context();
+        s_spare_context = ctx;
+    } else if (exchange) {
+        void* previous = NULL;
+        int adopted = spurs_job_ls_exchange(job_owner, ctx, ctx->ls, &previous);
+        /* A nested dispatch could have left its own spare. Never leak it or
+         * reuse a still-running outer context through the TLS cache. */
+        spurs_job_release_thread_context();
+        s_spare_context = adopted ? (spu_context*)previous : ctx;
+    }
+    if (trace_start) {
+        uint64_t end = ps3_ft_now();
+        if (job_trace_all || end - trace_start >= ps3_ft_min_ns())
+            ps3_ft_span(PS3_FT_SPU_JOB, GetCurrentThreadId(), (uint32_t)image_id, job_ea, trace_start, end);
+    }
+    if(phase_seconds)job_phase_report(image_id,phase_start,phase_enter,phase_leave,job_clock(),phase_seconds,phase_mfc,phase_atomic);
     return 0;
+}
+
+/* Keep the original stack-backed path as the control. The exchange path uses
+ * the SAME complete context layout, including ls == ls_store: treating an
+ * external LS pointer as raw-SPU memory would change mailbox semantics. */
+static int run_spurs_job_stack(spu_lifted_entry_fn entry, int image_id,
+                               uint32_t job_ea, uint32_t descriptor_size)
+{
+    spu_context ctx;
+    return run_spurs_job_context(entry, image_id, job_ea, descriptor_size, &ctx, 0);
+}
+
+int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+                      uint32_t job_ea, uint32_t descriptor_size)
+{
+    static SPURS_JOB_TLS int exchange = -1;
+    if (exchange < 0) {
+        const char* option = getenv("SPURS_JOB_LS_EXCHANGE");
+        exchange = option && option[0] && option[0] != '0';
+    }
+    if (!exchange) return run_spurs_job_stack(entry, image_id, job_ea, descriptor_size);
+    if (!s_spare_context) {
+#ifdef _WIN32
+        s_spare_context = (spu_context*)_aligned_malloc(sizeof(spu_context), 16);
+#else
+        s_spare_context = (spu_context*)aligned_alloc(16, sizeof(spu_context));
+#endif
+        if (!s_spare_context)
+            return run_spurs_job_stack(entry, image_id, job_ea, descriptor_size);
+    }
+    spu_context* owned = s_spare_context;
+    s_spare_context = NULL; /* a recursively entered job must allocate its own */
+    int result = run_spurs_job_context(entry, image_id, job_ea, descriptor_size, owned, 1);
+    if (result < 0) { /* rejected before initialization/publication */
+        spurs_job_release_thread_context();
+        s_spare_context = owned;
+    }
+    return result;
 }

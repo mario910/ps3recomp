@@ -72,6 +72,13 @@ extern sys_timer_info g_sys_timers[SYS_TIMER_MAX];
 
 /* Syscall handlers */
 int64_t sys_timer_usleep(ppu_context* ctx);
+
+/* Register a guest poll loop `while (*(u32*)(r<reg> + offset) != 0)
+ * usleep(tiny)` by the LR value its syscall sees. Such sleeps then block
+ * until a PPU store to that word (or 2 ms) instead of spinning. Call before
+ * guest threads start. Opt-in: PS3_USLEEP_WAIT_SITES=1 uses registrations;
+ * PS3_USLEEP_WAIT_SPIN_US sets the spin before blocking (default 20). */
+void sys_timer_register_usleep_wait(uint32_t lr, int reg, uint32_t offset);
 int64_t sys_timer_sleep(ppu_context* ctx);
 int64_t sys_time_get_current_time(ppu_context* ctx);
 int64_t sys_time_get_timezone(ppu_context* ctx);

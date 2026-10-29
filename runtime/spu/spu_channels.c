@@ -137,6 +137,14 @@ void (*g_spu_out_mbox_hook)(uint32_t group_id, uint32_t spu_id,
  * stream is, so the only evidence is the DMA that writes it. NULL until
  * installed, so a title with no SPU-built FIFO pays nothing. */
 void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
+/* Same contract for the SPURS chain walker: a PUT may publish a command over
+ * a parked jump-to-self. Installed only when that wake is enabled. */
+void (*g_spu_put_notify)(uint32_t ea, uint32_t size) = 0;
+/* Optional recorder of every DMA and atomic line transfer (job corpus capture).
+ * kind: 1 GET, 2 PUT, 3 GETLLAR, 4 PUTLLC ok, 5 PUTLLC failed, 6 PUTLLUC;
+ * data = the bytes moved (LS side). NULL unless a recorder is installed. */
+void (*g_spu_dma_observer)(spu_context* ctx, uint32_t kind, uint32_t lsa, uint32_t ea,
+                           uint32_t size, const void* data) = 0;
 
 void spu_halt(spu_context* ctx)
 {
@@ -198,6 +206,8 @@ void spu_stop(spu_context* ctx)
     if (s_halt) spu_halt(ctx);
 }
 
+SPU_THREAD_LOCAL unsigned g_spu_run_serial;
+
 /* Run a lifted SPU entry with a halt landing pad. Returns 1 if the job halted
  * (via spu_halt), 0 if it returned normally. */
 int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
@@ -219,6 +229,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * an earlier run would be restored over this job's arguments. */
     { extern void spu_irq_regs_forget(spu_context*); spu_irq_regs_forget(ctx); }
     ctx->steps = 0;   /* fresh run: step 0 is the entry */
+    g_spu_run_serial++;   /* per-run state keyed to this thread (spu_dma.h) */
     /* The host stack is empty here by definition, so no lifted caller frame
      * is live. A persistent context (a SPURS policy module re-entered every
      * scheduling quantum) otherwise carries the depth its last quantum
@@ -263,7 +274,9 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
          * calls drain inside their own call brackets (see the lifter). */
         entry(ctx);
         { static int _e = 0;
-          if (getenv("SPU_ARGWATCH") && _e < 8) { _e++;
+          static _Thread_local int argwatch = -1;
+          if (argwatch < 0) argwatch = getenv("SPU_ARGWATCH") != NULL;
+          if (argwatch && _e < 8) { _e++;
               fprintf(stderr, "[argwatch] after entry(): img=%d pc=0x%05X "
                       "r2=0x%08X r3=0x%08X r4=0x%08X\n", ctx->image_id,
                       (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[2]._u32[0],
@@ -291,8 +304,31 @@ typedef struct spu_mfc_slot {
     struct spu_mfc_slot* next;
 } spu_mfc_slot;
 
-static spu_mfc_slot* s_mfc_slots;
-static SRWLOCK s_mfc_claim_lock = SRWLOCK_INIT;
+enum { MFC_DIRECTORY_BUCKETS = 64 };
+typedef union {
+    struct { spu_mfc_slot* slots; SRWLOCK lock; } state;
+    unsigned char cache_lines[128];
+} spu_mfc_bucket;
+static _Alignas(128) spu_mfc_bucket s_mfc_directory[MFC_DIRECTORY_BUCKETS];
+/* Startup-only opt-in: a single EXE can compare the exact same engine path
+ * with one directory lock or disjoint context-keyed locks. Never shard engine
+ * state itself: each node still belongs to exactly one virtual context. */
+static int s_mfc_sharded;
+__attribute__((constructor)) static void mfc_directory_init(void)
+{
+    const char* value = getenv("SPU_MFC_SHARDED");
+    s_mfc_sharded = value && value[0]=='1' && !value[1];
+    if(value)fprintf(stderr,"[mfc-directory] buckets=%u\n",s_mfc_sharded?MFC_DIRECTORY_BUCKETS:1);
+}
+static spu_mfc_bucket* mfc_bucket_for(const spu_context* ctx)
+{
+    uintptr_t key = (uintptr_t)ctx;
+    unsigned index = s_mfc_sharded ? (unsigned)((key>>4) ^ (key>>17) ^ (key>>25)) & (MFC_DIRECTORY_BUCKETS-1) : 0;
+    return &s_mfc_directory[index];
+}
+/* Names retained for single-directory regression fixtures only. */
+#define s_mfc_slots s_mfc_directory[0].state.slots
+#define s_mfc_claim_lock s_mfc_directory[0].state.lock
 
 /* SPU_PCSAMPLE=<secs>: every <secs>, print image and pc of every context
  * holding an MFC slot -- i.e. every live SPU that has done DMA. Answers
@@ -303,8 +339,11 @@ static DWORD WINAPI spu_pcsample_thread(LPVOID p)
     for (;;) {
         Sleep(ms);
         int i = 0;
-        AcquireSRWLockShared(&s_mfc_claim_lock);
-        for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next, i++) {
+        const unsigned buckets=s_mfc_sharded?MFC_DIRECTORY_BUCKETS:1;
+        for (unsigned bucket=0;bucket<buckets;++bucket) {
+        spu_mfc_bucket* directory=&s_mfc_directory[bucket];
+        AcquireSRWLockShared(&directory->state.lock);
+        for (spu_mfc_slot* slot = directory->state.slots; slot; slot = slot->next, i++) {
             spu_context* c = slot->ctx;
             if (c) fprintf(stderr, "[pcsample] slot=%d img=%d spu=0x%X pc=0x%05X lr=0x%05X"
                                    " r3=0x%08X r81=0x%08X r84=0x%X r13=0x%08X r14=0x%08X\n",
@@ -312,31 +351,42 @@ static DWORD WINAPI spu_pcsample_thread(LPVOID p)
                            (unsigned)(c->gpr[0]._u32[0] & SPU_LS_MASK), c->gpr[3]._u32[0],
                            c->gpr[81]._u32[0], c->gpr[84]._u32[0], c->gpr[13]._u32[0], c->gpr[14]._u32[0]);
         }
-        ReleaseSRWLockShared(&s_mfc_claim_lock);
+        ReleaseSRWLockShared(&directory->state.lock);
+        }
         fflush(stderr);
     }
 }
 
 static mfc_engine* mfc_for(spu_context* ctx)
 {
-    { static volatile LONG started = 0; const char* e;
-      if (!started && (e = getenv("SPU_PCSAMPLE")) && !InterlockedExchange(&started, 1))
-          CreateThread(NULL, 0, spu_pcsample_thread, (LPVOID)(uintptr_t)(atoi(e) * 1000), 0, NULL); }
-    AcquireSRWLockShared(&s_mfc_claim_lock);
-    for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
+    mfc_engine* cached = (mfc_engine*)__atomic_load_n(&ctx->mfc_private, __ATOMIC_ACQUIRE);
+    if (cached) return cached;
+    /* Parse this optional diagnostic once, including the disabled case. It
+     * used to enter the CRT environment lock at every MFC channel access. */
+    { static volatile LONG initialized = 0;
+      if (!initialized && !InterlockedCompareExchange(&initialized, 1, 0)) {
+          const char* e = getenv("SPU_PCSAMPLE");
+          if (e) CreateThread(NULL, 0, spu_pcsample_thread,
+                              (LPVOID)(uintptr_t)(atoi(e) * 1000), 0, NULL);
+      } }
+    spu_mfc_bucket* directory=mfc_bucket_for(ctx);
+    AcquireSRWLockShared(&directory->state.lock);
+    for (spu_mfc_slot* slot = directory->state.slots; slot; slot = slot->next) {
         if (slot->ctx == ctx) {
-            ReleaseSRWLockShared(&s_mfc_claim_lock);
+            __atomic_store_n(&ctx->mfc_private, (void*)&slot->mfc, __ATOMIC_RELEASE);
+            ReleaseSRWLockShared(&directory->state.lock);
             return &slot->mfc;
         }
     }
-    ReleaseSRWLockShared(&s_mfc_claim_lock);
+    ReleaseSRWLockShared(&directory->state.lock);
 
     /* A concurrent miss may publish while the read lock is released. Recheck
      * under the writer lock before creating this context's private engine. */
-    AcquireSRWLockExclusive(&s_mfc_claim_lock);
-    for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
+    AcquireSRWLockExclusive(&directory->state.lock);
+    for (spu_mfc_slot* slot = directory->state.slots; slot; slot = slot->next) {
         if (slot->ctx == ctx) {
-            ReleaseSRWLockExclusive(&s_mfc_claim_lock);
+            __atomic_store_n(&ctx->mfc_private, (void*)&slot->mfc, __ATOMIC_RELEASE);
+            ReleaseSRWLockExclusive(&directory->state.lock);
             return &slot->mfc;
         }
     }
@@ -348,32 +398,40 @@ static mfc_engine* mfc_for(spu_context* ctx)
     }
     slot->ctx = ctx;
     mfc_engine_init(&slot->mfc);
-    slot->next = s_mfc_slots;
-    s_mfc_slots = slot;
-    ReleaseSRWLockExclusive(&s_mfc_claim_lock);
+    slot->next = directory->state.slots;
+    directory->state.slots = slot;
+    __atomic_store_n(&ctx->mfc_private, (void*)&slot->mfc, __ATOMIC_RELEASE);
+    ReleaseSRWLockExclusive(&directory->state.lock);
     return &slot->mfc;
 }
 
 void spu_mfc_release(spu_context* ctx)
 {
     if (!ctx) return;
-    AcquireSRWLockExclusive(&s_mfc_claim_lock);
-    for (spu_mfc_slot** link = &s_mfc_slots; *link; link = &(*link)->next) {
+    spu_mfc_bucket* directory=mfc_bucket_for(ctx);
+    AcquireSRWLockExclusive(&directory->state.lock);
+    __atomic_store_n(&ctx->mfc_private, (void*)0, __ATOMIC_RELEASE);
+    for (spu_mfc_slot** link = &directory->state.slots; *link; link = &(*link)->next) {
         if ((*link)->ctx != ctx) continue;
         spu_mfc_slot* slot = *link;
         *link = slot->next;
         free(slot);
         break;
     }
-    ReleaseSRWLockExclusive(&s_mfc_claim_lock);
+    ReleaseSRWLockExclusive(&directory->state.lock);
 }
 
 /* Exit safety net for contexts unwound off a departing thread's stack.
  * Pointer comparisons suffice: the abandoned context need not be readable. */
 void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
 {
-    AcquireSRWLockExclusive(&s_mfc_claim_lock);
-    for (spu_mfc_slot** link = &s_mfc_slots; *link;) {
+    /* Never hold two bucket locks at once. Exit cleanup must visit every
+     * bucket, but comparisons do not dereference abandoned context storage. */
+    const unsigned buckets=s_mfc_sharded?MFC_DIRECTORY_BUCKETS:1;
+    for(unsigned bucket=0;bucket<buckets;++bucket) {
+    spu_mfc_bucket* directory=&s_mfc_directory[bucket];
+    AcquireSRWLockExclusive(&directory->state.lock);
+    for (spu_mfc_slot** link = &directory->state.slots; *link;) {
         spu_mfc_slot* slot = *link;
         uintptr_t owner = (uintptr_t)slot->ctx;
         if (owner >= lo && owner < hi) {
@@ -383,7 +441,8 @@ void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
             link = &slot->next;
         }
     }
-    ReleaseSRWLockExclusive(&s_mfc_claim_lock);
+    ReleaseSRWLockExclusive(&directory->state.lock);
+    }
 }
 
 /* ===========================================================================
@@ -599,6 +658,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * Havok's SPU allocator (GH3 collide task, LS 0xA66C) re-issues the
          * GETLLAR until that bit is set, and spun forever on 0. PUTLLUC is 2. */
         ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 4;
+        if (g_spu_dma_observer) g_spu_dma_observer(ctx, 3, lsa, ea, MFC_ATOMIC_LINE, ls);
         ctx->dbg_getllar++;
         /* A GETLLAR re-issued millions of times on one line is an SPU spin-wait
          * that nobody is releasing (a ticket lock, a counter barrier). Say so
@@ -766,6 +826,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       ctx->atomic_stat ? "FAIL" : "OK",
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
         ctx->resv_valid = 0;                           /* reservation consumed */
+        if (g_spu_dma_observer)
+            g_spu_dma_observer(ctx, ctx->atomic_stat == 0 ? 4 : 5, lsa, ea, MFC_ATOMIC_LINE, ls);
         spu_lockline_unlock();
         if (ctx->atomic_stat == 0) {
             spu_taskset_line_committed(ea & ~127u);
@@ -786,6 +848,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * has already overwritten. */
         spu_coh_notify_write(ea);
         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
+        if (g_spu_dma_observer) g_spu_dma_observer(ctx, 6, lsa, ea, MFC_ATOMIC_LINE, ls);
         spu_lockline_unlock();
         spu_taskset_line_committed(ea & ~127u);
         if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
@@ -1352,6 +1415,7 @@ typedef struct {
 #define SPU_FN_REGISTRY_MAX 262144
 static spu_reg_entry s_registry[SPU_FN_REGISTRY_MAX];
 static uint32_t s_registry_count = 0;
+static uint32_t s_registry_gen = 0;   /* bumped once a registration is complete */
 
 /* Accessor for the sampling profiler in ppu_loader.cpp. Its address->function
  * map is built from the PPU table alone, which leaves the SPU-lifted bodies as
@@ -1427,6 +1491,8 @@ void spu_register_function(uint32_t addr, spu_fn fn)
     else
         s_hash_next[s_hash_tail[h] - 1] = i + 1;
     s_hash_tail[h] = i + 1;
+    /* After the chain is linked: invalidates every memoized lookup. */
+    __atomic_add_fetch(&s_registry_gen, 1, __ATOMIC_RELEASE);
 }
 
 /* Report a CROSS-IMAGE match: the registry served a function some other image
@@ -1468,7 +1534,7 @@ static void spu_report_cross_image(uint32_t addr, int want, int got)
             "issue #59.\n", addr, want, got);
 }
 
-spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-path dispatch (spu_dispatch_mt.c) needs it */
+static spu_fn spu_lookup_chain(uint32_t addr, int image_id, uint32_t* found)
 {
     /* Match the context's active image; image_id 0 (context or entry) matches
      * any, for back-compat with single-image contexts. */
@@ -1479,10 +1545,47 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
             /* One compare on the return path; the report itself is rare. */
             if (e->image_id != image_id)
                 spu_report_cross_image(addr, image_id, e->image_id);
+            *found = n;
             return e->fn;
         }
     }
+    *found = 0;
     return NULL;
+}
+
+/* Every job image is loaded at LS 0, so one address chain holds the entries of
+ * every image with a function there and a late-registered image walks most of
+ * it on each indirect branch. Memoize the chain's answer per (image, word):
+ * the registry generation it was computed at sits in the same 64-bit slot, so
+ * any later registration invalidates it and the walk decides again. */
+#define SPU_LOOKUP_MEMO_IMAGES 64
+#define SPU_LOOKUP_MEMO_MISS 0xFFFFFFFFu
+static uint64_t* volatile s_lookup_memo[SPU_LOOKUP_MEMO_IMAGES];
+
+spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-path dispatch (spu_dispatch_mt.c) needs it */
+{
+    if (image_id <= 0 || image_id >= SPU_LOOKUP_MEMO_IMAGES || (addr & 3) || addr >= SPU_LS_SIZE) {
+        uint32_t found;
+        return spu_lookup_chain(addr, image_id, &found);
+    }
+    uint64_t* memo = s_lookup_memo[image_id];
+    if (!memo) {
+        uint64_t* fresh = (uint64_t*)calloc(SPU_LS_SIZE / 4, sizeof(uint64_t));
+        if (!fresh) { uint32_t found; return spu_lookup_chain(addr, image_id, &found); }
+        memo = (uint64_t*)InterlockedCompareExchangePointer((void* volatile*)&s_lookup_memo[image_id], fresh, NULL);
+        if (memo) free(fresh); else memo = fresh;
+    }
+    const uint32_t count = __atomic_load_n(&s_registry_gen, __ATOMIC_ACQUIRE);
+    const uint64_t slot = __atomic_load_n(&memo[addr >> 2], __ATOMIC_RELAXED);
+    if (slot && (uint32_t)(slot >> 32) == count) {
+        const uint32_t n = (uint32_t)slot;
+        return n == SPU_LOOKUP_MEMO_MISS ? NULL : s_registry[n - 1].fn;
+    }
+    uint32_t found;
+    spu_fn fn = spu_lookup_chain(addr, image_id, &found);
+    __atomic_store_n(&memo[addr >> 2], ((uint64_t)count << 32) | (found ? found : SPU_LOOKUP_MEMO_MISS),
+                     __ATOMIC_RELAXED);
+    return fn;
 }
 
 /* Which image registered a function at this LS address, or -1 if none did.
@@ -1553,11 +1656,14 @@ void spu_overlay_register_region(uint32_t content_ea, uint32_t span, int image_i
  * unrelated overlays using the same address. Registration precedes execution. */
 static struct { uint32_t entry; int image_id; } s_stack_reset[16];
 static unsigned s_stack_reset_count;
+/* Read by the drain fast path: zero means spu_check_stack_reset is a no-op. */
+volatile unsigned g_spu_stack_reset_n;
 void spu_register_stack_reset_entry(uint32_t entry, int image_id)
 {
     if (s_stack_reset_count < 16) {
         s_stack_reset[s_stack_reset_count].entry = entry & SPU_LS_MASK;
         s_stack_reset[s_stack_reset_count++].image_id = image_id;
+        g_spu_stack_reset_n = s_stack_reset_count;
     }
 }
 
@@ -1750,6 +1856,68 @@ int spu_overlay_match_sig(const uint8_t hdr[16])
         const spu_ovl_src* o = &s_ovl_src[i];
         if (o->has_sig && memcmp(hdr, o->sig, 16) == 0)
             return o->image_id;
+    }
+    return 0;
+}
+
+/* ---- Runtime-loaded code modules -----------------------------------------
+ * Code a program loads into its own local store and calls -- MultiStream's
+ * ATRAC decoder and DSP plugins -- belongs to no image and arrives from
+ * buffers whose EA varies, so it is identified by residence address and
+ * content: on the first branch into an unowned address inside a registered
+ * span, the span's bytes (minus one declared mutable window, e.g. init code
+ * whose memory the program reuses) are hashed with FNV-1a-64. A match makes
+ * that lift the span's resident code owner until a DMA writes into the span
+ * (spu_overlay_note_get drops it); a mismatch leaves the address unowned. */
+typedef struct { uint32_t lsa, size, skip_lo, skip_hi; uint64_t fnv; int image_id; } spu_rt_module;
+#define SPU_RT_MODULE_MAX 16
+static spu_rt_module s_rt_module[SPU_RT_MODULE_MAX];
+static int s_rt_module_count;
+
+/* Startup only, before any SPU runs. skip_lo == skip_hi: no mutable window. */
+void spu_runtime_code_register(uint32_t lsa, uint32_t size, uint32_t skip_lo, uint32_t skip_hi,
+                               uint64_t fnv, int image_id)
+{
+    if (s_rt_module_count >= SPU_RT_MODULE_MAX || !size || lsa + size > SPU_LS_SIZE ||
+        skip_lo > skip_hi || skip_hi > size) return;
+    s_rt_module[s_rt_module_count++] = (spu_rt_module){lsa, size, skip_lo, skip_hi, fnv, image_id};
+}
+
+static uint64_t spu_rt_fnv(const uint8_t* p, uint32_t n, uint64_t h)
+{
+    for (uint32_t i = 0; i < n; ++i) { h ^= p[i]; h *= 0x100000001B3ull; }
+    return h;
+}
+
+/* The image owning ctx->pc as verified runtime code, or 0. */
+static int spu_runtime_code_claim(spu_context* ctx)
+{
+    const uint32_t pc = ctx->pc & SPU_LS_MASK;
+    for (int i = 0; i < s_rt_module_count; ++i) {
+        const spu_rt_module* m = &s_rt_module[i];
+        if (pc < m->lsa || pc - m->lsa >= m->size) continue;
+        const uint8_t* base = ctx->ls + m->lsa;
+        uint64_t h = spu_rt_fnv(base, m->skip_lo, 0xCBF29CE484222325ull);
+        h = spu_rt_fnv(base + m->skip_hi, m->size - m->skip_hi, h);
+        static int s_log;
+        if (h != m->fnv) {
+            if (PS3_LOG_FIRST(s_log, 16))
+                fprintf(stderr, "[spu-rtcode] img=%d LS 0x%05X: content differs from lift %d\n",
+                        ctx->image_id, pc, m->image_id);
+            continue;
+        }
+        unsigned slot = 0;
+        while (slot < 4 && ctx->resident_code[slot].image_id &&
+               ctx->resident_code[slot].lsa != m->lsa) ++slot;
+        if (slot == 4) slot = 3;  /* evict: a re-claim costs one more hash */
+        ctx->resident_code[slot].lsa = m->lsa;
+        ctx->resident_code[slot].size = m->size;
+        ctx->resident_code[slot].source_ea = 0;
+        ctx->resident_code[slot].image_id = m->image_id;
+        if (PS3_LOG_FIRST(s_log, 16))
+            fprintf(stderr, "[spu-rtcode] img=%d LS 0x%05X..0x%05X -> lifted image %d\n",
+                    ctx->image_id, m->lsa, m->lsa + m->size, m->image_id);
+        return m->image_id;
     }
     return 0;
 }
@@ -2091,6 +2259,26 @@ static int spu_smc_microstep(spu_context* ctx)
               fprintf(stderr, "[spu-smc] microstep img=%d pc=0x%05X word 0x%08X not in the"
                       " microstep set -- handing to the interpreter (steps=%d)\n",
                       ctx->image_id, pc, w, steps); }
+        /* SPU_INTERP_ENTRIES=1: every distinct (image, entry pc) that falls
+         * back to the interpreter here, once -- an indirect target the lift
+         * has no entry for, i.e. a candidate extra function start. */
+        { static int s_ie = -1;
+          if (s_ie < 0) { const char* e = getenv("SPU_INTERP_ENTRIES"); s_ie = e && e[0] == '1'; }
+          if (s_ie) {
+              static volatile uint32_t seen[256]; static volatile long n_seen;
+              const uint32_t key = ((uint32_t)ctx->image_id << 20) | (ctx->pc & SPU_LS_MASK);
+              int known = 0;
+              for (long i = 0; i < n_seen && i < 256; ++i) if (seen[i] == key) { known = 1; break; }
+              if (!known) {
+                  const long slot = _InterlockedIncrement(&n_seen) - 1;
+                  if (slot < 256) {
+                      seen[slot] = key;
+                      fprintf(stderr, "[spu-interp-entry] img=%d pc=0x%05X first-word=0x%08X lr=0x%05X\n",
+                              ctx->image_id, ctx->pc & SPU_LS_MASK, w,
+                              ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+                  }
+              }
+          } }
         ctx->pc = pc;
         /* Stop at the drain's return point too: it sits mid-function, so it is
          * no lifted entry, and a job's return would otherwise run on through
@@ -2349,6 +2537,10 @@ void spu_indirect_branch(spu_context* ctx)
         }
     }
 
+    if (!fn && !code_owner && !ctx->policy_mode && s_rt_module_count) {
+        const int owner = spu_runtime_code_claim(ctx);
+        if (owner) fn = spu_lookup(ctx->pc, owner);
+    }
     if (!fn && !ctx->policy_mode && ctx->pc >= SPU_JM2_KERNEL_BASE) {
         static uint32_t seen[16]; static int n_seen = 0;
         int known = 0;
@@ -2390,7 +2582,25 @@ void spu_indirect_branch(spu_context* ctx)
           uint32_t w0 = ((uint32_t)ctx->ls[p] << 24) | ((uint32_t)ctx->ls[p+1] << 16) |
                         ((uint32_t)ctx->ls[p+2] << 8) | ctx->ls[p+3];
           static int s_iu = -1;
-          if (s_iu < 0) { const char* e = getenv("SPU_INTERP_UNLIFTED"); s_iu = e ? 1 : 0; }
+          if (s_iu < 0) { const char* e = getenv("SPU_INTERP_UNLIFTED"); s_iu = e && e[0] && e[0] != '0'; }
+          /* SPU_UNLIFTED_LSDUMP=<dir>: the whole local store as it stands at
+           * the first branch into each unlifted target, i.e. runtime-loaded
+           * code after its loader applied relocations -- what a lift of it
+           * has to match. One file per target: ls_img<id>_<pc>.bin. */
+          { static int s_ld = -1; static char s_dir[400];
+            if (s_ld < 0) { const char* e = getenv("SPU_UNLIFTED_LSDUMP"); s_ld = e && *e;
+                            if (s_ld) snprintf(s_dir, sizeof s_dir, "%s", e); }
+            static uint32_t s_dumped[16]; static unsigned s_nd;
+            int seen = 0;
+            for (unsigned i = 0; i < s_nd; ++i) if (s_dumped[i] == p) seen = 1;
+            if (s_ld && !seen && s_nd < 16) {
+                s_dumped[s_nd++] = p;
+                char path[512];
+                snprintf(path, sizeof path, "%s/ls_img%d_%05X.bin", s_dir, ctx->image_id, p);
+                FILE* f = fopen(path, "wb");
+                if (f) { fwrite(ctx->ls, 1, SPU_LS_SIZE, f); fclose(f); }
+                fprintf(stderr, "[spu] LS dump at unlifted 0x%05X -> %s\n", p, path);
+            } }
           if (s_iu && w0) {
               static int _n = 0;
               if (PS3_LOG_FIRST(_n, 8))

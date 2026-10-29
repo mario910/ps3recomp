@@ -32,12 +32,14 @@
 #endif
 
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
+#include "ppu_tls_image.h"
 #define PPU_NO_INLINE_LOADS   /* this file defines the out-of-line accessors */
 #include "ppu_recomp.h"
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE timeline */
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
+#include "../spu/spurs_command_wait.h"
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #ifndef _WIN32
 #include <sys/mman.h>   /* the guest-pointer trap reserves the low 4 GB */
@@ -661,12 +663,15 @@ static DWORD WINAPI samp_thread(LPVOID p)
                     CONTEXT c; c.ContextFlags = CONTEXT_CONTROL;
                     if (GetThreadContext(h, &c)) {
                         s_samp_total++;
+                        /* Record native addresses independently of the guessed
+                         * guest extents: linker ICF and runtime gaps can make
+                         * those extents credit a hot helper to an empty stub. */
+                        samp_rva_hit((uintptr_t)c.Rip);
                         uint32_t g = samp_lookup((uintptr_t)c.Rip);
                         if (!g && s_samp_main > 0) g = samp_stack_guest(h, &c);
                         if (g) { s_samp_guest++; samp_hit(g); samp_tid_hit(te.th32ThreadID);
                                  samp_tid2(te.th32ThreadID, 1, 0); }
                         else { int nt = samp_mod_hit((uintptr_t)c.Rip);
-                               if (!nt) samp_rva_hit((uintptr_t)c.Rip);
                                samp_tid2(te.th32ThreadID, 0, nt); }
                     }
                     ResumeThread(h);
@@ -854,9 +859,11 @@ extern "C" void ppu_report_guest_lrs(void)
     for (long i = 0; i < n; i++) {
         ppu_context* c = g_resv_ctxs[i];
         if (!c) continue;
-        fprintf(stderr, "[WATCHDOG]   guest-tid %-3u lr=0x%08X  r3=0x%08X sp=0x%08X\n",
+        fprintf(stderr, "[WATCHDOG]   guest-tid %-3u lr=0x%08X  r3=0x%08X sp=0x%08X r11=%08X r27=%08X r28=%08X r30=%08X r31=%08X\n",
                 (unsigned)c->thread_id, (uint32_t)c->lr,
-                (uint32_t)c->gpr[3], (uint32_t)c->gpr[1]);
+                (uint32_t)c->gpr[3], (uint32_t)c->gpr[1],
+                (uint32_t)c->gpr[11],(uint32_t)c->gpr[27],(uint32_t)c->gpr[28],
+                (uint32_t)c->gpr[30],(uint32_t)c->gpr[31]);
         /* With BCTRL_RING armed, follow it with that thread's recent INDIRECT
          * targets. lr cannot see those (bctrl does not write it), so for a
          * thread looping on a vtable call the ring is the only record of where
@@ -1216,6 +1223,12 @@ extern "C" uint32_t ppu_vm_size = 0;
  * the free window just below the mmapper region (0x11000000) and above any
  * game's high data segments, so it doesn't collide with the static image. */
 static uint32_t g_tls_vaddr = 0, g_tls_filesz = 0, g_tls_memsz = 0;
+extern "C" int ppu_tls_copy_template(uint32_t destination, uint32_t capacity)
+{
+    const uint64_t limit = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
+    return ps3_ppu_tls_copy_image(vm_base, limit, destination, capacity,
+                                 g_tls_vaddr, g_tls_filesz, g_tls_memsz);
+}
 #define PPU_TLS_IMG   VM_PPU_TLS_BASE
 #define PPU_TLS_TP    (PPU_TLS_IMG + 0x7000u)
 
@@ -1792,8 +1805,22 @@ static void ww_arm_inline_window(uint32_t ww)
     g_ww_lo = ww & ~15u;
     g_ww_hi = (ww & ~15u) + len;
 }
-static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
+/* Keep the disabled watch out of every VM store. The old inline function was
+ * too large to inline at /O1: even its early return was an unconditional call
+ * with a C++ local-static initialization guard, twice for every vm_write64.
+ * -1 preserves lazy environment sampling on the first store. The dynamic
+ * guest barrier watch can still arm later, independently of that cache. */
+static int s_barrier_environment_watches = -1;
+static __attribute__((noinline, cold)) void barrier_watch_hit_slow(uint32_t a, uint32_t v, int width, void* ra)
 {
+    /* Most stores have no watch armed. Keep the full diagnostic machinery
+     * off that hot path, while still allowing the guest barrier probe to
+     * arm its dynamic watch later. Environment watches were already cached
+     * on their first store; this preserves that initialization contract. */
+    static const bool environment_watches = getenv("PPU_WVAL") || getenv("PPU_WWATCH");
+    __atomic_store_n(&s_barrier_environment_watches, environment_watches ? 1 : 0,
+                     __ATOMIC_RELAXED);
+    if (!environment_watches && !g_barrier_sync_watch) return;
     /* PPU_WVAL=<hexvalue>: log every PPU store that WRITES this value, wherever
      * it lands. PPU_WWATCH answers "who writes this address"; when a bad value is
      * copied from node to node down a list, that only ever catches the copy.
@@ -1913,6 +1940,14 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
     }
 }
 
+static inline __attribute__((always_inline)) void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
+{
+    if (__builtin_expect(__atomic_load_n(&s_barrier_environment_watches,
+                                        __ATOMIC_RELAXED) != 0 ||
+                         g_barrier_sync_watch != 0, 0))
+        barrier_watch_hit_slow(a, v, width, ra);
+}
+
 /* See the note on the forward declaration above ppu_stwcx32. */
 extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* ra)
 {
@@ -1930,6 +1965,8 @@ void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, _
     VM_WRITE_COH(a, &v, 1); }
 void vm_write16(uint64_t a, uint16_t v) { barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2) || vm_null_store((uint32_t)a, v, 2, __builtin_return_address(0))) return;
     v = __builtin_bswap16(v); VM_WRITE_COH(a, &v, 2); }
+extern "C" volatile uint32_t g_ppu_wake_ea[2];   /* sys_timer.c wait-site slots */
+extern "C" volatile long g_ppu_wake_count;
 void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4) || vm_null_store((uint32_t)a, v, 4, __builtin_return_address(0))) return;
 #ifdef _WIN32
     /* PT restore: a full-word store of a valid pointer (high byte set) to a
@@ -1938,6 +1975,11 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
 #endif
     { uint32_t _v = v;
       v = __builtin_bswap32(v); VM_WRITE_COH(a, &v, 4);
+#ifdef _WIN32
+      /* A thread blocked in a registered usleep wait site polls this word. */
+      if (__builtin_expect((uint32_t)a == g_ppu_wake_ea[0] || (uint32_t)a == g_ppu_wake_ea[1], 0)) {
+          _InterlockedIncrement(&g_ppu_wake_count); WakeByAddressAll(vm_base + (uint32_t)a); }
+#endif
       /* Raw SPU problem state: run control, mailboxes and signal notification
        * have side effects. The plain store above still happens -- the registers
        * are guest memory and the PPU reads most of them straight back. */
@@ -1951,7 +1993,10 @@ void vm_write64(uint64_t a, uint64_t v) {
     barrier_watch_hit((uint32_t)a,     (uint32_t)(v >> 32), 4, __builtin_return_address(0));
     barrier_watch_hit((uint32_t)a + 4, (uint32_t)v,         4, __builtin_return_address(0));
     if (vm_oob((uint32_t)a,8) || vm_null_store((uint32_t)a, (uint32_t)(v >> 32), 8, __builtin_return_address(0))) return;
-    v = __builtin_bswap64(v); VM_WRITE_COH(a, &v, 8); }
+    v = __builtin_bswap64(v); VM_WRITE_COH(a, &v, 8);
+    /* Buzz publishes JTS command slots using aligned std stores. The filter
+     * stays zero unless a native chain explicitly registers a waiter. */
+    spurs_command_notify64((uint32_t)a); }
 }
 
 /* ---- malloc allocation tracker (PS3_ALLOCTAG) -------------------------------
@@ -2039,6 +2084,7 @@ extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
  * syscall time is the HOST return address; map it to the lifted function's
  * guest address via the (host fn ptr -> guest addr) inverse of the registry.
  * Built lazily on first use (registration is boot-time-only). */
+#include "host_pc_cache.h"
 static struct { void* host; uint32_t guest; } g_inv[PPU_HASH_SIZE];
 static uint32_t g_inv_n = 0;
 extern "C" uint32_t ppu_prof_resolve_host(void* ra)
@@ -2055,11 +2101,19 @@ extern "C" uint32_t ppu_prof_resolve_host(void* ra)
               });
         if (!g_inv_n) return 0;
     }
+    /* HLE/syscall breadcrumbs repeatedly resolve the same return sites.
+     * Memoize their exact result without touching the guest dispatcher or
+     * changing duplicate/folded-symbol selection in the inverse map. */
+    static PPU_THREAD_LOCAL HostPcCache<64> cache;
+    uint32_t guest;
+    if (cache.get((uintptr_t)ra, guest)) return guest;
     /* greatest host fn <= ra */
     uint32_t lo = 0, hi = g_inv_n;
     while (lo < hi) { uint32_t mid = (lo + hi) / 2;
         if (g_inv[mid].host <= ra) lo = mid + 1; else hi = mid; }
-    return lo ? g_inv[lo - 1].guest : 0;
+    guest = lo ? g_inv[lo - 1].guest : 0;
+    cache.put((uintptr_t)ra, guest);
+    return guest;
 }
 
 static ppu_fn ppu_lookup(uint32_t a)
@@ -3797,11 +3851,10 @@ extern "C" ppu_context* volatile g_ppu_main_ctx = nullptr;
 
 extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
 {
-    /* Line-buffer stdout: HLE logs mix printf (stdout) with probe fprintf
-     * (stderr); with a redirected block-buffered stdout, printf lines sat in
-     * the buffer for minutes and were LOST when the run was killed -- which
-     * made "the log line is absent" unusable as evidence. */
-    setvbuf(stdout, NULL, _IONBF, 0);
+    /* The embedding host owns stdio buffering and log-flush cadence. The boot
+     * harnesses already configure their streams explicitly; resetting stdout
+     * here silently defeated a port's buffered logging, issuing a pipe write
+     * for almost every character of high-volume HLE diagnostics on Windows. */
 
     g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
     uint32_t code = 0, toc = 0;

@@ -57,6 +57,21 @@ enum ps3_ft_kind {
     PS3_FT_GPU_EXEC    = 14, /* Metal: a command buffer's own GPU time, ending when the CPU saw it
                               * complete; who = render passes, a = depth resolves | colour copies << 16,
                               * b = 1 present / 0 flush */
+    PS3_FT_HLE        = 15, /* PPU tid, NID, guest LR; elapsed, may include nested work */
+    PS3_FT_SPU_JOB    = 16, /* native worker tid, image id, descriptor EA; elapsed */
+    PS3_FT_BLIT       = 17, /* nested in DRAIN: a=1 swizzled CPU copy, b=pixels */
+    PS3_FT_CHAIN_JTS  = 18, /* native tid, chain EA, command PC: waiting for publication */
+    PS3_FT_CHAIN_GUARD= 19, /* native tid, chain EA, guard EA */
+    PS3_FT_CHAIN_POOL = 20, /* native tid, chain EA, job count: complete parallel list */
+    PS3_FT_CHAIN_LIST = 21, /* native tid, chain EA, job count: complete serial list */
+    PS3_FT_CHAIN_CMD  = 22, /* native tid, chain EA, low 7 command bits; instant */
+    PS3_FT_POOL_READY = 23, /* native tid, chain EA, first descriptor: enqueue -> first claim */
+    PS3_FT_POOL_JOIN  = 24, /* native tid, chain EA, first descriptor: last done -> owner return */
+    PS3_FT_FRAME_GATE = 25, /* who: 1 strict FIFO boundary, 2 legacy boundary, 3 catch-up skip,
+                             * 4 host present decision, 5 clear present, 6 small-batch hold,
+                             * 7 ticker suppressed by clear mode, 8 offscreen-only execution,
+                             * 9 empty batch; a=buffer/flip serial, b=backlog/draws */
+    PS3_FT_PPU_SCOPE = 26, /* PPU tid, guest function PC, incoming LR; elapsed including nested work */
 };
 
 #if defined(_MSC_VER)
@@ -70,7 +85,8 @@ typedef struct { uint64_t t0, t1; uint32_t a, b, who, kind; } ps3_ft_rec;
 enum { PS3_FT_TIDS = 256 };
 
 typedef struct {
-    int on;              /* 0 unknown, 1 initialising, 2 recording, 3 off/done */
+    int on;              /* 0 unknown, 1 initialising, 2 recording, 3 off/done, 4 awaiting activation */
+    int pending_activated; /* deferred FIRST capture only; never reset a live buffer */
     int dumped;
     uint32_t n, cap, dropped;
     uint64_t base, start, end, min, merge;
@@ -145,6 +161,15 @@ static inline int ps3_ft_init(void)
             fprintf(stderr, "[ftrace] PS3_FTRACE=<start s>:<seconds>:<path>, got '%s'\n", e);
         } else {
             snprintf(s->path, sizeof s->path, "%s", e + used);
+            const char* wait = getenv("PS3_FTRACE_WAIT");
+            if (!s->pending_activated && wait && wait[0]=='1' && !wait[1]) {
+                /* No buffer exists and no writer has ever seen on=2. Keep
+                 * hooks on their cheap off branch until explicitly activated.
+                 * The port, not these hot hooks, polls a trigger file. */
+                fprintf(stderr,"[ftrace] armed, awaiting explicit activation: %s\n",s->path);
+                __atomic_store_n(&s->on,4,__ATOMIC_RELEASE);
+                return 0;
+            }
             const char* m = getenv("PS3_FTRACE_MIN_US");
             s->min = (m ? strtoull(m, 0, 10) : 20ull) * 1000ull;
             const char* g = getenv("PS3_FTRACE_MERGE_US");
@@ -166,6 +191,20 @@ static inline int ps3_ft_init(void)
     }
     __atomic_store_n(&s->on, on, __ATOMIC_RELEASE);
     return on == 2;
+}
+
+/* Only an armed FIRST capture can be activated. Refuse recording/finished
+ * states: resetting/freeing a live buffer would race writers. Another hook
+ * may win the subsequent normal init, but it still initializes exactly once.
+ * Return means activation accepted, not that the dump is already complete. */
+static inline int ps3_ft_activate_pending(void)
+{
+    int expected=4;
+    if(!__atomic_compare_exchange_n(&g_ps3_ft.on,&expected,1,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return 0;
+    g_ps3_ft.pending_activated=1;
+    __atomic_store_n(&g_ps3_ft.on,0,__ATOMIC_RELEASE);
+    ps3_ft_init();
+    return 1;
 }
 
 /* The hook guard: one load when off. */
@@ -212,7 +251,10 @@ static inline void ps3_ft_usleep(uint32_t tid, uint32_t lr, uint64_t t0, uint64_
 /* A PPU thread's name, for the report's labels. */
 static inline void ps3_ft_name(uint32_t tid, const char* name)
 {
-    if (tid >= PS3_FT_TIDS || !name || !PS3_FT_ON()) return;
+    if (tid >= PS3_FT_TIDS || !name) return;
+    /* Thread creation normally precedes a manually armed capture. Retain
+     * names without allocating/recording spans while on=4. */
+    if (!PS3_FT_ON() && __atomic_load_n(&g_ps3_ft.on,__ATOMIC_ACQUIRE)!=4) return;
     snprintf(g_ps3_ft.names[tid], sizeof g_ps3_ft.names[tid], "%s", name);
 }
 

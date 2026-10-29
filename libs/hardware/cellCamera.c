@@ -22,6 +22,7 @@
  */
 
 #include "cellCamera.h"
+#include "cell_camera_pattern.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -146,21 +147,7 @@ static void cam_fill_frame(void)
 {
     if (!vm_base) return;
     unsigned char* dst = vm_base + CAM_BUFFER_GUEST_EA;
-    u32 t = s_frame;
-    int bx = (int)((t * 5u) % (CAM_W - 96));
-    int by = (int)((t * 3u) % (CAM_H - 96));
-    for (int y = 0; y < CAM_H; y++) {
-        for (int x = 0; x < CAM_W; x++) {
-            unsigned r = (unsigned)(x * 255 / CAM_W);
-            unsigned g = (unsigned)(y * 255 / CAM_H);
-            unsigned b = 255u - r;
-            if (x >= bx && x < bx + 96 && y >= by && y < by + 96) r = g = b = 250;
-            unsigned v;
-            if ((y & 1) == 0) v = ((x & 1) == 0) ? g : r;   /* G R */
-            else              v = ((x & 1) == 0) ? b : g;   /* B G */
-            dst[y * CAM_W + x] = (unsigned char)v;
-        }
-    }
+    camera_pattern_fill(dst,s_frame);
 }
 
 /* 3-arg read (libcamera's real signature):

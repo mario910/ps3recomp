@@ -13,6 +13,7 @@
  */
 
 #include "../../runtime/memory/vm.h"   /* vm_commit */
+#include "../../runtime/platform/thread_name.h"
 #include "cellAudio.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read64, vm_write32 */
 #include <stdio.h>
@@ -376,7 +377,7 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
          * it, unlike PS3_NO_AUDIO, which sends the title down its no-audio
          * path. For unattended runs. */
         static int mute = -1;
-        if (mute < 0) mute = getenv("PS3_MUTE") ? 1 : 0;
+        if (mute < 0) { const char* e = getenv("PS3_MUTE"); mute = e && e[0] && e[0] != '0'; }
         memcpy(buf, stereo_samples, num_samples * 2 * sizeof(float));
         s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, num_samples,
                                                mute ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
@@ -652,6 +653,7 @@ static int audio_start_mix_thread(void)
 #ifdef _WIN32
     s_mix_thread = (HANDLE)_beginthreadex(NULL, 0, audio_mix_thread_func,
                                            NULL, 0, NULL);
+    if (s_mix_thread) ps3_thread_name(s_mix_thread, "cellAudio mixer");
     if (!s_mix_thread) {
         s_mix_thread_running = 0;
         return -1;
