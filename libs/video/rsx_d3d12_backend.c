@@ -6459,6 +6459,14 @@ typedef struct { float v[4]; } VPSlot;
 
 
 void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n);
+/* VTX_POS is read once; disabled, the per-vertex call is skipped entirely
+ * (it showed as ~7% of the RSX worker in a heavy-scene profile). */
+static int vtx_pos_dbg_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("VTX_POS"); on = e && atoi(e) > 0; }
+    return on;
+}
 
 /* Fill all 16 attribute slots for one vertex. The per-attribute work lives in
  * rsx_vertex_fetch.c so the Metal and null backends read guest vertices the
@@ -6483,7 +6491,7 @@ static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16,rsx_ver
     else rsx_fetch_vertex(state, vi, (float (*)[4])out16);
     const rsx_vertex_attrib* a = &state->vertex_attribs[0];
     u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
-    rsx_vtx_pos_dbg(state, out16[0].v, n);
+    if (vtx_pos_dbg_on()) rsx_vtx_pos_dbg(state, out16[0].v, n);
 }
 
 static void read_vp_vertex_cached(rsx_vertex_cache* cache, u32 vi, VPSlot* out16)
@@ -6492,7 +6500,7 @@ static void read_vp_vertex_cached(rsx_vertex_cache* cache, u32 vi, VPSlot* out16
     if(cache->planned)vp_fetch_plan_compare(cache->state,vi,out16);
     const rsx_vertex_attrib* a = &cache->state->vertex_attribs[0];
     u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
-    rsx_vtx_pos_dbg(cache->state, out16[0].v, n);
+    if (vtx_pos_dbg_on()) rsx_vtx_pos_dbg(cache->state, out16[0].v, n);
 }
 
 /* VTX_POS=<N>: print the first fetched position of the first N draws. A guest
