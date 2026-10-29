@@ -1,5 +1,11 @@
 # ps3recomp
 
+> **Buzz! Quiz World fork.** This master preserves upstream and Buzz commit history,
+> while retaining the validated v0.17 runtime/code-generator baseline.
+> See [BUZZ_FORK.md](BUZZ_FORK.md) for the explicit compatibility pin and provenance.
+> For the game port's supported inputs and build instructions, use
+> [buzz-quizworld-recomp](https://github.com/mario910/buzz-quizworld-recomp).
+
 ### *Because the Cell processor deserves a second life*
 
 > Static recompilation runtime libraries for PlayStation 3 titles.

@@ -114,4 +114,9 @@ fw_spu/
 *.PRX
 
 # SPU differential test build products (runtime/spu/tests/build_diff_test.sh)
+# Copied references and old diagnostic output are not part of the source package.
+/docs/RSXFIFOCommands - PS3 Developer wiki.pdf
+/docs/rsxfifo.txt
+/tools/stderr_revert2.txt
+/tools/stderr_vt1.txt
 runtime/spu/tests/build_diff/
