@@ -1958,6 +1958,8 @@ void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, _
     VM_WRITE_COH(a, &v, 1); }
 void vm_write16(uint64_t a, uint16_t v) { barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2) || vm_null_store((uint32_t)a, v, 2, __builtin_return_address(0))) return;
     v = __builtin_bswap16(v); VM_WRITE_COH(a, &v, 2); }
+extern "C" volatile uint32_t g_ppu_wake_ea[2];   /* sys_timer.c wait-site slots */
+extern "C" volatile long g_ppu_wake_count;
 void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4) || vm_null_store((uint32_t)a, v, 4, __builtin_return_address(0))) return;
 #ifdef _WIN32
     /* PT restore: a full-word store of a valid pointer (high byte set) to a
@@ -1966,6 +1968,11 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
 #endif
     { uint32_t _v = v;
       v = __builtin_bswap32(v); VM_WRITE_COH(a, &v, 4);
+#ifdef _WIN32
+      /* A thread blocked in a registered usleep wait site polls this word. */
+      if (__builtin_expect((uint32_t)a == g_ppu_wake_ea[0] || (uint32_t)a == g_ppu_wake_ea[1], 0)) {
+          _InterlockedIncrement(&g_ppu_wake_count); WakeByAddressAll(vm_base + (uint32_t)a); }
+#endif
       /* Raw SPU problem state: run control, mailboxes and signal notification
        * have side effects. The plain store above still happens -- the registers
        * are guest memory and the PPU reads most of them straight back. */

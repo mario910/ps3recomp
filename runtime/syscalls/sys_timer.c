@@ -14,12 +14,47 @@
 #include <stdlib.h>
 #include "ps3emu/log_first.h"
 #include "timer_short_spin.h"
+#ifdef _WIN32
+#pragma comment(lib, "Synchronization.lib")   /* WaitOnAddress / WakeByAddressAll */
+#endif
 
 /* ---------------------------------------------------------------------------
  * Globals
  * -----------------------------------------------------------------------*/
 sys_timer_info g_sys_timers[SYS_TIMER_MAX];
 static unsigned s_short_spin_us, s_timer_tail_us, s_min_sleep_us;
+
+/* Guest poll loops of the form `while (*(u32*)(rN + off) != 0) usleep(tiny)`,
+ * identified by the return address the lifted code leaves in LR at the
+ * syscall. Registered by the port at startup, before guest threads run. */
+static struct { uint32_t lr; int reg; uint32_t offset; } s_wait_site[8];
+static int s_wait_site_n, s_wait_sites_off;
+static unsigned s_wait_spin_us = 20;
+/* The guest word each waiting thread polls, one slot per waiter (the word
+ * is per work object, so waiters differ); vm_write32 wakes a slot's waiter
+ * when it stores to that word. ~0 = empty (0 is a valid store address). */
+volatile uint32_t g_ppu_wake_ea[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+static volatile long s_wake_slots_used;
+volatile long g_ppu_wake_count;   /* stores that woke wait-site waiters */
+volatile long g_ppu_wake_count_dma, g_ppu_wake_count_hle;   /* ...from SPU PUTs / HLE stores */
+#ifdef _WIN32
+/* HLE stores (ppu_memory.h inline vm_write32) to a wait-site word. */
+void ps3_wake_address_hle(uint32_t addr)
+{
+    _InterlockedIncrement(&g_ppu_wake_count_hle);
+    WakeByAddressAll(vm_base + addr);
+}
+#endif
+
+void sys_timer_register_usleep_wait(uint32_t lr, int reg, uint32_t offset)
+{
+    if (!s_wait_sites_off && s_wait_site_n < 8 && reg >= 0 && reg < 32) {
+        s_wait_site[s_wait_site_n].lr = lr;
+        s_wait_site[s_wait_site_n].reg = reg;
+        s_wait_site[s_wait_site_n].offset = offset;
+        s_wait_site_n++;
+    }
+}
 __attribute__((constructor)) static void timer_short_spin_options_init(void)
 {
     const char* e=getenv("PS3_SHORT_SLEEP_SPIN_US");int requested=e?atoi(e):0;
@@ -28,6 +63,10 @@ __attribute__((constructor)) static void timer_short_spin_options_init(void)
     s_timer_tail_us=requested>=1 && requested<=900?(unsigned)requested:0;
     e=getenv("PS3_USLEEP_MIN_US");requested=e?atoi(e):0;
     s_min_sleep_us=requested>=1 && requested<=2000?(unsigned)requested:0;
+    e=getenv("PS3_USLEEP_WAIT_SPIN_US");
+    if(e){requested=atoi(e);s_wait_spin_us=requested>=0 && requested<=1000?(unsigned)requested:20;}
+    e=getenv("PS3_USLEEP_WAIT_SITES");   /* =1: use registered wait sites (opt-in) */
+    s_wait_sites_off=!(e && e[0]=='1');
 }
 
 #ifdef _WIN32
@@ -229,6 +268,56 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         ppu_log_host_chain("usleep1ms"); } }
 
 #ifdef _WIN32
+    /* Registered wait sites (sys_timer_register_usleep_wait): the guest
+     * sleeps here only to poll a word another PPU thread clears. Spin a
+     * little (short holds), then block until a store to that word wakes us
+     * (vm_write32 -> WakeByAddressAll) or 2 ms pass; the guest loop re-checks
+     * either way. Replaces ~100k spinning usleep(2) calls a second. */
+    if (s_wait_site_n && usec <= 50) {
+        for (int i = 0; i < s_wait_site_n; ++i) {
+            if ((uint32_t)ctx->lr != s_wait_site[i].lr) continue;
+            const uint32_t ea = (uint32_t)ctx->gpr[s_wait_site[i].reg] + s_wait_site[i].offset;
+            if ((ea & 3u) || ea < 0x10000u || ea >= 0xF0000000u) break;
+            static _Thread_local int slot = -1;
+            if (slot < 0) {
+                const long taken = _InterlockedIncrement(&s_wake_slots_used) - 1;
+                slot = taken < 2 ? (int)taken : 2;   /* 2: no slot, plain spin path */
+            }
+            if (slot == 2) break;
+            /* Publish before reading the word: a store that lands after the
+             * read wakes us; one that lands before is seen by the read. */
+            __atomic_store_n(&g_ppu_wake_ea[slot], ea, __ATOMIC_SEQ_CST);
+            volatile uint32_t* word = (volatile uint32_t*)(vm_base + ea);
+            ensure_qpc_init();
+            LARGE_INTEGER now, spin_end;
+            QueryPerformanceCounter(&now);
+            spin_end.QuadPart = now.QuadPart + (int64_t)s_wait_spin_us * s_qpc_freq.QuadPart / 1000000;
+            while (*word != 0 && now.QuadPart < spin_end.QuadPart) {
+                SwitchToThread();
+                QueryPerformanceCounter(&now);
+            }
+            uint32_t seen = *word;
+            long blocked = 0, timed_out = 0;
+            if (seen != 0) {
+                blocked = 1;
+                if (!WaitOnAddress((volatile VOID*)word, &seen, sizeof seen, 2)) timed_out = 1;
+            }
+            __atomic_store_n(&g_ppu_wake_ea[slot], 0xFFFFFFFFu, __ATOMIC_RELAXED);
+            { static int stats = -1; static volatile long calls, blocks, timeouts; static ULONGLONG last;
+              if (stats < 0) { const char* se = getenv("PS3_USLEEP_WAIT_STATS"); stats = se && se[0] == '1'; }
+              if (stats) {
+                  _InterlockedIncrement(&calls);
+                  if (blocked) _InterlockedIncrement(&blocks);
+                  if (timed_out) _InterlockedIncrement(&timeouts);
+                  ULONGLONG t = GetTickCount64();
+                  if (t - last >= 5000) { last = t;
+                      extern volatile long g_ppu_wake_count;
+                      fprintf(stderr, "[usleep-wait] ea=%08X calls=%ld blocked=%ld timeouts=%ld wakes=%ld dma=%ld hle=%ld value=%08X\n",
+                              ea, calls, blocks, timeouts, g_ppu_wake_count, g_ppu_wake_count_dma,
+                              g_ppu_wake_count_hle, *word); } } }
+            return CELL_OK;
+        }
+    }
     /* PS3_USLEEP_MIN_US=<n>: a sleep shorter than n us blocks for n us on a
      * high-resolution timer instead of spinning. A guest polling with
      * usleep(2) ~120k times a second (Buzz's ThreadPoolWorker) otherwise

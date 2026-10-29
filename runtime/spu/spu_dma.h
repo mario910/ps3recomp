@@ -710,6 +710,16 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * find the pushbuffer; NULL for every title that does not. */
         { extern void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
           if (g_spu_put_hook) g_spu_put_hook((uint32_t)ea, size); }
+#ifdef _WIN32
+        /* A PPU thread blocked in a registered usleep wait site may be polling
+         * a word this PUT just wrote (sys_timer.c wait-site slots). */
+        { extern volatile uint32_t g_ppu_wake_ea[2]; extern volatile long g_ppu_wake_count_dma;
+          const uint32_t lo = (uint32_t)ea, hi = lo + size;
+          for (int k = 0; k < 2; ++k) {
+              const uint32_t w = g_ppu_wake_ea[k];
+              if (w - lo < hi - lo) { _InterlockedIncrement(&g_ppu_wake_count_dma); WakeByAddressAll(vm_base + w); }
+          } }
+#endif
         /* A PUT can replace a SPURS jump-to-self the host walker is parked on;
          * wake it now instead of at its timeout. NULL unless enabled. */
         { extern void (*g_spu_put_notify)(uint32_t ea, uint32_t size);

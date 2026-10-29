@@ -187,12 +187,19 @@ static inline void vm_write16(uint32_t addr, uint16_t val)
     VM_WRITE_COH(addr, &raw, sizeof(raw));
 }
 
+#ifdef _WIN32
+extern volatile uint32_t g_ppu_wake_ea[2];   /* sys_timer.c wait-site slots */
+void ps3_wake_address_hle(uint32_t addr);    /* sys_timer.c */
+#endif
 static inline void vm_write32(uint32_t addr, uint32_t val)
 {
     PS3_WW_CHECK(addr, val, 4);
     uint32_t raw = ps3_bswap32(val);
     VM_WRITE_COH(addr, &raw, sizeof(raw));
     if (g_resv_store_active > 0) ppu_resv_break_store(addr);
+#ifdef _WIN32
+    if (addr == g_ppu_wake_ea[0] || addr == g_ppu_wake_ea[1]) ps3_wake_address_hle(addr);
+#endif
 }
 
 static inline void vm_write64(uint32_t addr, uint64_t val)
