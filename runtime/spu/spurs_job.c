@@ -273,8 +273,8 @@ void spurs_job_run_prepared(spu_lifted_entry_fn entry, int image_id, spu_context
 }
 
 /* SPURS_JOB_LS_ZERO: how much of a reused (exchanged) job context is
- * cleared before staging. 0 (default): the whole LS past the binary, 256 KiB
- * per job. 1: the job's declared regions (io/out/scratch/stack/cache) and the
+ * cleared before staging. 0: the whole LS past the binary, 256 KiB per job.
+ * 1 (default): the job's declared regions (io/out/scratch/stack/cache) and the
  * context/descriptor block; the rest keeps the previous job's bytes, as jm2's
  * own LS does on hardware. 2: diagnostic, context block only. Only exchanged
  * contexts qualify: they start zeroed (spu_run_spurs_job). */
@@ -284,8 +284,8 @@ static int spurs_job_ls_zero_mode(void)
     int m = __atomic_load_n(&mode, __ATOMIC_RELAXED);
     if (m < 0) {
         const char* e = getenv("SPURS_JOB_LS_ZERO");
-        m = e ? atoi(e) : 0;
-        if (m < 0 || m > 2) m = 0;
+        m = e && *e ? atoi(e) : 1;
+        if (m < 0 || m > 2) m = 1;
         __atomic_store_n(&mode, m, __ATOMIC_RELAXED);
     }
     return m;

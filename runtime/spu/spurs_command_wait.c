@@ -66,11 +66,12 @@ static unsigned logical_processors(void)
 #endif
 }
 
-/* SPURS_JTS_SPIN_US=n: poll the slot for up to n us before parking, as
- * SPURS_POOL_SPIN_US does for pool lanes; a publication usually lands within
- * one stage of the other chain, sooner than an OS wake-up. 12+ logical
- * processors only. Guest memory is read with atomic loads so the poll cannot
- * be hoisted; the caller re-reads the slot either way. */
+/* Poll the slot for up to SPURS_JTS_SPIN_US us before parking, as pool lanes
+ * do (SPURS_POOL_SPIN_US, same automatic default: 1000 with 12+ logical
+ * processors, else off; a set value is used as given). A publication usually
+ * lands within one stage of the other chain, sooner than an OS wake-up.
+ * Guest memory is read with atomic loads so the poll cannot be hoisted; the
+ * caller re-reads the slot either way. */
 static uint64_t spin_ticks(void)
 {
     static uint64_t ticks = UINT64_MAX;
@@ -78,9 +79,8 @@ static uint64_t spin_ticks(void)
     if (t == UINT64_MAX) {
         const char* e = getenv("SPURS_JTS_SPIN_US");
         LARGE_INTEGER f; QueryPerformanceFrequency(&f);
-        const long us = e ? atol(e) : 0;
-        t = us > 0 && us <= 100000 && logical_processors() >= 12
-            ? (uint64_t)f.QuadPart * (uint64_t)us / 1000000u : 0;
+        const long us = !e || !*e ? (logical_processors() >= 12 ? 1000 : 0) : atol(e);
+        t = us > 0 && us <= 100000 ? (uint64_t)f.QuadPart * (uint64_t)us / 1000000u : 0;
         __atomic_store_n(&ticks, t, __ATOMIC_RELAXED);
     }
     return t;

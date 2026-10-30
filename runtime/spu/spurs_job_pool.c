@@ -144,22 +144,22 @@ static unsigned logical_processors(void)
 /* A chain separated by SYNCs arrives as many short stages (Buzz's studio:
  * ~165 per frame, ~14 jobs each), so lanes go idle at every stage boundary.
  * Sleeping on the condition variable there costs an OS wake-up per lane per
- * stage. SPURS_POOL_SPIN_US=n first polls for new work for up to n us. The
- * polling lanes occupy cores, so it applies only with 12+ logical processors,
- * where the guest PPU, RSX and audio threads keep cores of their own. */
+ * stage, so an idle lane first polls for new work. SPURS_POOL_SPIN_US=n sets
+ * the bound in us (0: sleep at once) and is used as given. Unset, it is 1000
+ * with 12+ logical processors and off below: polling lanes occupy cores that
+ * smaller CPUs need for the guest PPU, RSX and audio threads. */
 static uint64_t spin_ticks(void)
 {
     static uint64_t ticks = UINT64_MAX;
     if (ticks == UINT64_MAX) {
         const char* e = getenv("SPURS_POOL_SPIN_US");
         LARGE_INTEGER f; QueryPerformanceFrequency(&f);
-        const long us = e ? atol(e) : 0;
         const unsigned cpus = logical_processors();
-        ticks = us > 0 && us <= 100000 && cpus >= 12
-            ? (uint64_t)f.QuadPart * (uint64_t)us / 1000000u : 0;
-        if (us > 0)
-            fprintf(stderr, "[job-pool] idle lanes poll %ld us before sleeping%s (%lu logical processors)\n",
-                    ticks ? us : 0L, ticks ? "" : ": off, too few processors", (unsigned long)cpus);
+        const int automatic = !e || !*e;
+        const long us = automatic ? (cpus >= 12 ? 1000 : 0) : atol(e);
+        ticks = us > 0 && us <= 100000 ? (uint64_t)f.QuadPart * (uint64_t)us / 1000000u : 0;
+        fprintf(stderr, "[job-pool] idle lanes poll %ld us before sleeping (%s, %u logical processors)\n",
+                ticks ? us : 0L, automatic ? "automatic" : "SPURS_POOL_SPIN_US", cpus);
     }
     return ticks;
 }
