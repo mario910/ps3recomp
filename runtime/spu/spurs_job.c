@@ -272,6 +272,25 @@ void spurs_job_run_prepared(spu_lifted_entry_fn entry, int image_id, spu_context
     spu_coh_unregister(ctx);
 }
 
+/* SPURS_JOB_LS_ZERO: how much of a reused (exchanged) job context is
+ * cleared before staging. 0 (default): the whole LS past the binary, 256 KiB
+ * per job. 1: the job's declared regions (io/out/scratch/stack/cache) and the
+ * context/descriptor block; the rest keeps the previous job's bytes, as jm2's
+ * own LS does on hardware. 2: diagnostic, context block only. Only exchanged
+ * contexts qualify: they start zeroed (spu_run_spurs_job). */
+static int spurs_job_ls_zero_mode(void)
+{
+    static int mode = -1;
+    int m = __atomic_load_n(&mode, __ATOMIC_RELAXED);
+    if (m < 0) {
+        const char* e = getenv("SPURS_JOB_LS_ZERO");
+        m = e ? atoi(e) : 0;
+        if (m < 0 || m > 2) m = 0;
+        __atomic_store_n(&mode, m, __ATOMIC_RELAXED);
+    }
+    return m;
+}
+
 static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size, spu_context* ctx, int exchange)
 {
@@ -313,7 +332,8 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
     /* Stage directly into the job's own zeroed local store. The old path
      * calloc'ed a second 256 KiB store, then zeroed ctx and copied all of it
      * again. Per-job ownership and the guest bytes are unchanged. */
-    spu_context_init_keep_ls_prefix(ctx,0,size_bin);   /* the binary covers [0, size_bin) */
+    const int ls_zero = exchange ? spurs_job_ls_zero_mode() : 0;
+    spu_context_init_keep_ls_prefix(ctx,0,ls_zero ? SPU_LS_SIZE : size_bin);
     ctx->image_id=image_id;
     uint8_t* ls=ctx->ls;
 
@@ -342,6 +362,8 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
     uint32_t s_ls      = p;
     uint32_t stack_top = p + ss_size;
     p += ss_size;
+    if (ls_zero == 1 && p > size_bin)
+        memset(ls + size_bin, 0, (p < SPU_LS_SIZE ? p : SPU_LS_SIZE) - size_bin);
 
     /* ---- cache-hinted read-only inputs ---------------------------------- */
     uint32_t dma_base   = job_ea + JH_SIZE;          /* input list ... */
@@ -355,6 +377,8 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
         if (p + sz > SPU_LS_SIZE) break;
         cache_ls[i] = p;
         memcpy(ls + p, vm_base + eal, sz);
+        if (ls_zero == 1 && ALIGN1024(sz) > sz && p + ALIGN1024(sz) <= SPU_LS_SIZE)
+            memset(ls + p + sz, 0, ALIGN1024(sz) - sz);
         p += ALIGN1024(sz);
     }
 
@@ -381,6 +405,7 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
     if (p > ctx_ls)
         fprintf(stderr, "[spurs-job] job 0x%08X: WARNING regions reach 0x%X, "
                         "past the context at 0x%X\n", job_ea, p, ctx_ls);
+    if (ls_zero) memset(ls + ctx_ls, 0, SPU_LS_SIZE - ctx_ls);
     memcpy(ls + desc_ls, vm_base + job_ea, dsz);
 
     ls32(ls, ctx_ls + JC_IO_BUFFER, io_ls);
@@ -684,6 +709,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
 #endif
         if (!s_spare_context)
             return run_spurs_job_stack(entry, image_id, job_ea, descriptor_size);
+        spu_context_init(s_spare_context, 0);   /* SPURS_JOB_LS_ZERO keeps later bytes */
     }
     spu_context* owned = s_spare_context;
     s_spare_context = NULL; /* a recursively entered job must allocate its own */
