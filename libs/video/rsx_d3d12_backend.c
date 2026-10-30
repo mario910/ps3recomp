@@ -765,8 +765,6 @@ static void (*s_host_key_handler)(u32 key, int down) = NULL;
 static int s_host_fullscreen = 0;
 static LONG_PTR s_host_window_style;
 static WINDOWPLACEMENT s_host_window_placement;
-static HANDLE s_host_frame_timer;
-static ps3_host_pacer s_host_pacer;
 
 /* Called only on the backend/window thread. Requests from a menu thread are
  * atomics; no HWND, swapchain, or guest state is touched by their setters. */
@@ -792,30 +790,6 @@ static void host_update_window_mode(void)
     }
     s_host_fullscreen=wanted;
     fprintf(stderr,"[host-controls] borderless-fullscreen=%d (guest resolution unchanged)\n",wanted);
-}
-static uint64_t host_now_ns(void)
-{
-    LARGE_INTEGER q,f;QueryPerformanceCounter(&q);QueryPerformanceFrequency(&f);
-    return (uint64_t)(q.QuadPart/f.QuadPart)*1000000000ull+
-           (uint64_t)(q.QuadPart%f.QuadPart)*1000000000ull/(uint64_t)f.QuadPart;
-}
-static void host_wait_present(unsigned fps)
-{
-    const uint64_t now=host_now_ns();
-    const uint64_t due=ps3_host_frame_deadline(&s_host_pacer,now,fps);
-    if(due<=now)return;
-    if(!s_host_frame_timer) {
-        s_host_frame_timer=CreateWaitableTimerExW(NULL,NULL,0x2,TIMER_MODIFY_STATE|SYNCHRONIZE);
-        if(!s_host_frame_timer)s_host_frame_timer=CreateWaitableTimerW(NULL,FALSE,NULL);
-    }
-    for(;;) {
-        const uint64_t current=host_now_ns();if(current>=due)return;
-        const uint64_t remaining=due-current;
-        LARGE_INTEGER interval;interval.QuadPart=-(LONGLONG)((remaining+99)/100);
-        if(s_host_frame_timer&&SetWaitableTimer(s_host_frame_timer,&interval,0,NULL,NULL,FALSE))
-            WaitForSingleObject(s_host_frame_timer,INFINITE);
-        else Sleep((DWORD)((remaining+999999)/1000000));
-    }
 }
 void rsx_d3d12_set_key_handler(void (*handler)(u32, int))
 {
@@ -6176,7 +6150,6 @@ skip_dump_consider: ;
     int presented=0;
     if (s_present_this_frame) {
         const unsigned host_limit=ps3_host_get_frame_limit();
-        host_wait_present(host_limit);
         u64 present_start=PS3_FT_ON()?ps3_ft_now():0;
         HRESULT present_result=s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain,host_limit==PS3_HOST_LEGACY_FRAME_LIMIT?1:0,0);
         rsx_pso_cache_tick();
@@ -7904,7 +7877,6 @@ void rsx_d3d12_backend_shutdown(void)
 {
     if(s_d3d.cmd_queue)wait_for_gpu();
     ps3_host_overlay_shutdown();
-    if(s_host_frame_timer){CloseHandle(s_host_frame_timer);s_host_frame_timer=NULL;}
     if (!s_d3d.initialized) return;
 
     if (rsx_frame_refs_drain(&s_draw_pipelines,

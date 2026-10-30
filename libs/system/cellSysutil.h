@@ -119,6 +119,9 @@ s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]);
  * The slot must match the slot the game registered against; flOw and most
  * games use slot 0. */
 void cellSysutilQueueEvent(int slot, u32 status, u32 param);
+/* Thread-safe: queue the event for every slot the title has registered, as
+ * the XMB's SYSTEM_MENU_OPEN/CLOSE reach them all. Returns how many. */
+int cellSysutilBroadcastEvent(u32 status, u32 param);
 
 /* value_ea / buf_ea are GUEST addresses, not host pointers: both write into
  * the title's own memory through vm_write*. Spelt u32 so a caller cannot

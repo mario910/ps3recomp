@@ -67,6 +67,7 @@
 #include <pthread.h>
 #else
 #include "ps3emu/host_overlay.h"
+#include "ps3emu/host_controls.h"
 #endif
 #include <stddef.h>
 #include <stdint.h>
@@ -271,6 +272,13 @@ typedef struct vk_state {
     VkPresentModeKHR requested_present_mode;
     VkImage          sc_images[8];
     VkSemaphore      sc_done[8];      /* per image: the present waits on it */
+    /* Host overlay (Windows): a load/present pass over each swapchain image,
+     * after the blit. Kept across swapchain recreation while the format holds. */
+    VkFormat         sc_format, overlay_format;
+    u32              sc_min_count;
+    VkRenderPass     overlay_pass;
+    VkImageView      sc_views[8];
+    VkFramebuffer    sc_framebuffers[8];
     VkSemaphore      sem_acquire;
     double           hold_seconds;
 
@@ -2044,6 +2052,87 @@ static LRESULT CALLBACK vk_window_proc(HWND window,UINT message,WPARAM wparam,LP
 }
 #endif
 
+static int ps3_overlay_wanted(void)
+{
+#ifdef _WIN32
+    return ps3_host_overlay_enabled();
+#else
+    return 0;
+#endif
+}
+
+/* Swapchain-image views and framebuffers for the host overlay pass. */
+static void vk_overlay_targets_drop(void)
+{
+    for (u32 i = 0; i < 8; i++) {
+        if (s_vk.sc_framebuffers[i]) pvkDestroyFramebuffer(s_vk.device, s_vk.sc_framebuffers[i], NULL);
+        if (s_vk.sc_views[i]) pvkDestroyImageView(s_vk.device, s_vk.sc_views[i], NULL);
+        s_vk.sc_framebuffers[i] = VK_NULL_HANDLE;
+        s_vk.sc_views[i] = VK_NULL_HANDLE;
+    }
+}
+
+/* Load the blitted frame, let the overlay draw over it, leave it ready to
+ * present. Any failure only disables the overlay; presenting is unaffected. */
+static void vk_overlay_targets_create(void)
+{
+#ifdef _WIN32
+    if (!ps3_host_overlay_enabled()) return;
+    if (s_vk.overlay_pass && s_vk.sc_format != s_vk.overlay_format) {
+        pvkDestroyRenderPass(s_vk.device, s_vk.overlay_pass, NULL);
+        s_vk.overlay_pass = VK_NULL_HANDLE;
+    }
+    if (!s_vk.overlay_pass) {
+        VkAttachmentDescription color = {
+            .format = s_vk.sc_format, .samples = VK_SAMPLE_COUNT_1_BIT,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, .finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        };
+        VkAttachmentReference ref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+        VkSubpassDescription sub = { .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                     .colorAttachmentCount = 1, .pColorAttachments = &ref };
+        VkSubpassDependency deps[2] = {
+            { VK_SUBPASS_EXTERNAL, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+              VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0 },
+            { 0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+              VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0, 0 },
+        };
+        VkRenderPassCreateInfo rp = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+                                      .attachmentCount = 1, .pAttachments = &color,
+                                      .subpassCount = 1, .pSubpasses = &sub,
+                                      .dependencyCount = 2, .pDependencies = deps };
+        if (pvkCreateRenderPass(s_vk.device, &rp, NULL, &s_vk.overlay_pass) != VK_SUCCESS) {
+            VK_LOG("overlay render pass creation failed; host overlay disabled\n");
+            s_vk.overlay_pass = VK_NULL_HANDLE;
+            return;
+        }
+        s_vk.overlay_format = s_vk.sc_format;
+    }
+    for (u32 i = 0; i < s_vk.sc_count; i++) {
+        VkImageViewCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                                     .image = s_vk.sc_images[i], .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                                     .format = s_vk.sc_format,
+                                     .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+        VkFramebufferCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+                                       .renderPass = s_vk.overlay_pass, .attachmentCount = 1,
+                                       .width = s_vk.sc_extent.width, .height = s_vk.sc_extent.height, .layers = 1 };
+        if (pvkCreateImageView(s_vk.device, &vi, NULL, &s_vk.sc_views[i]) != VK_SUCCESS) break;
+        fi.pAttachments = &s_vk.sc_views[i];
+        if (pvkCreateFramebuffer(s_vk.device, &fi, NULL, &s_vk.sc_framebuffers[i]) != VK_SUCCESS) break;
+    }
+    if (!s_vk.sc_framebuffers[s_vk.sc_count - 1]) {
+        VK_LOG("overlay framebuffers could not be created; host overlay disabled\n");
+        vk_overlay_targets_drop();
+    }
+#endif
+}
+
+static void* vk_overlay_proc(void* instance, const char* name)
+{
+    return (void*)pvkGetInstanceProcAddr((VkInstance)instance, name);
+}
+
 static void vk_window_drop(const char* why)
 {
     if (why) VK_LOG("window disabled, continuing headless: %s\n", why);
@@ -2055,6 +2144,9 @@ static void vk_window_drop(const char* why)
                 s_vk.sc_done[i] = VK_NULL_HANDLE;
             }
         if (s_vk.sem_acquire) pvkDestroySemaphore(s_vk.device, s_vk.sem_acquire, NULL);
+        vk_overlay_targets_drop();
+        if (s_vk.overlay_pass) pvkDestroyRenderPass(s_vk.device, s_vk.overlay_pass, NULL);
+        s_vk.overlay_pass = VK_NULL_HANDLE;
         if (s_vk.swapchain && pvkDestroySwapchainKHR)
             pvkDestroySwapchainKHR(s_vk.device, s_vk.swapchain, NULL);
     }
@@ -2209,13 +2301,16 @@ static int vk_create_swapchain(void)
     for (size_t k = 0; k < 4; k++)
         if (caps.supportedCompositeAlpha & alphas[k]) { alpha = alphas[k]; break; }
 
+    vk_overlay_targets_drop();          /* views of the old swapchain's images */
     VkSwapchainKHR old = s_vk.swapchain;
     VkSwapchainCreateInfoKHR sci = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
         .surface = s_vk.surface, .minImageCount = count,
         .imageFormat = fmt.format, .imageColorSpace = fmt.colorSpace,
         .imageExtent = ext, .imageArrayLayers = 1,
-        .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                      (ps3_overlay_wanted() && (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+                       ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0),
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .preTransform = caps.currentTransform, .compositeAlpha = alpha,
         .presentMode = present_mode,    /* FIFO default, alternatives diagnostic only */
@@ -2244,6 +2339,9 @@ static int vk_create_swapchain(void)
 
     s_vk.sc_extent = ext;
     s_vk.sc_count = n;
+    s_vk.sc_format = fmt.format;
+    s_vk.sc_min_count = caps.minImageCount;
+    if (sci.imageUsage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) vk_overlay_targets_create();
     VK_LOG("window swapchain %ux%u, %u images, format %d\n", ext.width, ext.height, n, (int)fmt.format);
     VK_LOG("window present mode %s\n", present_mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" :
            present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo");
@@ -2255,6 +2353,38 @@ static void vk_swapchain_lost(void)
     vk_device_idle();
     if (vk_create_swapchain()) vk_window_drop("the swapchain could not be recreated");
 }
+
+#ifdef _WIN32
+/* Borderless fullscreen, as the D3D12 window does it. Runs only on the
+ * window's thread; the setting is an atomic. */
+static int s_host_fullscreen;
+static LONG_PTR s_host_window_style;
+static WINDOWPLACEMENT s_host_window_placement;
+
+static void vk_host_update_window_mode(void)
+{
+    const int wanted=ps3_host_get_fullscreen();
+    if(!s_vk.window||wanted<0||wanted==s_host_fullscreen)return;
+    if(wanted) {
+        MONITORINFO monitor={sizeof(MONITORINFO)};
+        s_host_window_placement.length=sizeof(WINDOWPLACEMENT);
+        if(!GetWindowPlacement(s_vk.window,&s_host_window_placement)||
+           !GetMonitorInfoA(MonitorFromWindow(s_vk.window,MONITOR_DEFAULTTONEAREST),&monitor))return;
+        s_host_window_style=GetWindowLongPtrA(s_vk.window,GWL_STYLE);
+        SetWindowLongPtrA(s_vk.window,GWL_STYLE,s_host_window_style&~WS_OVERLAPPEDWINDOW);
+        SetWindowPos(s_vk.window,NULL,monitor.rcMonitor.left,monitor.rcMonitor.top,
+            monitor.rcMonitor.right-monitor.rcMonitor.left,monitor.rcMonitor.bottom-monitor.rcMonitor.top,
+            SWP_FRAMECHANGED|SWP_NOZORDER|SWP_NOACTIVATE);
+    } else {
+        SetWindowLongPtrA(s_vk.window,GWL_STYLE,s_host_window_style);
+        s_host_window_placement.showCmd=SW_SHOWNOACTIVATE;
+        SetWindowPlacement(s_vk.window,&s_host_window_placement);
+        SetWindowPos(s_vk.window,NULL,0,0,0,0,SWP_FRAMECHANGED|SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
+    }
+    s_host_fullscreen=wanted;
+    VK_LOG("borderless-fullscreen=%d (guest resolution unchanged)\n",wanted);
+}
+#endif
 
 /* Blit the offscreen target into the next swapchain image and present it. */
 static void vk_present_window(void)
@@ -2298,12 +2428,32 @@ static void vk_present_window(void)
     pvkCmdBlitImage(cb, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL,
                     s_vk.sc_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     1, &blit, VK_FILTER_LINEAR);
-    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    b.dstAccessMask = 0;
-    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    pvkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                          0, 0, NULL, 0, NULL, 1, &b);
+    if (s_vk.sc_framebuffers[idx]) {
+#ifdef _WIN32
+        /* The pass's own dependencies order it after the blit and leave the
+         * image in PRESENT_SRC. The queue lock covers uploads the hook submits. */
+        VkRenderPassBeginInfo rb = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                                     .renderPass = s_vk.overlay_pass, .framebuffer = s_vk.sc_framebuffers[idx],
+                                     .renderArea = { { 0, 0 }, s_vk.sc_extent } };
+        pvkCmdBeginRenderPass(cb, &rb, VK_SUBPASS_CONTENTS_INLINE);
+        const ps3_host_overlay_vulkan vulkan = { s_vk.instance, s_vk.phys, vk_overlay_proc, s_vk.queue_family,
+                                                 s_vk.overlay_pass, s_vk.sc_min_count, s_vk.sc_count };
+        const ps3_host_overlay_frame frame = { s_vk.window, s_vk.device, s_vk.queue, cb, 0,
+                                               s_vk.sc_extent.width, s_vk.sc_extent.height, s_vk.sc_count,
+                                               (unsigned)s_vk.sc_format, PS3_HOST_OVERLAY_VULKAN, &vulkan };
+        vk_mutex_lock(&s_vk.queue_mu);
+        ps3_host_overlay_draw(&frame);
+        vk_mutex_unlock(&s_vk.queue_mu);
+        pvkCmdEndRenderPass(cb);
+#endif
+    } else {
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = 0;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        pvkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                              0, 0, NULL, 0, NULL, 1, &b);
+    }
     if (pvkEndCommandBuffer(cb) != VK_SUCCESS) { VK_LOG("vkEndCommandBuffer failed\n"); return; }
 
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -4823,6 +4973,14 @@ void rsx_vulkan_backend_shutdown(void)
             vk_present_window();         /* FIFO: paced by the display */
         }
     }
+#ifdef _WIN32
+    if (s_vk.device) {               /* the overlay owns device objects */
+        vk_device_idle();
+        vk_mutex_lock(&s_vk.queue_mu);
+        ps3_host_overlay_shutdown();
+        vk_mutex_unlock(&s_vk.queue_mu);
+    }
+#endif
     if (s_vk.windowed || s_vk.window) vk_window_drop(NULL);
     if (s_vk.device) {
         vk_device_idle();
@@ -4878,6 +5036,7 @@ int rsx_vulkan_backend_pump_messages(void)
 #ifdef _WIN32
     MSG message;
     while(PeekMessageA(&message,NULL,0,0,PM_REMOVE)){TranslateMessage(&message);DispatchMessageA(&message);}
+    vk_host_update_window_mode();
     if(s_title_dirty&&s_vk.window){SetWindowTextA(s_vk.window,s_title_text);s_title_dirty=0;}
     return s_window_closed?-1:0;
 #else
@@ -4896,6 +5055,17 @@ void rsx_vulkan_backend_present(void)
 {
     rsx_vulkan_backend_present_begin();
     rsx_vulkan_backend_present_finish();
+}
+
+/* Show the last presented frame again (with the host overlay) without
+ * touching guest state: a host pause keeps the window alive this way. */
+void rsx_vulkan_backend_redisplay(void)
+{
+    if (!s_vk.device) return;
+    vk_mutex_lock(&s_vk.present_mu);
+    vk_present_complete_locked();       /* a finished copy, then the blit */
+    if (!s_vk.present_inflight) vk_present_window();
+    vk_mutex_unlock(&s_vk.present_mu);
 }
 
 void rsx_vulkan_backend_present_begin(void)

@@ -13,6 +13,7 @@
 #define PPU_NO_INLINE_LOADS   /* declares its own out-of-line vm_read* below */
 #include "ppu_recomp.h"     /* ppu_context */
 #include "ps3emu/nid.h"     /* ps3_compute_nid */
+#include "ps3emu/host_controls.h" /* guest clock: paused time excluded */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,12 +68,11 @@ static void sys_time_get_system_time(ppu_context* ctx)
 {
 #ifdef _WIN32
     static LARGE_INTEGER s_freq, s_base;
-    if (!s_freq.QuadPart) { QueryPerformanceFrequency(&s_freq); QueryPerformanceCounter(&s_base); }
-    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    if (!s_freq.QuadPart) { QueryPerformanceFrequency(&s_freq); s_base.QuadPart = ps3_host_guest_counter(); }
+    LARGE_INTEGER now; now.QuadPart = ps3_host_guest_counter();
     ctx->gpr[3] = (uint64_t)((now.QuadPart - s_base.QuadPart) * 1000000ull / (uint64_t)s_freq.QuadPart);
 #else
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    ctx->gpr[3] = (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+    ctx->gpr[3] = (uint64_t)ps3_host_guest_counter() / 1000ull;
 #endif
 }
 

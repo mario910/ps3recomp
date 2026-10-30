@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include "ps3emu/log_first.h"
 #include "timer_short_spin.h"
+#include "ps3emu/host_controls.h"   /* guest clock: paused time excluded */
 #ifdef _WIN32
 #pragma comment(lib, "Synchronization.lib")   /* WaitOnAddress / WakeByAddressAll */
 #endif
@@ -115,16 +116,15 @@ uint64_t ppu_timebase_now(void)
     static LONGLONG t0 = 0;
     ensure_qpc_init();
     LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
+    now.QuadPart = ps3_host_guest_counter();
     if (!t0) t0 = now.QuadPart;   /* benign race: same anchor either way */
     uint64_t d = (uint64_t)(now.QuadPart - t0);
     uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
     return (d / q) * PS3_TIMEBASE_FREQ + (d % q) * PS3_TIMEBASE_FREQ / q;
 #else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * PS3_TIMEBASE_FREQ +
-           (uint64_t)ts.tv_nsec * PS3_TIMEBASE_FREQ / 1000000000ull;
+    const uint64_t ns = (uint64_t)ps3_host_guest_counter();
+    return (ns / 1000000000ull) * PS3_TIMEBASE_FREQ +
+           (ns % 1000000000ull) * PS3_TIMEBASE_FREQ / 1000000000ull;
 #endif
 }
 

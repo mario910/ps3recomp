@@ -571,9 +571,18 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
      * With no device, pace on the performance counter instead. */
     LARGE_INTEGER qf, q0; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0);
     unsigned long long blocks = 0;
+    static const float silence[CELL_AUDIO_BLOCK_SAMPLES * 2];
     while (s_mix_thread_running) {
         const int room = audio_backend_room();
         if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
+        /* Host pause: the device gets silence; no port advances and no
+         * title is notified, so its mixer waits exactly where it was. */
+        if (ps3_host_get_paused()) {
+            if (room >= 0) audio_backend_submit(silence, CELL_AUDIO_BLOCK_SAMPLES);
+            else Sleep(5);
+            QueryPerformanceCounter(&q0); blocks = 0;
+            continue;
+        }
         if (room < 0) {
             LARGE_INTEGER now; QueryPerformanceCounter(&now);
             const long long due = q0.QuadPart +
@@ -632,6 +641,7 @@ static void* audio_mix_thread_func(void* arg)
     printf("[cellAudio] Mixing thread started\n");
 
     while (s_mix_thread_running) {
+        if (ps3_host_get_paused()) { usleep(5000); continue; }   /* host pause */
         audio_mix_one_block();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         audio_notify_event_queues();

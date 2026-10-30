@@ -28,6 +28,7 @@
 #include <time.h>
 #include "../platform/win32_compat.h"
 #include "ps3emu/log_first.h"
+#include "ps3emu/host_controls.h"   /* guest clock: paused time excluded */
 
 #ifdef __cplusplus
 extern "C" {
@@ -44,16 +45,14 @@ static uint64_t spu_host_ns(void)
     static LARGE_INTEGER s_freq;
     LARGE_INTEGER c;
     if (!s_freq.QuadPart) QueryPerformanceFrequency(&s_freq);
-    QueryPerformanceCounter(&c);
+    c.QuadPart = ps3_host_guest_counter();
     /* Split the divide to keep the multiply from overflowing: QPC counters are
      * large enough that (count * 1e9) wraps a u64 within hours of uptime. */
     return (uint64_t)(c.QuadPart / s_freq.QuadPart) * 1000000000ull
          + (uint64_t)(c.QuadPart % s_freq.QuadPart) * 1000000000ull
            / (uint64_t)s_freq.QuadPart;
 #else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    return (uint64_t)ps3_host_guest_counter();
 #endif
 }
 

@@ -38,6 +38,56 @@ void ps3_host_apply_volume(float* stereo,size_t frames,float* gain) {
     }
     *gain=target;
 }
+/* One 64-bit word, so a reader never sees half a transition: running, it
+ * holds the paused time to subtract; paused, the frozen value with
+ * GUEST_FROZEN set. The frozen value sits a millisecond past the pause so a
+ * reader that sampled the counter just before it cannot exceed it. */
+#define GUEST_FROZEN (1ll<<62)
+static host_atomic_int s_paused;
+#ifdef _WIN32
+static volatile LONG64 s_guest_clock;
+static SRWLOCK s_pause_lock=SRWLOCK_INIT;
+static int64_t host_counter(void){LARGE_INTEGER q;QueryPerformanceCounter(&q);return q.QuadPart;}
+static int64_t host_counter_ms(void){LARGE_INTEGER f;QueryPerformanceFrequency(&f);return f.QuadPart/1000;}
+static int64_t guest_clock_load(void){return InterlockedCompareExchange64(&s_guest_clock,0,0);}
+static void guest_clock_store(int64_t v){InterlockedExchange64(&s_guest_clock,v);}
+#define PAUSE_LOCK() AcquireSRWLockExclusive(&s_pause_lock)
+#define PAUSE_UNLOCK() ReleaseSRWLockExclusive(&s_pause_lock)
+#else
+#include <pthread.h>
+#include <time.h>
+static int64_t s_guest_clock;
+static pthread_mutex_t s_pause_lock=PTHREAD_MUTEX_INITIALIZER;
+static int64_t host_counter(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (int64_t)t.tv_sec*1000000000ll+t.tv_nsec;}
+static int64_t host_counter_ms(void){return 1000000;}
+static int64_t guest_clock_load(void){return __atomic_load_n(&s_guest_clock,__ATOMIC_ACQUIRE);}
+static void guest_clock_store(int64_t v){__atomic_store_n(&s_guest_clock,v,__ATOMIC_RELEASE);}
+#define PAUSE_LOCK() pthread_mutex_lock(&s_pause_lock)
+#define PAUSE_UNLOCK() pthread_mutex_unlock(&s_pause_lock)
+#endif
+int64_t ps3_host_guest_counter(void) {
+    const int64_t state=guest_clock_load(); /* before the counter: see above */
+    if(state&GUEST_FROZEN)return state&~GUEST_FROZEN;
+    return host_counter()-state;
+}
+void ps3_host_set_paused(int paused) {
+    paused=paused!=0;
+    PAUSE_LOCK();
+    if(paused!=host_load(&s_paused)) {
+        const int64_t state=guest_clock_load();
+        if(paused) guest_clock_store(GUEST_FROZEN|(host_counter()+host_counter_ms()-state));
+        else {
+            const int64_t frozen=state&~GUEST_FROZEN;
+            int64_t now=host_counter();
+            while(now<frozen)now=host_counter(); /* only within a millisecond of pausing */
+            guest_clock_store(now-frozen);
+        }
+        host_store(&s_paused,paused);
+    }
+    PAUSE_UNLOCK();
+}
+int ps3_host_get_paused(void){return host_load(&s_paused);}
+
 uint64_t ps3_host_frame_deadline(ps3_host_pacer* p,uint64_t now,unsigned fps) {
     if(!p)return now;
     if(fps!=30){p->next_ns=0;p->fps=fps;return now;}
