@@ -44,6 +44,12 @@ typedef struct rsx_vertex_remap {
     rsx_vertex_remap_slot* slots;
     u32 slot_capacity;
     u32 generation;
+    /* Dense path: one shared base_index and a narrow vertex_id range index a
+     * generation-stamped table directly instead of hashing. */
+    u32* dense_stamp;
+    u32* dense_value;
+    u32 dense_capacity;
+    u32 dense_generation;
 } rsx_vertex_remap;
 
 typedef struct rsx_vertex_fetch_attr {

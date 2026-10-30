@@ -392,6 +392,56 @@ int rsx_vertex_remap_build(
         remap->occurrence_capacity = count;
     }
 
+    /* Indexed draws reference one base_index and a compact vertex range:
+     * then a direct table replaces the hash. Same first-use order and
+     * occurrence map as the hash path, so the output is identical. */
+    {
+        const u32 base = refs[0].base_index;
+        u32 lo = refs[0].vertex_id, hi = lo;
+        u32 i = 1;
+        for (; i < count; i++) {
+            const rsx_vertex_ref r = refs[i];
+            if (r.base_index != base) break;
+            if (r.vertex_id < lo) lo = r.vertex_id;
+            if (r.vertex_id > hi) hi = r.vertex_id;
+        }
+        const u64 range = (u64)hi - lo + 1u;
+        if (i == count && range <= (u64)count * 4u + 4096u && range <= (1u << 22)) {
+            if (range > remap->dense_capacity) {
+                u32* stamp = (u32*)realloc(remap->dense_stamp, (size_t)range * sizeof(u32));
+                if (!stamp) return 0;
+                remap->dense_stamp = stamp;
+                u32* value = (u32*)realloc(remap->dense_value, (size_t)range * sizeof(u32));
+                if (!value) return 0;
+                remap->dense_value = value;
+                memset(remap->dense_stamp, 0, (size_t)range * sizeof(u32));
+                remap->dense_capacity = (u32)range;
+                remap->dense_generation = 0;
+            }
+            if (++remap->dense_generation == 0) {
+                memset(remap->dense_stamp, 0, (size_t)remap->dense_capacity * sizeof(u32));
+                remap->dense_generation = 1;
+            }
+            const u32 gen = remap->dense_generation;
+            u32* stamp = remap->dense_stamp;
+            u32* value = remap->dense_value;
+            u32 unique = 0;
+            for (u32 occurrence = 0; occurrence < count; occurrence++) {
+                const u32 k = refs[occurrence].vertex_id - lo;
+                if (stamp[k] != gen) {
+                    stamp[k] = gen;
+                    value[k] = unique;
+                    refs[unique].vertex_id = k + lo;
+                    refs[unique].base_index = base;
+                    unique++;
+                }
+                remap->occurrence_to_unique[occurrence] = value[k];
+            }
+            *unique_count = unique;
+            return 1;
+        }
+    }
+
     if (count > UINT_MAX / 2u)
         return 0;
     u32 slot_capacity = 16u;
@@ -461,6 +511,8 @@ void rsx_vertex_remap_destroy(rsx_vertex_remap* remap)
         return;
     free(remap->occurrence_to_unique);
     free(remap->slots);
+    free(remap->dense_stamp);
+    free(remap->dense_value);
     memset(remap, 0, sizeof(*remap));
 }
 
