@@ -20,6 +20,14 @@
 #include <string.h>
 
 static int g_failures;
+static void test_env(const char* name,const char* value)
+{
+#ifdef _WIN32
+    _putenv_s(name,value?value:"");
+#else
+    if(value)setenv(name,value,1);else unsetenv(name);
+#endif
+}
 
 #define CHECK(cond, ...)                                                      \
     do {                                                                      \
@@ -72,7 +80,11 @@ typedef struct {
     int n_color_create, n_color_release, n_color_seeded;
     int n_depth_create, n_depth_snapshot;
     int n_pipeline_create;
+    int n_submit;
+    u32 last_submit_reason;
     rsx_be_render_state pipeline_rs;   /* the last pipeline's render state */
+    u32 pipeline_input_mask;
+    float first_fp_constant[4];
     int n_draw, n_clear_color, n_clear_ds, n_present;
     u32 cleared[STUB_MAX_CLEARED];
 
@@ -112,7 +124,7 @@ static u32 stub_handle(void)
 
 static int stub_init(void* u, u32 w, u32 h) { (void)u; (void)w; (void)h; return 0; }
 static void stub_shutdown(void* u) { (void)u; }
-static void stub_submit(void* u, u32 reason) { (void)u; (void)reason; }
+static void stub_submit(void* u, u32 reason) { (void)u; stub.n_submit++; stub.last_submit_reason=reason; }
 
 static u32 stub_texture_create(void* u, rsx_be_format f, u32 w, u32 h, u32 mips,
                                u32 faces, u32 remap, u32 rsx_fmt)
@@ -175,6 +187,7 @@ static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
     stub.n_pipeline_create++;
     stub.pipeline_rt_count = rt_count;
     stub.pipeline_rs = *rs;
+    stub.pipeline_input_mask = layout->mask;
     return stub_handle();
 }
 
@@ -196,7 +209,8 @@ static void stub_bind_vs(void* u, const void* d, u32 n)
     if (d && n >= RSX_DSP_NUM_CONSTANTS * 16u + sizeof stub.vp_xf)
         memcpy(stub.vp_xf, (const u8*)d + RSX_DSP_NUM_CONSTANTS * 16u, sizeof stub.vp_xf);
 }
-static void stub_bind_ps(void* u, const void* d, u32 n) { (void)u; (void)d; (void)n; }
+static void stub_bind_ps(void* u, const void* d, u32 n)
+{ (void)u;if(d && n>=16)memcpy(stub.first_fp_constant,d,16); }
 
 static void stub_bind_textures(void* u, const u32* tex,
                                const rsx_be_sampler_desc* smp, u32 mask)
@@ -736,7 +750,7 @@ static void test_texture_sparse_rehash(void)
     engine_down();
 
     /* PS3RECOMP_ENG_TEXHASH_FULL=1: the full hash every frame, as before. */
-    setenv("PS3RECOMP_ENG_TEXHASH_FULL", "1", 1);
+    test_env("PS3RECOMP_ENG_TEXHASH_FULL", "1");
     engine_up();
     bind_big_texture();
     draw_triangle();
@@ -744,7 +758,7 @@ static void test_texture_sparse_rehash(void)
     tex[5 * 2048 + 100] ^= 0xFF;
     CHECK(frames_to_notice(0) == 0, "PS3RECOMP_ENG_TEXHASH_FULL=1 hashes everything every frame");
     engine_down();
-    unsetenv("PS3RECOMP_ENG_TEXHASH_FULL");
+    test_env("PS3RECOMP_ENG_TEXHASH_FULL", NULL);
 }
 
 /* ---- 4. the pipeline key ------------------------------------------------- */
@@ -1593,6 +1607,67 @@ static void test_immediate_packed_zero_and_inline(void)
     engine_down();
 }
 
+static void test_completion_boundaries(void)
+{
+    engine_up();
+    const u32 methods[]={0x50,0x14,0x6c,0x104,0x1d70,0x1d74,0x1800};
+    const u32 reasons[]={RSX_BE_FLUSH_GUEST_REFERENCE,RSX_BE_FLUSH_COMMAND_LABEL,RSX_BE_FLUSH_COMMAND_LABEL,
+        RSX_BE_FLUSH_REPORT,RSX_BE_FLUSH_BACKEND_LABEL,RSX_BE_FLUSH_TEXTURE_LABEL,RSX_BE_FLUSH_REPORT};
+    for(u32 i=0;i<sizeof(methods)/sizeof(methods[0]);i++) {
+        const int before=stub.n_submit;
+        m(methods[i]|0x2000u,1);
+        CHECK(stub.n_submit==before+1&&stub.last_submit_reason==reasons[i],
+            "completion method 0x%04X flushes the right boundary on another subchannel",methods[i]);
+    }
+    engine_down();
+}
+
+static void program_word(u8* p,u32 word)
+{
+    // Fragment words are big-endian with 16-bit halves swapped.
+    const u32 be=(word<<16)|(word>>16);
+    p[0]=(u8)(be>>24);p[1]=(u8)(be>>16);p[2]=(u8)(be>>8);p[3]=(u8)be;
+}
+static void program_float(u8* p,float value)
+{ u32 word;memcpy(&word,&value,4);program_word(p,word); }
+static void program_vertex_input(u32 input)
+{
+    // One synthetic MOV o0, v[input], with identity source swizzle and END.
+    const u32 source=2u|(1u<<12)|(2u<<10)|(3u<<8);
+    m(0x1e9c,0);
+    m(0x0b80,(1u<<30)|(63u<<15));
+    m(0x0b84,(1u<<22)|(input<<8)|((source>>9)&0xff));
+    m(0x0b88,(source&0x1ff)<<23);
+    m(0x0b8c,1u|(0xfu<<13));
+}
+static void test_per_draw_program_pair(void)
+{
+    engine_up();
+    const u32 offset=0x30000;
+    u8* fp=vm_base+offset;memset(fp,0,32);
+    // Synthetic MOV r0, inline float4, END. No retail microcode/assets.
+    program_word(fp,(1u<<24)|(0xfu<<9)|1u);
+    program_word(fp+4,2u|(1u<<11)|(2u<<13)|(3u<<15)|(7u<<18)|
+                 (1u<<23)|(2u<<25)|(3u<<27));
+    program_float(fp+16,1.0f);program_float(fp+20,0.25f);
+    program_float(fp+24,0.5f);program_float(fp+28,1.0f);
+    program_vertex_input(0);m(0x08e4,offset|2u);m(0x1d60,0x40u);
+    draw_triangle();rsx_draw_engine_present();
+    CHECK(stub.n_draw==1 && stub.n_pipeline_create==1 && stub.pipeline_input_mask==1u &&
+          rsx_draw_engine_guest_draws()==1 && stub.first_fp_constant[0]==1.0f,
+          "valid synthetic program pair drives both layout and pipeline");
+    program_float(fp+16,0.125f);draw_triangle();
+    CHECK(stub.n_pipeline_create==1 && stub.first_fp_constant[0]==0.125f,
+          "inline fragment constants refresh on the next draw without a new pipeline");
+    program_vertex_input(3);draw_triangle();
+    CHECK(stub.n_pipeline_create==2 && stub.pipeline_input_mask==(1u<<3) && stub.draw_stride==16,
+          "changed vertex bytes are re-resolved for the next draw's layout and pipeline");
+    m(0x08e4,0);draw_triangle();
+    CHECK(stub.n_pipeline_create==3 && stub.pipeline_input_mask==0xffffu && stub.draw_stride==256,
+          "missing fragment program returns to the full fixed-function layout");
+    engine_down();
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -1627,6 +1702,8 @@ int main(void)
     test_color_read_as_float();
     test_immediate_compositor();
     test_immediate_packed_zero_and_inline();
+    test_completion_boundaries();
+    test_per_draw_program_pair();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",

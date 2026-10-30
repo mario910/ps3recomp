@@ -48,6 +48,8 @@ int rsx_d3d12_backend_pump_messages(void);
 
 /* Force a present (useful for debugging). */
 void rsx_d3d12_backend_present(void);
+/* Successful window presentations only; excludes offscreen/occluded batches. */
+u64 rsx_d3d12_backend_presented_frames(void);
 
 #ifdef __cplusplus
 }

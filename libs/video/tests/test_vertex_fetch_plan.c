@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "ps3emu/ps3_ftrace.h"
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; if (fails <= 20) { \
@@ -36,10 +37,12 @@ static uint32_t rnd(void)
 enum { GUEST = 1 << 16 };
 static uint8_t guest[2][GUEST];         /* two locations */
 static uint32_t mapped_end[2];          /* bytes past this are unmapped */
+static u32 resolve_calls;
 
 static const u8* guest_ptr(void* user, u32 location, u32 offset, u32 min_bytes)
 {
     (void)user;
+    resolve_calls++;
     const u32 loc = location & 1u;
     if ((u64)offset + min_bytes > mapped_end[loc]) return NULL;
     return guest[loc] + offset;
@@ -128,12 +131,92 @@ static void random_plan(rsx_vertex_fetch_plan* plan, int use_inline,
     }
 }
 
-int main(void)
+static void compare_fetch(const rsx_vertex_fetch_plan* plan,const rsx_vertex_ref* refs,u32 count)
+{
+    static _Alignas(16) u8 legacy[200*256+16],bulk[200*256+16];
+    const size_t bytes=(size_t)count*plan->layout.stride;
+    CHECK(count<=200 && bytes+16<=sizeof legacy,"fixture output capacity");
+    if(count>200 || bytes+16>sizeof legacy)return;
+    memset(legacy,0xa5,sizeof legacy);memset(bulk,0xa5,sizeof bulk);
+    int ref_ok=1;resolve_calls=0;
+    for(u32 i=0;i<count;i++)
+        if(!rsx_vertex_fetch_one(plan,&refs[i],plan->layout.stride?legacy+(size_t)i*plan->layout.stride:NULL)){
+            ref_ok=0;break;
+        }
+    const u32 ref_calls=resolve_calls;resolve_calls=0;
+    const int bulk_ok=rsx_vertex_fetch_many(plan,refs,count,bulk);
+    CHECK((bulk_ok!=0)==ref_ok,"bulk/reference success mismatch");
+    CHECK(resolve_calls==ref_calls,"bulk/reference fallback resolver calls %u/%u",resolve_calls,ref_calls);
+    if(ref_ok && bulk_ok)CHECK(!memcmp(legacy,bulk,bytes),"bulk/reference output differs");
+    for(size_t i=bytes;i<bytes+16;i++)CHECK(bulk[i]==0xa5,"bulk write crossed output end");
+}
+
+static void structured_fetch(void)
+{
+    rsx_vertex_ref refs[200];
+    for(u32 i=0;i<200;i++){refs[i].vertex_id=(i*37)%200;refs[i].base_index=0;}
+    for(u32 type=1;type<=7;type++)for(u32 size=1;size<=4;size++)for(u32 mode=0;mode<3;mode++){
+        rsx_vertex_fetch_plan plan;memset(&plan,0,sizeof plan);
+        rsx_vertex_layout_plan_init(&plan.layout,(1u<<0)|(1u<<3)|(1u<<8));
+        plan.guest_ptr=guest_ptr;plan.divider_mask=mode==2?1u<<3:0;
+        const u32 attrs[2]={0,3};
+        for(u32 k=0;k<2;k++){
+            rsx_vertex_fetch_attr* f=&plan.attr[attrs[k]];
+            f->desc.type=k?type:RSX_VTX_TYPE_FLOAT;f->desc.size=size;
+            f->elem_size=rsx_vertex_attrib_size(f->desc.type,size);
+            f->stride=f->elem_size+3;f->desc.offset=k?16384:0;
+            f->desc.location=k;f->desc.frequency=k && mode?3:0;
+        }
+        plan.attr[8].default_value[0]=0.25f;plan.attr[8].default_value[3]=-0.0f;
+        mapped_end[0]=mapped_end[1]=GUEST;
+        rsx_vertex_fetch_plan_prepare(&plan,refs,200);compare_fetch(&plan,refs,200);
+        refs[199].vertex_id=4095;compare_fetch(&plan,refs,200);refs[199].vertex_id=(199*37)%200;
+        mapped_end[1]=16384+200;rsx_vertex_fetch_plan_prepare(&plan,refs,200);compare_fetch(&plan,refs,200);
+        mapped_end[0]=200;rsx_vertex_fetch_plan_prepare(&plan,refs,200);compare_fetch(&plan,refs,200);
+    }
+}
+
+static int benchmark(void)
+{
+    rsx_vertex_fetch_plan plan;memset(&plan,0,sizeof plan);
+    rsx_vertex_layout_plan_init(&plan.layout,0xf);
+    rsx_vertex_ref refs[1024];static _Alignas(16) u8 out[1024*64];
+    for(u32 a=0;a<4;a++){
+        rsx_vertex_fetch_attr* f=&plan.attr[a];f->desc.type=RSX_VTX_TYPE_FLOAT;
+        f->desc.size=a==0?3:4;f->stride=16;f->stable_base=guest[0]+a*16384;
+        f->stable_last=1023;
+    }
+    for(u32 i=0;i<1024;i++){refs[i].vertex_id=(i*37)%1024;refs[i].base_index=0;}
+    volatile u32 checksum=0;
+    const u32 counts[]={3,16,64,256,1024};
+    for(u32 c=0;c<sizeof counts/sizeof counts[0];c++){
+        const u32 count=counts[c],iterations=1000000/count+1;
+        u64 start=ps3_ft_now();
+        for(u32 n=0;n<iterations;n++){
+            for(u32 i=0;i<count;i++)rsx_vertex_fetch_one(&plan,&refs[i],out+i*64);
+            checksum+=out[n%(count*64)];
+        }
+        const u64 old=ps3_ft_now()-start;start=ps3_ft_now();
+        for(u32 n=0;n<iterations;n++){
+            rsx_vertex_fetch_many(&plan,refs,count,out);checksum+=out[n%(count*64)];
+        }
+        const u64 bulk=ps3_ft_now()-start;
+        printf("vertices=%u legacy_ms=%.3f bulk_ms=%.3f speedup=%.3f\n",count,old/1e6,bulk/1e6,(double)old/bulk);
+    }
+    printf("benchmark checksum=%u\n",checksum);return 0;
+}
+
+int main(int argc,char** argv)
 {
     enum { PLANS = 6000, MAXV = 200 };
     static rsx_vertex_ref refs[MAXV];
     static u8 inl[8192];
     int stable = 0, divided = 0;
+    for(u32 l=0;l<2;l++)for(u32 i=0;i<GUEST;i++)guest[l][i]=(u8)(i*13+i/17+l*91);
+    for(u32 i=0;i<sizeof inl;i++)inl[i]=(u8)(i*31+i/7);
+    if(argc==2 && !strcmp(argv[1],"--bench"))return benchmark();
+    if(argc!=1){printf("unknown test option\n");return 1;}
+    structured_fetch();
 
     for (int n = 0; n < PLANS; n++) {
         for (int l = 0; l < 2; l++)
@@ -151,6 +234,7 @@ int main(void)
         }
         ref = plan;
         rsx_vertex_fetch_plan_prepare(&plan, refs, count);
+        compare_fetch(&plan,refs,count);
         ref_prepare(&ref, refs, count);
         for (u32 at = 0; at < RSX_DSP_NUM_VERTEX_ATTR; at++) {
             CHECK(plan.attr[at].stable_base == ref.attr[at].stable_base &&
@@ -173,5 +257,8 @@ int main(void)
         printf("FAIL: too few cases exercised a path\n");
         return 1;
     }
+    rsx_vertex_fetch_plan empty;memset(&empty,0,sizeof empty);
+    CHECK(rsx_vertex_fetch_many(&empty,NULL,0,NULL)==1,"empty bulk fetch");
+    CHECK(rsx_vertex_fetch_many(NULL,NULL,0,NULL)==0,"null bulk plan rejected");
     return fails ? 1 : 0;
 }

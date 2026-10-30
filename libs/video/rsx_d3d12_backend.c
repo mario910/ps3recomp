@@ -18,6 +18,8 @@
 
 #include <time.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/host_controls.h"
+#include "ps3emu/host_overlay.h"
 #include "rsx_d3d12_backend.h"
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
@@ -604,6 +606,7 @@ typedef struct {
 
     /* Stats */
     u64 frame_count;
+    u64 window_present_count; /* successful swapchain presents, not offscreen batches */
     u64 last_fps_time;
     u32 fps;
 
@@ -759,6 +762,61 @@ static u32    s_lock_n  = 0;
 
 /* Optional host input sink owned by the port (no guest/pad assumptions). */
 static void (*s_host_key_handler)(u32 key, int down) = NULL;
+static int s_host_fullscreen = 0;
+static LONG_PTR s_host_window_style;
+static WINDOWPLACEMENT s_host_window_placement;
+static HANDLE s_host_frame_timer;
+static ps3_host_pacer s_host_pacer;
+
+/* Called only on the backend/window thread. Requests from a menu thread are
+ * atomics; no HWND, swapchain, or guest state is touched by their setters. */
+static void host_update_window_mode(void)
+{
+    const int wanted=ps3_host_get_fullscreen();
+    if(!s_d3d.hwnd||wanted<0||wanted==s_host_fullscreen)return;
+    if(wanted) {
+        MONITORINFO monitor={sizeof(MONITORINFO)};
+        s_host_window_placement.length=sizeof(WINDOWPLACEMENT);
+        if(!GetWindowPlacement(s_d3d.hwnd,&s_host_window_placement)||
+           !GetMonitorInfoA(MonitorFromWindow(s_d3d.hwnd,MONITOR_DEFAULTTONEAREST),&monitor))return;
+        s_host_window_style=GetWindowLongPtrA(s_d3d.hwnd,GWL_STYLE);
+        SetWindowLongPtrA(s_d3d.hwnd,GWL_STYLE,s_host_window_style&~WS_OVERLAPPEDWINDOW);
+        SetWindowPos(s_d3d.hwnd,NULL,monitor.rcMonitor.left,monitor.rcMonitor.top,
+            monitor.rcMonitor.right-monitor.rcMonitor.left,monitor.rcMonitor.bottom-monitor.rcMonitor.top,
+            SWP_FRAMECHANGED|SWP_NOZORDER|SWP_NOACTIVATE);
+    } else {
+        SetWindowLongPtrA(s_d3d.hwnd,GWL_STYLE,s_host_window_style);
+        s_host_window_placement.showCmd=SW_SHOWNOACTIVATE;
+        SetWindowPlacement(s_d3d.hwnd,&s_host_window_placement);
+        SetWindowPos(s_d3d.hwnd,NULL,0,0,0,0,SWP_FRAMECHANGED|SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
+    }
+    s_host_fullscreen=wanted;
+    fprintf(stderr,"[host-controls] borderless-fullscreen=%d (guest resolution unchanged)\n",wanted);
+}
+static uint64_t host_now_ns(void)
+{
+    LARGE_INTEGER q,f;QueryPerformanceCounter(&q);QueryPerformanceFrequency(&f);
+    return (uint64_t)(q.QuadPart/f.QuadPart)*1000000000ull+
+           (uint64_t)(q.QuadPart%f.QuadPart)*1000000000ull/(uint64_t)f.QuadPart;
+}
+static void host_wait_present(unsigned fps)
+{
+    const uint64_t now=host_now_ns();
+    const uint64_t due=ps3_host_frame_deadline(&s_host_pacer,now,fps);
+    if(due<=now)return;
+    if(!s_host_frame_timer) {
+        s_host_frame_timer=CreateWaitableTimerExW(NULL,NULL,0x2,TIMER_MODIFY_STATE|SYNCHRONIZE);
+        if(!s_host_frame_timer)s_host_frame_timer=CreateWaitableTimerW(NULL,FALSE,NULL);
+    }
+    for(;;) {
+        const uint64_t current=host_now_ns();if(current>=due)return;
+        const uint64_t remaining=due-current;
+        LARGE_INTEGER interval;interval.QuadPart=-(LONGLONG)((remaining+99)/100);
+        if(s_host_frame_timer&&SetWaitableTimer(s_host_frame_timer,&interval,0,NULL,NULL,FALSE))
+            WaitForSingleObject(s_host_frame_timer,INFINITE);
+        else Sleep((DWORD)((remaining+999999)/1000000));
+    }
+}
 void rsx_d3d12_set_key_handler(void (*handler)(u32, int))
 {
     s_host_key_handler = handler; /* registered before the window thread starts */
@@ -766,6 +824,7 @@ void rsx_d3d12_set_key_handler(void (*handler)(u32, int))
 
 static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    if(ps3_host_overlay_message(hwnd,msg,(uintptr_t)wp,(intptr_t)lp))return 0;
     switch (msg) {
     case WM_CLOSE:
         s_d3d.window_closed = 1;
@@ -5869,6 +5928,15 @@ static void render_frame(void)
 skip_dump_consider: ;
     guest_fb_present(fi);
     composite_present(fi);
+    if(s_present_this_frame&&ps3_host_overlay_enabled()) {
+        D3D12_CPU_DESCRIPTOR_HANDLE host_rtv;
+        s_d3d.rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.rtv_heap,&host_rtv);
+        host_rtv.ptr+=(SIZE_T)fi*s_d3d.rtv_descriptor_size;
+        s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list,1,&host_rtv,FALSE,NULL);
+        const ps3_host_overlay_frame frame={s_d3d.hwnd,s_d3d.device,s_d3d.cmd_queue,s_d3d.cmd_list,
+            host_rtv.ptr,s_d3d.width,s_d3d.height,FRAME_COUNT,DXGI_FORMAT_R8G8B8A8_UNORM};
+        ps3_host_overlay_draw(&frame);
+    }
     int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
                    && s_d3d.dump_skip_left == 0);
     { static int mind2 = -1;
@@ -6107,10 +6175,13 @@ skip_dump_consider: ;
     /* Present */
     int presented=0;
     if (s_present_this_frame) {
+        const unsigned host_limit=ps3_host_get_frame_limit();
+        host_wait_present(host_limit);
         u64 present_start=PS3_FT_ON()?ps3_ft_now():0;
-        HRESULT present_result=s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain,1,0);
+        HRESULT present_result=s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain,host_limit==PS3_HOST_LEGACY_FRAME_LIMIT?1:0,0);
         rsx_pso_cache_tick();
         presented=present_result==S_OK; /* not an offscreen batch or DXGI_STATUS_OCCLUDED */
+        if(presented)__atomic_fetch_add(&s_d3d.window_present_count,1,__ATOMIC_RELAXED);
         if(presented && present_start)
             ps3_ft_span(PS3_FT_PRESENT,0,(u32)s_d3d.frame_count,s_dbg_last_draws,present_start,ps3_ft_now());
     }
@@ -7831,9 +7902,10 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
 
 void rsx_d3d12_backend_shutdown(void)
 {
+    if(s_d3d.cmd_queue)wait_for_gpu();
+    ps3_host_overlay_shutdown();
+    if(s_host_frame_timer){CloseHandle(s_host_frame_timer);s_host_frame_timer=NULL;}
     if (!s_d3d.initialized) return;
-
-    wait_for_gpu();
 
     if (rsx_frame_refs_drain(&s_draw_pipelines,
             rsx_fence_reached(s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence),
@@ -7889,6 +7961,7 @@ void rsx_d3d12_backend_shutdown(void)
 
 int rsx_d3d12_backend_pump_messages(void)
 {
+    host_update_window_mode();
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) return -1;
@@ -7993,6 +8066,11 @@ void rsx_d3d12_backend_present(void)
     }
 }
 
+u64 rsx_d3d12_backend_presented_frames(void)
+{
+    return __atomic_load_n(&s_d3d.window_present_count,__ATOMIC_RELAXED);
+}
+
 #else /* !_WIN32 */
 
 #include <ps3emu/ps3types.h>   /* u32 (header includes above are inside the _WIN32 guard) */
@@ -8008,5 +8086,6 @@ int rsx_d3d12_backend_init(u32 w, u32 h, const char* t)
 void rsx_d3d12_backend_shutdown(void) {}
 int rsx_d3d12_backend_pump_messages(void) { return 0; }
 void rsx_d3d12_backend_present(void) {}
+u64 rsx_d3d12_backend_presented_frames(void) { return 0; }
 
 #endif /* _WIN32 */

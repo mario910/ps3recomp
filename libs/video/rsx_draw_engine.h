@@ -90,10 +90,16 @@ typedef struct rsx_be_render_state {
     u32 bs_func, bs_fail, bs_zfail, bs_zpass;
 } rsx_be_render_state;
 
-/* submit_and_wait reasons, for a backend that wants to log or count them. */
+/* Submission boundaries. Texture-read labels retire input reads, unlike full
+ * backend completion. A backend with immutable private input snapshots can
+ * satisfy that boundary without waiting for its queued raster work. */
 #define RSX_BE_FLUSH_VERTEX_RING     0
 #define RSX_BE_FLUSH_GUEST_REFERENCE 1
 #define RSX_BE_FLUSH_SHUTDOWN        2
+#define RSX_BE_FLUSH_COMMAND_LABEL   3
+#define RSX_BE_FLUSH_TEXTURE_LABEL   4
+#define RSX_BE_FLUSH_BACKEND_LABEL   5
+#define RSX_BE_FLUSH_REPORT          6
 
 /* clear_depth_stencil flags */
 #define RSX_BE_CLEAR_DEPTH   0x1u
@@ -244,6 +250,24 @@ typedef struct rsx_draw_backend {
                               u32 depth, u32 mips, u32 remap, u32 rsx_fmt);
     void (*texture_upload_3d)(void* user, u32 texture, u32 z, u32 mip,
                               u32 w, u32 h, const void* src, u32 row_bytes);
+
+    /* Optional. Like color_snapshot, but of the w x h rectangle at (x, y):
+     * for a unit that samples a smaller linear image at or inside a target
+     * (a portrait drawn into one corner of a larger surface). The result
+     * takes surface_view like a snapshot. NULL: the whole target is bound.
+     * `reuse`, when nonzero, is an earlier result of the same size: refresh
+     * it in command order (draws recorded before still read the old pixels)
+     * and return it, instead of allocating -- an animated portrait changes
+     * every frame. */
+    u32 (*color_region_snapshot)(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+                                 u32 reuse);
+
+    /* Optional. Clear only the w x h rectangle at (x, y): CLEAR_SURFACE
+     * honours the scissor, and a title that renders several cells of one
+     * target (a name plate per player) clears each before drawing it. NULL:
+     * the whole target is cleared, which wipes the cells drawn before. */
+    void (*clear_color_rect)(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+                             const float rgba[4]);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

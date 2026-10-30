@@ -12,6 +12,7 @@ Makefile
 *.cmake
 !CMakeLists.txt
 !cmake/PS3RecompSPU.cmake
+!cmake/VulkanDependencies.cmake
 
 # Compiled objects and libraries
 *.o

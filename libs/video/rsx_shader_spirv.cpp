@@ -35,7 +35,11 @@
 
 #include <glslang/Public/ShaderLang.h>
 #include <glslang/Public/ResourceLimits.h>
+#if __has_include(<glslang/SPIRV/GlslangToSpv.h>)
 #include <glslang/SPIRV/GlslangToSpv.h>
+#else
+#include <SPIRV/GlslangToSpv.h> // source-built glslang exposes the repository root
+#endif
 
 #include <mutex>
 #include <string>

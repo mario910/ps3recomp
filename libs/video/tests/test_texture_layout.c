@@ -13,6 +13,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 static int g_fail = 0;
 
@@ -763,8 +764,83 @@ static void test_remap_rejects_null(void)
     rsx_texture_component_remap(0xAAE4u, FMT_A8R8G8B8, NULL);   /* must not crash */
 }
 
+static u32 rows_random(u32* seed)
+{
+    *seed=*seed*1664525u+1013904223u;
+    return *seed;
+}
+
+/* Compare complete allocations, including unaligned prefixes, row padding and
+ * suffix guards. Odd widths exercise vector tails; the other formats and
+ * swizzled layouts deliberately exercise the reference fallback. */
+static void test_fast_rows_reference(void)
+{
+    static const u32 formats[]={0x85,0x9E,0x81,0x8B,0x82,0x83,0x84,0x90,
+                                0x92,0x94,0x95,0x97,0x9A,0x9B,0x9C,0x9F,
+                                0x86,0x87,0x88};
+    static const u32 widths[]={1,2,3,7,15,16,17,31,32,33,63,64,65,127,128,129,
+                               257,1280,1920,2048};
+    u32 seed=0x98176234u;
+    for(u32 trial=0;trial<1200;trial++) {
+        const u32 fmt=formats[trial%(sizeof formats/sizeof formats[0])];
+        const int swizzled=(trial%5)==0;
+        const u32 w=swizzled?1u<<(rows_random(&seed)%8):widths[rows_random(&seed)%(sizeof widths/sizeof widths[0])];
+        const u32 h=swizzled?1u<<(rows_random(&seed)%6):1+rows_random(&seed)%33;
+        rsx_tex_layout tl;
+        rsx_texture_layout(fmt|(swizzled?0:FMT_LN),w,h,&tl);
+        if(!swizzled && !tl.compressed)
+            rsx_texture_layout_pitched(fmt|FMT_LN,w,h,tl.row_bytes+rows_random(&seed)%17,&tl);
+        const u32 dp=tl.dst_row_bytes+rows_random(&seed)%23;
+        const size_t n=(size_t)dp*tl.rows+32;
+        u8* src=(u8*)malloc((size_t)tl.face_bytes+32);
+        u8* ref=(u8*)malloc(n);
+        u8* got=(u8*)malloc(n);
+        CHECK(src && ref && got);
+        if(!src || !ref || !got){free(src);free(ref);free(got);return;}
+        for(size_t i=0;i<(size_t)tl.face_bytes+32;i++)src[i]=(u8)(rows_random(&seed)>>24);
+        for(int rgba=0;rgba<2;rgba++) {
+            memset(ref,0xA5,n);memset(got,0xA5,n);
+            rsx_texture_decode(ref+7,dp,src+5,w,h,&tl,rgba);
+            rsx_texture_decode_fast_rows(got+7,dp,src+5,w,h,&tl,rgba);
+            CHECK(memcmp(ref,got,n)==0);
+        }
+        free(src);free(ref);free(got);
+    }
+    rsx_tex_layout tl;rsx_texture_layout(FMT_A8R8G8B8|FMT_LN,2,2,&tl);
+    u8 src[16]={0},dst[16];memset(dst,0xA5,sizeof dst);
+    rsx_texture_decode_fast_rows(NULL,8,src,2,2,&tl,0);
+    rsx_texture_decode_fast_rows(dst,8,NULL,2,2,&tl,0);
+    rsx_texture_decode_fast_rows(dst,8,src,0,2,&tl,0);
+    rsx_texture_decode_fast_rows(dst,8,src,2,0,&tl,0);
+    rsx_texture_decode_fast_rows(dst,8,src,2,2,NULL,0);
+    for(u32 i=0;i<sizeof dst;i++)CHECK_EQ(dst[i],0xA5);
+}
+
+/* A DXT volume stores its slices in groups of four, each block followed by
+ * the same block of the group's other slices; a last group of fewer slices
+ * interleaves only those. */
+static void test_volume_block_slice(void)
+{
+    enum { BW = 2, BH = 1, D = 6, BB = 8 };
+    u8 src[BW * BH * D * BB], dst[BW * BH * BB];
+    /* Block b of slice z, stored at its interleaved place, holds (z << 4) | b. */
+    for (u32 z = 0; z < D; z++) {
+        const u32 first = z / 4u * 4u, n = D - first < 4u ? D - first : 4u;
+        for (u32 b = 0; b < BW * BH; b++)
+            memset(src + (first * BW * BH + b * n + (z - first)) * BB, (int)((z << 4) | b), BB);
+    }
+    for (u32 z = 0; z < D; z++) {
+        rsx_texture_volume_block_slice(dst, src, BW, BH, D, z, BB);
+        for (u32 b = 0; b < BW * BH; b++) {
+            CHECK_EQ(dst[b * BB], (z << 4) | b);
+            CHECK_EQ(dst[b * BB + BB - 1], (z << 4) | b);
+        }
+    }
+}
+
 int main(void)
 {
+    test_fast_rows_reference();
     test_argb();
     test_g8b8();
     test_compressed();
@@ -795,6 +871,7 @@ int main(void)
     test_remap_dxt_matches_argb();
     test_expand_mask();
     test_remap_rejects_null();
+    test_volume_block_slice();
 
     if (g_fail) { printf("\nRSX texture layout: %d FAILED\n", g_fail); return 1; }
     printf("RSX texture layout tests: all passed\n");

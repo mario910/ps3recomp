@@ -157,6 +157,17 @@ u32 rsx_texture_cube_face_stride(u32 rsx_fmt, u32 w, u32 h, u32 levels,
     return (total + 127u) & ~127u;
 }
 
+void rsx_texture_volume_block_slice(u8* dst, const u8* src, u32 blocks_w, u32 blocks_h,
+                                    u32 depth, u32 z, u32 block_bytes)
+{
+    const u32 group = z / 4u, first = group * 4u;
+    const u32 group_slices = depth - first < 4u ? depth - first : 4u;
+    const u8* base = src + (size_t)first * blocks_w * blocks_h * block_bytes;
+    for (u32 b = 0; b < blocks_w * blocks_h; b++)
+        memcpy(dst + (size_t)b * block_bytes,
+               base + ((size_t)b * group_slices + (z - first)) * block_bytes, block_bytes);
+}
+
 int rsx_texture_argb_is_rgba(void)
 {
     static int cached = -1;
@@ -310,6 +321,33 @@ void rsx_texture_decode(void* dst, u32 dst_pitch,
                 ? src + (size_t)rsx_swizzle_offset(x, y, l2w, l2h) * sbpp
                 : src + (size_t)y * tl->row_bytes + (size_t)x * sbpp;
             decode_texel(tl, s, drow + (size_t)x * dbpp, argb_as_rgba);
+        }
+    }
+}
+
+void rsx_texture_decode_fast_rows(void* dst,u32 dst_pitch,const u8* src,u32 w,u32 h,
+                                  const rsx_tex_layout* tl,int argb_as_rgba)
+{
+    if(!dst || !src || !tl || !w || !h)return;
+    if(tl->compressed || tl->swizzled || tl->bytes_per_texel!=4 ||
+       tl->dst_bytes_per_texel!=4 || (tl->base_format!=0x85 && tl->base_format!=0x9E)) {
+        rsx_texture_decode(dst,dst_pitch,src,w,h,tl,argb_as_rgba);
+        return;
+    }
+    const int opaque=tl->base_format==0x9E;
+    for(u32 y=0;y<h;y++) {
+        const u8* s=src+(size_t)y*tl->row_bytes;
+        u8* d=(u8*)dst+(size_t)y*dst_pitch;
+        if(argb_as_rgba) {
+            if(!opaque)memcpy(d,s,(size_t)w*4);
+            else for(u32 x=0;x<w;x++) {
+                d[x*4]=s[x*4];d[x*4+1]=s[x*4+1];d[x*4+2]=s[x*4+2];d[x*4+3]=255;
+            }
+        } else {
+            for(u32 x=0;x<w;x++) {
+                d[x*4]=s[x*4+1];d[x*4+1]=s[x*4+2];d[x*4+2]=s[x*4+3];
+                d[x*4+3]=opaque?255:s[x*4];
+            }
         }
     }
 }

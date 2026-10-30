@@ -135,6 +135,16 @@ u32 rsx_texture_mip_chain(u32 rsx_fmt, u32 w, u32 h, u32 levels, u32 pitch,
 u32 rsx_texture_cube_face_stride(u32 rsx_fmt, u32 w, u32 h, u32 levels,
                                  u32 pitch);
 
+/* Slice z of one level of a COMPRESSED (DXT) volume, as an ordinary 2D block
+ * image (block rows of `blocks_w` blocks). RSX does not store such a level as
+ * consecutive slices: slices come in groups of four, and inside a group each
+ * 4x4 block is followed by the same block of the group's other slices (a last
+ * short group has fewer). Reading slices as consecutive images shears them
+ * into horizontal streaks (Buzz Quiz World's star and logo flip-books).
+ * `src` is the level's first byte; `block_bytes` is 8 (DXT1) or 16. */
+void rsx_texture_volume_block_slice(u8* dst, const u8* src, u32 blocks_w, u32 blocks_h,
+                                    u32 depth, u32 z, u32 block_bytes);
+
 /* Byte offset of texel (x, y) within a swizzled (Morton-ordered) image whose
  * dimensions are 2^log2w by 2^log2h, in texels -- multiply by bytes_per_texel.
  * Interleaves the low bits of x and y, then appends whichever axis still has
@@ -172,6 +182,12 @@ u32 rsx_log2_ceil(u32 v);
 void rsx_texture_decode(void* dst, u32 dst_pitch,
                         const u8* src, u32 w, u32 h,
                         const rsx_tex_layout* tl, int argb_as_rgba);
+/* Same output/row-padding contract; specialize linear 32-bit color rows so
+ * the compiler can vectorize the channel shuffle. Everything else delegates
+ * to the reference decoder. No architecture intrinsics or alignment assumption. */
+void rsx_texture_decode_fast_rows(void* dst, u32 dst_pitch,
+                                  const u8* src, u32 w, u32 h,
+                                  const rsx_tex_layout* tl, int argb_as_rgba);
 
 /* Per-final-RGBA-lane gamma flags from TEXTURE_ADDRESS bits 20..23.
  * Float/depth/non-gamma formats return zero; source signed flags take

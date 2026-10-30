@@ -310,6 +310,59 @@ int rsx_vertex_fetch_one(
     return 1;
 }
 
+int rsx_vertex_fetch_many(
+    const rsx_vertex_fetch_plan* plan,const rsx_vertex_ref* refs,u32 count,u8* out)
+{
+    if(!plan || (!refs && count) || (!out && count && plan->layout.stride))return 0;
+    if(!count || !plan->layout.count)return 1;
+    if(count<4)goto reference;
+    /* Only prevalidated contiguous ranges are reordered. No resolver callback
+     * is invoked by the fast path, and no speculative read crosses a span. */
+    for(u32 slot=0;slot<plan->layout.count;slot++){
+        const rsx_vertex_fetch_attr* f=&plan->attr[plan->layout.attrs[slot]];
+        if(!f->desc.type || !f->desc.size)continue;
+        if(!f->stable_base || f->desc.size>4 || f->desc.type>7)goto reference;
+    }
+    for(u32 slot=0;slot<plan->layout.count;slot++){
+        const rsx_vertex_fetch_attr* f=&plan->attr[plan->layout.attrs[slot]];
+        u8* column=out+slot*16u;
+        const u32 stride=plan->layout.stride;
+        if(!f->desc.type || !f->desc.size){
+            for(u32 i=0;i<count;i++)memcpy(column+(u64)i*stride,f->default_value,16);
+            continue;
+        }
+        const u32 size=f->desc.size;
+        const u32 modulo=(plan->divider_mask>>plan->layout.attrs[slot])&1u;
+        if(f->desc.type==RSX_VTX_TYPE_FLOAT){
+            for(u32 i=0;i<count;i++){
+                const u32 element=rsx_vertex_element_index(refs[i].vertex_id,refs[i].base_index,f->desc.frequency,modulo);
+                if(element<f->stable_first || element>f->stable_last)goto reference;
+                const u8* src=f->stable_base+(u64)(element-f->stable_first)*f->stride;
+                float value[4];
+                value[0]=rsx_compact_be_f32(src);
+                value[1]=size>1?rsx_compact_be_f32(src+4):0.0f;
+                value[2]=size>2?rsx_compact_be_f32(src+8):0.0f;
+                value[3]=size>3?rsx_compact_be_f32(src+12):1.0f;
+                memcpy(column+(u64)i*stride,value,16);
+            }
+        } else {
+            for(u32 i=0;i<count;i++){
+                const u32 element=rsx_vertex_element_index(refs[i].vertex_id,refs[i].base_index,f->desc.frequency,modulo);
+                if(element<f->stable_first || element>f->stable_last)goto reference;
+                const u8* src=f->stable_base+(u64)(element-f->stable_first)*f->stride;
+                float value[4];
+                if(!rsx_vertex_decode_element(f->desc.type,size,src,value))return 0;
+                memcpy(column+(u64)i*stride,value,16);
+            }
+        }
+    }
+    return 2;
+reference:
+    for(u32 i=0;i<count;i++)
+        if(!rsx_vertex_fetch_one(plan,&refs[i],plan->layout.stride?out+(u64)i*plan->layout.stride:NULL))return 0;
+    return 1;
+}
+
 static u64 rsx_vertex_remap_hash(u64 value)
 {
     value ^= value >> 33;

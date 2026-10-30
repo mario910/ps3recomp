@@ -116,6 +116,16 @@ void rsx_vertex_fetch_plan_prepare(
 int rsx_vertex_fetch_one(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* ref, u8* out);
 
+/* Fetch count vertices into count*layout.stride bytes. Prepared, stable plain
+ * arrays can be fetched attribute-major with invariant format checks outside
+ * the inner loop. Element/divider bounds remain checked per reference. Unmapped
+ * or unsupported plans retain the exact vertex-major fallback. Return 2 for
+ * attribute-major success, 1 for reference/empty success, or 0 for failure.
+ * Zero means the complete group must be discarded;
+ * no partial-output guarantee is made on failure, as with _fetch_one. */
+int rsx_vertex_fetch_many(
+    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count, u8* out);
+
 /* Collapse repeated (vertex_id, base_index) references in first-use order.
  * refs is rewritten in place with the unique prefix.  The occurrence map
  * remains valid until the next call using the same remap object. */

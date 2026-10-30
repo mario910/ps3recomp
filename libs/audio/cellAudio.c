@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <math.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/host_controls.h"
 
 /* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
  * rather than including sys_event.h to avoid pulling PPU context/syscall
@@ -157,6 +158,7 @@ static mutex_t       s_audio_mutex;
 
 /* Output mix buffer (stereo, one block worth) */
 static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
+static float s_output_gain = 1.0f; /* owned only by the mixer thread */
 
 /* ---------------------------------------------------------------------------
  * Host audio output backend
@@ -533,6 +535,7 @@ static void audio_mix_one_block(void)
         if (s_mix_buffer[i] > 1.0f) s_mix_buffer[i] = 1.0f;
         if (s_mix_buffer[i] < -1.0f) s_mix_buffer[i] = -1.0f;
     }
+    ps3_host_apply_volume(s_mix_buffer,CELL_AUDIO_BLOCK_SAMPLES,&s_output_gain);
 }
 
 /* ---------------------------------------------------------------------------

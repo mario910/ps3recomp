@@ -1,7 +1,7 @@
 /*
  * ps3recomp - Vulkan RSX Backend
  *
- * The Linux renderer the README calls "the obvious target". Same host-facing
+ * Linux and experimental Windows renderer. Same host-facing
  * entry points and test hooks as the Metal and headless null backends, so
  * runtime/host/host_posix.c drives it unchanged.
  *
@@ -21,7 +21,8 @@
  * Rendering is offscreen; a present reads the frame back (the host's pixel
  * checks), optionally dumps it, and optionally shows it in a window.
  *
- * Vulkan is loaded at run time (dlopen of libvulkan.so.1), not linked, so:
+ * Vulkan is loaded at run time (libvulkan.so.1 on Linux, the System32
+ * vulkan-1.dll on Windows), not linked, so:
  *   - building needs only the Vulkan headers, not a target-arch libvulkan
  *     (which is what makes cross-compiling for aarch64 straightforward);
  *   - a machine with no Vulkan loader fails init() cleanly instead of failing
@@ -34,12 +35,15 @@
  *                             order) instead of the first non-CPU device.
  *   PS3RECOMP_VK_DUMP=<path>  write every presented frame to <path> as a
  *                             binary PPM (overwritten each present).
- *   PS3RECOMP_VK_WINDOW=1     also show each presented frame in an SDL2
+ *   PS3RECOMP_VK_DUMP_EVERY=N dump every Nth frame (default 1).
+ *   PS3RECOMP_VK_WINDOW=1     also show each presented frame in a native Win32
+ *                             or SDL2 (Linux)
  *                             window. Rendering and readback are unchanged, so
  *                             every test gives the same result with or without
  *                             it; if the window cannot be opened the run
  *                             continues headless and says why.
- *   PS3RECOMP_VK_FULLSCREEN=1 with a window: borderless full screen.
+ *   PS3RECOMP_VK_FULLSCREEN=1 Linux SDL2 window: borderless full screen.
+ *                             Windows host presentation controls are pending.
  *   PS3RECOMP_VK_HOLD=<sec>   with a window: keep the last frame on screen
  *                             this long before shutdown closes it.
  *   PS3RECOMP_VK_GUEST_PROGRAMS=1
@@ -61,21 +65,28 @@ extern "C" {
 #endif
 
 /* Load Vulkan, create the device and the offscreen target, and register as
- * the RSX backend. `title` is only logged (no window at V0).
+ * the RSX backend. `title` names the optional native window.
  * Returns 0 on success, -1 on any failure (reason printed to stderr). */
 int  rsx_vulkan_backend_init(u32 width, u32 height, const char* title);
 
 /* Unregister and destroy every Vulkan object, then unload the library. */
 void rsx_vulkan_backend_shutdown(void);
 
-/* Headless: always 0. Windowed: drains SDL's event queue; -1 once the
+/* Headless: always 0. Windowed: drains the native event queue; -1 once the
  * window has been closed or Esc pressed. */
 int  rsx_vulkan_backend_pump_messages(void);
+/* True only with an actual surface and swapchain (not a headless fallback). */
+int  rsx_vulkan_backend_windowed(void);
+#ifdef _WIN32
+void rsx_vulkan_set_key_handler(void (*handler)(u32,int));
+#endif
 
 /* Read the frame back to host memory (and to PS3RECOMP_VK_DUMP if set), and
  * show it in the window if there is one. Same as _present_begin() followed
  * by _present_finish(). */
 void rsx_vulkan_backend_present(void);
+/* Successful window presentations only; zero for a headless run. */
+u64 rsx_vulkan_backend_presented_frames(void);
 
 /* The same present in two halves, for a host that presents on a thread of its
  * own beside the FIFO walker.
@@ -95,15 +106,18 @@ void rsx_vulkan_backend_present_begin(void);
 void rsx_vulkan_backend_present_finish(void);
 
 /* Centre pixel of the last frame a present copied out, as 0xFFRRGGBB, or 0
- * before the first. Unlike _readback_center(), which on the draw engine path
+ * before the first or when PS3RECOMP_VK_PRESENT_READBACK=0 explicitly disables
+ * presentation diagnostics (a frame dump forces them on). Unlike
+ * _readback_center(), which on the draw engine path
  * reads the surface as it is now, this is what was shown. */
 u32  rsx_vulkan_backend_presented_center(void);
 
 /* The clear colour most recently set through the command stream, ARGB8888. */
 u32  rsx_vulkan_backend_debug_color(void);
 
-/* Centre pixel of the last presented frame as 0xFFRRGGBB, or 0 if nothing
- * has been presented yet. */
+/* Draw-engine path: explicitly read the current selected surface, even if
+ * presentation diagnostics are disabled. Vtable path: last presented centre
+ * as 0xFFRRGGBB, or 0 before presentation/when diagnostics were disabled. */
 u32  rsx_vulkan_backend_readback_center(void);
 
 /* Draws of the last presented frame that ran the guest's own programs. */

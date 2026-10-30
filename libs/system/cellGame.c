@@ -57,8 +57,25 @@ static char s_app_ver[16]   = "01.00";
  *
  * The literal below is only the fallback for a host with no VFS configured;
  * content_root() resolves the real one on first use. */
-static char s_content_path[CELL_GAME_PATH_MAX] = "./gamedata/dev_hdd0/game";
+/* CELL_GAME_PATH_MAX is the guest ABI's 128-byte virtual path, not a limit
+ * on the absolute host directory. Keep room for title/USRDIR suffixes and
+ * reject oversized roots rather than creating a truncated sibling tree. */
+#define GAME_HOST_PATH_MAX 1024
+#define GAME_HOST_ROOT_MAX (GAME_HOST_PATH_MAX - CELL_GAME_PATH_MAX)
+static char s_content_path[GAME_HOST_PATH_MAX] = "./gamedata/dev_hdd0/game";
 static int  s_content_path_resolved = 0;
+static int  s_content_path_invalid = 0;
+
+static void set_content_root(const char* prefix, const char* suffix)
+{
+    s_content_path_invalid = strlen(prefix) + strlen(suffix) >= GAME_HOST_ROOT_MAX;
+    if (s_content_path_invalid) {
+        s_content_path[0] = '\0';
+        fprintf(stderr, "[cellGame] host content root is too long; refusing truncated filesystem access\n");
+    } else {
+        snprintf(s_content_path, sizeof s_content_path, "%s%s", prefix, suffix);
+    }
+}
 
 /* Resolved the same way ppu_fs.cpp resolves the /dev_hdd0 mount: $PS3_HDD0_ROOT
  * if set, else the VFS root -- in both cases with the "/dev_hdd0/" prefix
@@ -71,21 +88,21 @@ static const char* content_root(void)
         s_content_path_resolved = 1;
         const char* hdd0 = getenv("PS3_HDD0_ROOT");
         if (hdd0 && *hdd0)
-            snprintf(s_content_path, sizeof s_content_path, "%s/game", hdd0);
+            set_content_root(hdd0, "/game");
         else if (ppu_vfs_root && *ppu_vfs_root && strcmp(ppu_vfs_root, ".") != 0)
             /* NB: <root>/game, not <root>/dev_hdd0/game. ppu_fs STRIPS the mount
              * prefix -- guest /dev_hdd0/game/<id> resolves to <root>/game/<id>.
              * Spelling the device out here just recreates the same split one
              * directory over, with each side quietly making its own tree. */
-            snprintf(s_content_path, sizeof s_content_path, "%s/game", ppu_vfs_root);
+            set_content_root(ppu_vfs_root, "/game");
         for (char* q = s_content_path; *q; q++) if (*q == 0x5C) *q = 0x2F;
         printf("[cellGame] content root (host /dev_hdd0/game): %s\n", s_content_path);
     }
-    return s_content_path;
+    return s_content_path_invalid ? NULL : s_content_path;
 }
-static char s_content_info_path[CELL_GAME_PATH_MAX] = "";
-static char s_usrdir_path[CELL_GAME_PATH_MAX] = "";
-static char s_tmp_path[CELL_GAME_PATH_MAX] = "";
+static char s_content_info_path[GAME_HOST_PATH_MAX] = "";
+static char s_usrdir_path[GAME_HOST_PATH_MAX] = "";
+static char s_tmp_path[GAME_HOST_PATH_MAX] = "";
 static char s_exit_param[256] = "";
 
 static int  s_boot_checked = 0;
@@ -102,7 +119,7 @@ static char s_check_dir[64] = "";
 
 static void ensure_dirs(const char* path)
 {
-    char tmp[CELL_GAME_PATH_MAX];
+    char tmp[GAME_HOST_PATH_MAX];
     strncpy(tmp, path, sizeof(tmp) - 1);
     tmp[sizeof(tmp) - 1] = '\0';
 
@@ -133,7 +150,7 @@ static int dir_exists(const char* path)
  * so installation checks use the destination volume, without creating data. */
 static s32 content_free_kb(void)
 {
-    char path[CELL_GAME_PATH_MAX];
+    char path[GAME_HOST_PATH_MAX];
     snprintf(path, sizeof(path), "%s", s_content_path[0] ? s_content_path : ".");
     for (;;) {
 #ifdef _WIN32
@@ -214,8 +231,7 @@ void cellGame_set_content_path(const char* path)
 {
     if (!path) return;
     s_content_path_resolved = 1;   /* explicit override beats content_root() */
-    strncpy(s_content_path, path, sizeof(s_content_path) - 1);
-    s_content_path[sizeof(s_content_path) - 1] = '\0';
+    set_content_root(path, "");
 }
 
 /* ---------------------------------------------------------------------------
@@ -333,13 +349,16 @@ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
 {
     printf("[cellGame] BootCheck()\n");
 
+    const char* root = content_root();
+    if (!root) return CELL_GAME_ERROR_PARAM;
+
     /* Build paths based on title ID */
     snprintf(s_content_info_path, sizeof(s_content_info_path),
-             "%s/%s", content_root(), s_title_id);
+             "%s/%s", root, s_title_id);
     snprintf(s_usrdir_path, sizeof(s_usrdir_path),
-             "%s/%s/USRDIR", content_root(), s_title_id);
+             "%s/%s/USRDIR", root, s_title_id);
     snprintf(s_tmp_path, sizeof(s_tmp_path),
-             "%s/%s_TMP", content_root(), s_title_id);
+             "%s/%s_TMP", root, s_title_id);
 
 #ifdef _WIN32
     for (char* p = s_content_info_path; *p; p++) if (*p == '/') *p = '\\';
@@ -388,20 +407,17 @@ s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath)
            s_check_is_disc ? "/dev_bdvd/PS3_GAME" : "game-data dir");
 
     if (!s_check_is_disc) {
+        const char* root = content_root();
+        if (!root) return CELL_GAME_ERROR_PARAM;
         /* Ensure directories exist. IMPORTANT: also create them at the SAME host
          * location the VFS (ppu_fs.cpp host_path) maps /dev_hdd0/game/<title>/ to,
          * i.e. $ppu_vfs_root/game/<title>/. cellGame historically only created
          * ./gamedata/dev_hdd0/game/... which cellFs never looks at, so a game that
          * polls cellFsStat for its game-data USRDIR (LBP's boot bringup stage) stalls
          * forever and exits. Create it where cellFs will actually find it. */
-        ensure_dirs(s_content_info_path);
-        ensure_dirs(s_usrdir_path);
-        {
-            extern const char* ppu_vfs_root;
-            char vpath[CELL_GAME_PATH_MAX];
-            snprintf(vpath, sizeof vpath, "%s/game/%s/USRDIR", ppu_vfs_root, s_check_dir);
-            ensure_dirs(vpath);
-        }
+        char path[GAME_HOST_PATH_MAX];
+        snprintf(path, sizeof path, "%s/%s/USRDIR", root, s_check_dir);
+        ensure_dirs(path);
     }
 
     /* Both paths are GUEST addresses; format into a host temp, copy into the
@@ -442,8 +458,10 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
     strncpy(s_check_dir, check_dir, sizeof(s_check_dir) - 1);
     s_check_dir[sizeof(s_check_dir) - 1] = '\0';
 
-    char path[CELL_GAME_PATH_MAX];
-    snprintf(path, sizeof(path), "%s/%s", content_root(), check_dir);
+    const char* root = content_root();
+    if (!root) return CELL_GAME_ERROR_PARAM;
+    char path[GAME_HOST_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", root, s_check_dir);
 
     uint32_t size_ea = (uint32_t)(uintptr_t)size;
     if (size_ea) {
@@ -721,13 +739,15 @@ s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPat
      * precedes this call, which is exactly what firmware creates. */
     const char* create_dir = s_check_dir[0] ? s_check_dir : s_title_id;
 
-    char path[CELL_GAME_PATH_MAX];
-    snprintf(path, sizeof(path), "%s/%s", content_root(), create_dir);
+    const char* root = content_root();
+    if (!root) return CELL_GAME_ERROR_PARAM;
+    char path[GAME_HOST_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", root, create_dir);
 
     ensure_dirs(path);
 
     /* Also create USRDIR */
-    char usrdir[CELL_GAME_PATH_MAX];
+    char usrdir[GAME_HOST_PATH_MAX];
     snprintf(usrdir, sizeof(usrdir), "%s/USRDIR", path);
     ensure_dirs(usrdir);
 
