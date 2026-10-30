@@ -37,6 +37,9 @@
 extern "C" {
 #endif
 
+/* Backend-internal kernels only; the decompilers never emit compute. */
+#define RSX_SHADER_STAGE_COMPUTE  2
+
 #define RSX_SPIRV_VPCONST_BINDING  0u
 #define RSX_SPIRV_PSCONST_BINDING  1u
 #define RSX_SPIRV_TEXTURE_BINDING  16u
@@ -48,7 +51,7 @@ int rsx_hlsl_to_spirv_available(void);
 /* Translate one HLSL shader whose entry point is `main` into SPIR-V 1.0 for a
  * Vulkan 1.0 client.
  *   hlsl      : NUL-terminated HLSL, as the decompilers emit it.
- *   stage     : RSX_SHADER_STAGE_VERTEX or RSX_SHADER_STAGE_FRAGMENT.
+ *   stage     : RSX_SHADER_STAGE_VERTEX, _FRAGMENT or _COMPUTE.
  *   words     : receives the SPIR-V, max_words 32-bit words at most.
  *   out_words : receives the word count.
  *   log       : receives a diagnostic on failure (may be NULL).

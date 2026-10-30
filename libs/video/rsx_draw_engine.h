@@ -268,6 +268,15 @@ typedef struct rsx_draw_backend {
      * the whole target is cleared, which wipes the cells drawn before. */
     void (*clear_color_rect)(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
                              const float rgba[4]);
+
+    /* Optional. The w x h corner of a depth target as the R,G,B,A texture a
+     * linear A8R8G8B8 unit decodes from its Z24S8 bytes in guest memory:
+     * depth rounded to 24 bits as eng_zdepth_to_guest stores it, stencil 0.
+     * The result takes surface_view like a colour snapshot. Recorded in
+     * command order like color_region_snapshot, including `reuse`; no
+     * readback or upload. 0 when the backend cannot: the engine then goes
+     * through guest memory as before. */
+    u32 (*depth_color_copy)(void* user, u32 depth, u32 w, u32 h, u32 reuse);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

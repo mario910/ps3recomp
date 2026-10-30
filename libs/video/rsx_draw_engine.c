@@ -182,6 +182,8 @@ typedef struct {
     int guest_dirty;       /* written since guest memory last got a copy     */
     u32 zfmt, pitch;       /* SURFACE_FORMAT depth field and zeta pitch then */
     u32 used_w, used_h;    /* the clip that write went through              */
+    u32 color_copy;        /* backend depth_color_copy result, or 0         */
+    u64 color_serial;      /* depth_serial that copy was made from          */
 } eng_zdepth;
 
 typedef struct {
@@ -952,6 +954,7 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
         return (slot < g.n_zdepths && g.zdepths[slot].handle) ? slot : ENG_INVALID;
 
     eng_zdepth* z = &g.zdepths[slot];
+    if (z->color_copy) { g.be->texture_release(g.be->user, z->color_copy); z->color_copy = 0; }
     if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
     z->location = location; z->offset = offset;
     z->w = want_w; z->h = want_h;
@@ -1464,6 +1467,84 @@ static int eng_zdepth_to_guest(u32 slot)
         fprintf(stderr, "[rsx engine] depth 0x%08X (%s, pitch %u) %ux%u stored to guest memory\n",
                 z->offset, bpp == 2u ? "Z16" : "Z24S8", z->pitch, w, h);
     return 1;
+}
+
+/* A depth target sampled as linear A8R8G8B8 over exactly its Z24S8 bytes
+ * (a depth-of-field pass reading the depth buffer of the frame): the backend
+ * builds those texels on the GPU, in command order, instead of a full wait,
+ * readback, guest store and re-upload of the whole buffer every frame. Guest
+ * memory keeps guest_dirty, so any other reader still gets the stored bytes.
+ * Anything this does not exactly cover returns 0 for the guest-memory path. */
+static int s_zdepth_color = -1;
+
+/* PS3RECOMP_ENG_DEPTH_COLOR_CHECK=N: for the first N copies, also store the
+ * depth through guest memory and compare every texel (diagnostic: waits). */
+static void eng_zdepth_color_check(u32 slot, u32 w, u32 h)
+{
+    static int left = -1;
+    if (left < 0) {
+        const char* e = getenv("PS3RECOMP_ENG_DEPTH_COLOR_CHECK");
+        left = e ? atoi(e) : 0;
+    }
+    if (left <= 0 || !g.be->readback) return;
+    left--;
+    eng_zdepth* z = &g.zdepths[slot];
+    u8* rows = (u8*)malloc((size_t)w * h * 4u);
+    if (!rows) return;
+    g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+    g.be->readback(g.be->user, z->color_copy, 0, 0, w, h, rows, w * 4u);
+    z->guest_dirty = 1;
+    u64 bad = 0;
+    u32 first_x = 0, first_y = 0, got = 0, want = 0;
+    if (eng_zdepth_to_guest(slot)) {
+        for (u32 y = 0; y < h; y++) {
+            const u8* gm = (const u8*)eng_guest_ptr(NULL, z->location, z->offset + y * z->pitch, w * 4u);
+            if (!gm) { bad = ~0ull; break; }
+            for (u32 x = 0; x < w; x++) {
+                const u8* c = rows + ((size_t)y * w + x) * 4u;
+                const u8* m = gm + (size_t)x * 4u;
+                if (c[0] != m[1] || c[1] != m[2] || c[2] != m[3] || c[3] != m[0]) {
+                    if (!bad++) {
+                        first_x = x; first_y = y;
+                        got = ((u32)c[3] << 24) | ((u32)c[0] << 16) | ((u32)c[1] << 8) | c[2];
+                        want = ((u32)m[0] << 24) | ((u32)m[1] << 16) | ((u32)m[2] << 8) | m[3];
+                    }
+                }
+            }
+        }
+    } else bad = ~0ull;
+    fprintf(stderr, "[rsx engine] depth colour check 0x%08X %ux%u: %llu mismatches"
+            " (first %u,%u gpu %08X guest %08X)\n", z->offset, w, h,
+            (unsigned long long)bad, first_x, first_y, got, want);
+    free(rows);
+}
+
+static u32 eng_zdepth_color_view(u32 slot, const rsx_dsp_texture* t)
+{
+    if (s_zdepth_color < 0) {
+        const char* e = getenv("PS3RECOMP_ENG_DEPTH_COLOR");
+        s_zdepth_color = !(e && e[0] == '0');
+    }
+    eng_zdepth* z = &g.zdepths[slot];
+    const u32 w = z->used_w < z->w ? z->used_w : z->w;
+    const u32 h = z->used_h < z->h ? z->used_h : z->h;
+    if (!s_zdepth_color || !g.be->depth_color_copy || !g.be->surface_view ||
+        !z->handle || z->zfmt != 2u ||
+        (t->format & ~(u32)RSX_TEX_FMT_UNNORM) != (RSX_TEX_FMT_A8R8G8B8 | 0x20u) ||
+        t->dimension != 2 || t->cubemap || t->mipmaps > 1 ||
+        t->width != w || t->height != h || t->pitch != w * 4u || z->pitch != t->pitch ||
+        rsx_texture_argb_is_rgba())
+        return 0;
+    if (!z->color_copy || z->color_serial != z->depth_serial) {
+        const u32 copy = g.be->depth_color_copy(g.be->user, z->handle, w, h, z->color_copy);
+        if (!copy) return 0;
+        if (z->color_copy && z->color_copy != copy)
+            g.be->texture_release(g.be->user, z->color_copy);
+        z->color_copy = copy;
+        z->color_serial = z->depth_serial;
+        eng_zdepth_color_check(slot, w, h);
+    }
+    return g.be->surface_view(g.be->user, z->color_copy, t->remap & 0xFFFFu, t->format);
 }
 
 /* A depth write or clear through the current zeta, recorded with what the
@@ -2353,12 +2434,15 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             break;
         }
         if (zsrc >= 0) {
-            /* DEPTH24_D8 keeps the backend's own snapshot when it has one;
-             * anything else goes through guest memory. */
+            /* DEPTH24_D8 keeps the backend's own snapshot when it has one,
+             * linear A8R8G8B8 its GPU copy; anything else goes through
+             * guest memory. */
             if (base_fmt == RSX_TEX_FMT_DEPTH24_D8 && current_zslot != (u32)zsrc) {
                 const u32 snap = eng_zdepth_snapshot((u32)zsrc);
                 if (snap) { textures[u] = snap; continue; }
             }
+            const u32 view = eng_zdepth_color_view((u32)zsrc, &t);
+            if (view) { textures[u] = view; continue; }
             if (eng_zdepth_to_guest((u32)zsrc)) {
                 textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                                t.width, t.height, t.mipmaps, t.pitch,
@@ -3251,8 +3335,10 @@ void rsx_draw_engine_shutdown(void)
         if (g.surfaces[i].feedback) g.be->texture_release(g.be->user, g.surfaces[i].feedback);
         if (g.surfaces[i].handle) g.be->color_target_release(g.be->user, g.surfaces[i].handle);
     }
-    for (u32 i = 0; i < g.n_zdepths; i++)
+    for (u32 i = 0; i < g.n_zdepths; i++) {
+        if (g.zdepths[i].color_copy) g.be->texture_release(g.be->user, g.zdepths[i].color_copy);
         if (g.zdepths[i].handle) g.be->depth_target_release(g.be->user, g.zdepths[i].handle);
+    }
     if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);
 
     rsx_draw_engine_set_guest_memory(NULL, NULL);

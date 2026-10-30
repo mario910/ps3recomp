@@ -117,13 +117,13 @@ static void vk_mutex_destroy(vk_mutex* m){pthread_mutex_destroy(m);}
     X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkResetDescriptorPool) \
     X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) \
     X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) \
-    X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) \
+    X(vkCreateGraphicsPipelines) X(vkCreateComputePipelines) X(vkDestroyPipeline) \
     X(vkCreateSampler) X(vkDestroySampler) \
     X(vkCmdPipelineBarrier) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) \
     X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImage) X(vkCmdUpdateBuffer) \
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBindPipeline) \
     X(vkCmdBindVertexBuffers) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) \
-    X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) \
+    X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) X(vkCmdDispatch) \
     X(vkCmdSetStencilReference) X(vkCmdSetDepthBounds) \
     X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) \
     X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage)
@@ -2933,11 +2933,13 @@ static void vk_eng_release(void* user, u32 handle)
 }
 
 static void vk_eng_snapshot_pool_drain(void);
+static void vk_zcolor_shutdown(void);
 
 static void vk_eng_shutdown(void* user)
 {
     s_texture_pool.on=0; /* shutdown releases destroy rather than refilling the pool */
     vk_eng2_shutdown(user);
+    vk_zcolor_shutdown();
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++) vk_eng_release(user, i);
     vk_eng_snapshot_pool_drain();
     vk_eng_clear_src_drain();
@@ -3865,6 +3867,229 @@ static int vk_eng_translate(const char* hlsl, int stage, VkShaderModule* out)
     return pvkCreateShaderModule(s_vk.device, &ci, NULL, out) == VK_SUCCESS ? 0 : -1;
 }
 
+/* ---- depth read as A8R8G8B8 (rsx_draw_backend.depth_color_copy) ----------
+ * A deferred or depth-of-field pass samples the frame's Z24S8 buffer as
+ * linear A8R8G8B8. The guest-memory route waited for the GPU, read the whole
+ * buffer back, stored it, hashed, decoded and uploaded it again: 7 MiB per
+ * frame for Buzz's 2560x704 2xAA depth. Here depth -> buffer -> one compute
+ * pass -> RGBA8 image, recorded into the draw batch in command order. The
+ * kernel rounds exactly as eng_zdepth_to_guest (floor(d * 0xFFFFFF + 0.5) of
+ * the clamped float, in 48-bit integer arithmetic) and lays the bytes out as
+ * the A8R8G8B8 decode does: guest A,R,G,B = depth[23:16], depth[15:8],
+ * depth[7:0], stencil 0 -> host R,G,B,A. Groups of 64 texels, 65535 groups
+ * per dispatch row; the scratch buffer is padded to whole rows, so no lane
+ * needs a bound. Float depth formats only; others return 0 and keep the
+ * guest-memory path. */
+static const char k_zcolor_hlsl[] =
+    "[[vk::binding(0,0)]] RWByteAddressBuffer buf;\n"
+    "[numthreads(64,1,1)] void main(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {\n"
+    "  uint i = (gid.y * 65535u + gid.x) * 64u + lid.x;\n"
+    "  uint f = buf.Load(i * 4u);\n"
+    "  uint e = (f >> 23) & 0xFFu;\n"
+    "  uint v = 0u;\n"
+    /* negative, zero, denormal (< 2^-126, rounds to 0) or NaN: 0 */
+    "  if ((f & 0x80000000u) != 0u || e == 0u || (e == 0xFFu && (f & 0x7FFFFFu) != 0u)) v = 0u;\n"
+    "  else if (f >= 0x3F800000u) v = 0xFFFFFFu;\n"
+    "  else {\n"
+    "    uint m = (f & 0x7FFFFFu) | 0x800000u;\n"
+    "    uint lo = m << 24, hi = m >> 8;\n"          /* m * 2^24 */
+    "    if (lo < m) hi -= 1u;\n"
+    "    lo -= m;\n"                                  /* m * (2^24 - 1), 48 bits */
+    "    uint sh = 150u - e;\n"                       /* d = m * 2^-sh, sh >= 24 */
+    "    uint r = sh - 1u;\n"                         /* + 0.5 = 2^(sh-1) */
+    "    if (r < 32u) { uint t = lo + (1u << r); if (t < lo) hi += 1u; lo = t; }\n"
+    "    else if (r < 64u) hi += 1u << (r - 32u);\n"
+    "    if (sh < 32u) v = (lo >> sh) | (hi << (32u - sh));\n"
+    "    else if (sh < 64u) v = hi >> (sh - 32u);\n"
+    "  }\n"
+    "  buf.Store(i * 4u, ((v >> 8) & 0xFFu) | ((v & 0xFFu) << 8) | (((v >> 16) & 0xFFu) << 24));\n"
+    "}\n";
+
+static struct {
+    int tried, ok;
+    VkDescriptorSetLayout dsl;
+    VkPipelineLayout layout;
+    VkPipeline pipe;
+    VkDescriptorPool pool;
+    VkDescriptorSet set;
+    VkBuffer buf;
+    VkDeviceMemory mem;
+    VkDeviceSize size;
+} s_zc;
+
+static int vk_zcolor_init(void)
+{
+    if (s_zc.tried) return s_zc.ok ? 0 : -1;
+    s_zc.tried = 1;
+    if (!s_g.on || !s_g.spv) return -1;
+    u32 words = 0;
+    if (rsx_hlsl_to_spirv(k_zcolor_hlsl, RSX_SHADER_STAGE_COMPUTE, s_g.spv, VK_SPV_WORDS, &words,
+                          s_g.log, sizeof s_g.log) || !words) {
+        VK_LOG("engine: depth colour kernel translation failed: %s\n", s_g.log);
+        return -1;
+    }
+    VkShaderModule cs = VK_NULL_HANDLE;
+    VkShaderModuleCreateInfo mci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                     .codeSize = (size_t)words * 4u, .pCode = s_g.spv };
+    if (pvkCreateShaderModule(s_vk.device, &mci, NULL, &cs) != VK_SUCCESS) return -1;
+    VkDescriptorSetLayoutBinding b = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                                       VK_SHADER_STAGE_COMPUTE_BIT, NULL };
+    VkDescriptorSetLayoutCreateInfo lci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                            .bindingCount = 1, .pBindings = &b };
+    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 };
+    VkDescriptorPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                       .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps };
+    int rc = -1;
+    if (pvkCreateDescriptorSetLayout(s_vk.device, &lci, NULL, &s_zc.dsl) == VK_SUCCESS &&
+        pvkCreateDescriptorPool(s_vk.device, &pci, NULL, &s_zc.pool) == VK_SUCCESS) {
+        VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                            .setLayoutCount = 1, .pSetLayouts = &s_zc.dsl };
+        VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                            .descriptorPool = s_zc.pool, .descriptorSetCount = 1,
+                                            .pSetLayouts = &s_zc.dsl };
+        if (pvkCreatePipelineLayout(s_vk.device, &plci, NULL, &s_zc.layout) == VK_SUCCESS &&
+            pvkAllocateDescriptorSets(s_vk.device, &dai, &s_zc.set) == VK_SUCCESS) {
+            VkComputePipelineCreateInfo cpi = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                           .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = cs, .pName = "main" },
+                .layout = s_zc.layout };
+            if (pvkCreateComputePipelines(s_vk.device, VK_NULL_HANDLE, 1, &cpi, NULL,
+                                          &s_zc.pipe) == VK_SUCCESS)
+                rc = 0;
+        }
+    }
+    pvkDestroyShaderModule(s_vk.device, cs, NULL);
+    if (rc) { VK_LOG("engine: depth colour kernel unavailable\n"); return -1; }
+    s_zc.ok = 1;
+    VK_LOG("engine: depth sampled as A8R8G8B8 is converted on the GPU\n");
+    return 0;
+}
+
+/* One device-local scratch buffer, reused in queue order by every copy. */
+static int vk_zcolor_reserve(VkDeviceSize bytes)
+{
+    if (bytes <= s_zc.size) return 0;
+    if (s_zc.buf) {
+        /* Rare (a larger depth target): no recorded copy may still use it. */
+        if (vk_batch_flush()) return -1;
+        vk_present_wait_gpu();
+        pvkDeviceWaitIdle(s_vk.device);
+        pvkDestroyBuffer(s_vk.device, s_zc.buf, NULL);
+        pvkFreeMemory(s_vk.device, s_zc.mem, NULL);
+        s_zc.buf = VK_NULL_HANDLE; s_zc.mem = VK_NULL_HANDLE; s_zc.size = 0;
+    }
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = bytes,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    if (pvkCreateBuffer(s_vk.device, &bci, NULL, &s_zc.buf) != VK_SUCCESS) {
+        s_zc.buf = VK_NULL_HANDLE; return -1;
+    }
+    VkMemoryRequirements req;
+    pvkGetBufferMemoryRequirements(s_vk.device, s_zc.buf, &req);
+    u32 type;
+    if (vk_find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type) &&
+        vk_find_memory_type(req.memoryTypeBits, 0, &type)) goto fail;
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .allocationSize = req.size, .memoryTypeIndex = type };
+    if (pvkAllocateMemory(s_vk.device, &mai, NULL, &s_zc.mem) != VK_SUCCESS) {
+        s_zc.mem = VK_NULL_HANDLE; goto fail;
+    }
+    if (pvkBindBufferMemory(s_vk.device, s_zc.buf, s_zc.mem, 0) != VK_SUCCESS) goto fail;
+    s_zc.size = bytes;
+    VkDescriptorBufferInfo bi = { s_zc.buf, 0, VK_WHOLE_SIZE };
+    VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s_zc.set,
+                               .dstBinding = 0, .descriptorCount = 1,
+                               .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi };
+    pvkUpdateDescriptorSets(s_vk.device, 1, &w, 0, NULL);
+    return 0;
+fail:
+    if (s_zc.mem) pvkFreeMemory(s_vk.device, s_zc.mem, NULL);
+    pvkDestroyBuffer(s_vk.device, s_zc.buf, NULL);
+    s_zc.buf = VK_NULL_HANDLE; s_zc.mem = VK_NULL_HANDLE;
+    return -1;
+}
+
+static void vk_zcolor_shutdown(void)
+{
+    if (s_zc.buf || s_zc.pipe) { vk_batch_flush(); pvkDeviceWaitIdle(s_vk.device); }
+    if (s_zc.buf) pvkDestroyBuffer(s_vk.device, s_zc.buf, NULL);
+    if (s_zc.mem) pvkFreeMemory(s_vk.device, s_zc.mem, NULL);
+    if (s_zc.pipe) pvkDestroyPipeline(s_vk.device, s_zc.pipe, NULL);
+    if (s_zc.layout) pvkDestroyPipelineLayout(s_vk.device, s_zc.layout, NULL);
+    if (s_zc.pool) pvkDestroyDescriptorPool(s_vk.device, s_zc.pool, NULL);
+    if (s_zc.dsl) pvkDestroyDescriptorSetLayout(s_vk.device, s_zc.dsl, NULL);
+    memset(&s_zc, 0, sizeof s_zc);
+}
+
+static void vk_zcolor_memory_barrier(void)
+{
+    VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                           .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                           .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
+    pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+}
+
+static u32 vk_eng_depth_color_copy(void* user, u32 depth, u32 w, u32 h, u32 reuse)
+{
+    const vk_eng_obj* z = vk_eng_get(depth, VK_ENG_DEPTH);
+    if (!z || !w || !h || w > z->w || h > z->h) return 0;
+    if (s_vk.depth_format != VK_FORMAT_D32_SFLOAT &&
+        s_vk.depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT) return 0;
+    const u64 groups = ((u64)w * h + 63u) / 64u;
+    const u32 row = groups > 65535u ? 65535u : (u32)groups;
+    const u32 rows = (u32)((groups + row - 1u) / row);
+    if (vk_zcolor_init() || vk_zcolor_reserve((VkDeviceSize)row * rows * 64u * 4u)) return 0;
+    u32 hd = reuse;
+    vk_eng_obj* o = vk_eng_get(reuse, VK_ENG_COLOR);
+    int fresh = 0;
+    if (!o || !o->snapshot || o->w != w || o->h != h || o->fmt != VK_FORMAT_R8G8B8A8_UNORM) {
+        hd = vk_eng_alloc();
+        if (!hd) return 0;
+        o = &s_eobj[hd];
+        if (vk_create_image(&o->im, VK_FORMAT_R8G8B8A8_UNORM, w, h,
+                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT)) {
+            vk_destroy_image(&o->im); memset(o, 0, sizeof *o); return 0;
+        }
+        o->kind = VK_ENG_COLOR; o->snapshot = 1;
+        o->fmt = VK_FORMAT_R8G8B8A8_UNORM; o->bpp = 4; o->w = w; o->h = h;
+        fresh = 1;
+    }
+    /* As vk_eng_region_refresh: queued with the draws, so earlier draws
+     * still sample the previous contents and later ones the new. */
+    const int queued = vk_batch_clear_begin();
+    if (queued < 0 || (!queued && vk_begin())) {
+        if (fresh) vk_eng_release(user, hd);
+        return 0;
+    }
+    vk_barrier_image(z->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
+    vk_zcolor_memory_barrier();
+    VkBufferImageCopy out = { .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
+                              .imageExtent = { w, h, 1 } };
+    pvkCmdCopyImageToBuffer(s_vk.cmd, z->im.img, VK_IMAGE_LAYOUT_GENERAL, s_zc.buf, 1, &out);
+    vk_zcolor_memory_barrier();
+    pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_zc.pipe);
+    pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_zc.layout, 0, 1,
+                             &s_zc.set, 0, NULL);
+    pvkCmdDispatch(s_vk.cmd, row, rows, 1);
+    vk_zcolor_memory_barrier();
+    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT,
+                     fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL);
+    VkBufferImageCopy in = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                             .imageExtent = { w, h, 1 } };
+    pvkCmdCopyBufferToImage(s_vk.cmd, s_zc.buf, o->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &in);
+    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    if (queued) {
+        if (++s_batch.clear_commands >= s_batch.limit) vk_batch_flush_as(8);
+    } else if (vk_submit_and_wait()) {
+        if (fresh) vk_eng_release(user, hd);
+        return 0;
+    }
+    return hd;
+}
+
 /* A pixel program with a cube unit declares all sixteen units one by one
  * (TextureCube or Texture2D rsx_texN : register(tN)) instead of the
  * Texture2D array, and register(tN) is binding RSX_SPIRV_TEXTURE_BINDING + N
@@ -4684,6 +4909,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .readback             = vk_eng_readback,
     .depth_readback       = vk_eng_depth_readback,
     .color_target_write   = vk_eng_color_target_write,
+    .depth_color_copy     = vk_eng_depth_color_copy,
 };
 
 static rsx_backend s_vulkan_backend = {

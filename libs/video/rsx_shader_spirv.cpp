@@ -74,8 +74,9 @@ int translate(const char* hlsl, int stage, std::vector<unsigned int>& spirv,
         return -1;
     }
 
-    const EShLanguage lang = (stage == RSX_SHADER_STAGE_VERTEX) ? EShLangVertex
-                                                                : EShLangFragment;
+    const EShLanguage lang = stage == RSX_SHADER_STAGE_VERTEX ? EShLangVertex
+                           : stage == RSX_SHADER_STAGE_COMPUTE ? EShLangCompute
+                                                               : EShLangFragment;
     const EShMessages msgs =
         (EShMessages)(EShMsgSpvRules | EShMsgVulkanRules | EShMsgReadHlsl);
 
@@ -241,7 +242,8 @@ extern "C" int rsx_hlsl_to_spirv(const char* hlsl, int stage,
         put_log(log, log_size, "bad arguments", nullptr);
         return -1;
     }
-    if (stage != RSX_SHADER_STAGE_VERTEX && stage != RSX_SHADER_STAGE_FRAGMENT) {
+    if (stage != RSX_SHADER_STAGE_VERTEX && stage != RSX_SHADER_STAGE_FRAGMENT &&
+        stage != RSX_SHADER_STAGE_COMPUTE) {
         put_log(log, log_size, "unknown shader stage", nullptr);
         return -1;
     }
