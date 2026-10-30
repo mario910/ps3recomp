@@ -128,12 +128,56 @@ static void execute(Batch* batch, unsigned index)
     abort(); /* claim() cannot produce an index outside validated ranges */
 }
 
+/* A chain separated by SYNCs arrives as many short stages (Buzz's studio:
+ * ~165 per frame, ~14 jobs each), so lanes go idle at every stage boundary.
+ * Sleeping on the condition variable there costs an OS wake-up per lane per
+ * stage. SPURS_POOL_SPIN_US=n first polls for new work for up to n us. The
+ * polling lanes occupy cores, so it applies only with 12+ logical processors,
+ * where the guest PPU, RSX and audio threads keep cores of their own. */
+static uint64_t spin_ticks(void)
+{
+    static uint64_t ticks = UINT64_MAX;
+    if (ticks == UINT64_MAX) {
+        const char* e = getenv("SPURS_POOL_SPIN_US");
+        LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+        const long us = e ? atol(e) : 0;
+        const DWORD cpus = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+        ticks = us > 0 && us <= 100000 && cpus >= 12
+            ? (uint64_t)f.QuadPart * (uint64_t)us / 1000000u : 0;
+        if (us > 0)
+            fprintf(stderr, "[job-pool] idle lanes poll %ld us before sleeping%s (%lu logical processors)\n",
+                    ticks ? us : 0L, ticks ? "" : ": off, too few processors", (unsigned long)cpus);
+    }
+    return ticks;
+}
+
+/* Lock-free hint only: the caller re-checks under pool.lock. */
+static void spin_for_work(unsigned lane_bit)
+{
+    const uint64_t ticks = spin_ticks();
+    if (!ticks) return;
+    LARGE_INTEGER start, now;
+    QueryPerformanceCounter(&start);
+    for (;;) {
+        for (int n = 0; n < 32; ++n) {
+            if ((__atomic_load_n(&pool.head, __ATOMIC_ACQUIRE) &&
+                 !(__atomic_load_n(&pool.borrowed_lanes, __ATOMIC_RELAXED) & lane_bit)) ||
+                __atomic_load_n(&pool.stopping, __ATOMIC_RELAXED))
+                return;
+            YieldProcessor();
+        }
+        QueryPerformanceCounter(&now);
+        if ((uint64_t)(now.QuadPart - start.QuadPart) >= ticks) return;
+    }
+}
+
 static DWORD WINAPI job_worker(LPVOID argument)
 {
     const unsigned lane_bit = 1u << (unsigned)(uintptr_t)argument;
     in_worker = 1;
     spurs_job_set_spu_num((uint32_t)(uintptr_t)argument);
     for (;;) {
+        spin_for_work(lane_bit);
         AcquireSRWLockExclusive(&pool.lock);
         while (!pool.stopping && (!pool.head || (pool.borrowed_lanes & lane_bit)))
             SleepConditionVariableSRW(&pool.work, &pool.lock, INFINITE, 0);
@@ -189,6 +233,7 @@ int spurs_job_pool_run_sequence(uint32_t instance, unsigned nspus, unsigned work
         pool.instance = instance;
         const char* help = getenv("SPURS_POOL_CALLER_HELP");
         pool.caller_help = help && help[0] && help[0] != '0';
+        (void)spin_ticks();   /* read once, before any lane polls */
         for (unsigned n = 0; n < workers; ++n) {
             HANDLE thread = CreateThread(NULL, 1024 * 1024, job_worker,
                                           (LPVOID)(uintptr_t)(n + 1), 0, NULL);
