@@ -1,6 +1,10 @@
 #include "spurs_command_wait.h"
 #include "../platform/win32_compat.h"
 #include <string.h>
+#include <stdlib.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 enum { WAITERS = 32 };
 typedef struct { uint32_t pc, chain; int active; CONDITION_VARIABLE wake; } Waiter;
@@ -52,9 +56,58 @@ void spurs_command_dma_written(uint32_t ea, uint32_t size)
     }
 }
 
+static unsigned logical_processors(void)
+{
+#ifdef _WIN32
+    return (unsigned)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+#else
+    const long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (unsigned)n : 1u;
+#endif
+}
+
+/* SPURS_JTS_SPIN_US=n: poll the slot for up to n us before parking, as
+ * SPURS_POOL_SPIN_US does for pool lanes; a publication usually lands within
+ * one stage of the other chain, sooner than an OS wake-up. 12+ logical
+ * processors only. Guest memory is read with atomic loads so the poll cannot
+ * be hoisted; the caller re-reads the slot either way. */
+static uint64_t spin_ticks(void)
+{
+    static uint64_t ticks = UINT64_MAX;
+    uint64_t t = __atomic_load_n(&ticks, __ATOMIC_RELAXED);
+    if (t == UINT64_MAX) {
+        const char* e = getenv("SPURS_JTS_SPIN_US");
+        LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+        const long us = e ? atol(e) : 0;
+        t = us > 0 && us <= 100000 && logical_processors() >= 12
+            ? (uint64_t)f.QuadPart * (uint64_t)us / 1000000u : 0;
+        __atomic_store_n(&ticks, t, __ATOMIC_RELAXED);
+    }
+    return t;
+}
+
+static int published(const uint8_t* memory, uint32_t pc, uint32_t chain, uint64_t published_pc)
+{
+    return __builtin_bswap64(__atomic_load_n((const uint64_t*)(memory + pc), __ATOMIC_ACQUIRE)) != 0x800000012ull ||
+           __builtin_bswap64(__atomic_load_n((const uint64_t*)(memory + chain), __ATOMIC_ACQUIRE)) != published_pc;
+}
+
 void spurs_command_wait(const uint8_t* memory, uint32_t pc, uint32_t chain,
                         uint64_t published_pc, unsigned timeout_ms)
 {
+    const uint64_t ticks = !((pc | chain) & 7) ? spin_ticks() : 0;
+    if (ticks) {
+        LARGE_INTEGER start, now;
+        QueryPerformanceCounter(&start);
+        for (;;) {
+            for (int n = 0; n < 32; ++n) {
+                if (published(memory, pc, chain, published_pc)) return;
+                YieldProcessor();
+            }
+            QueryPerformanceCounter(&now);
+            if ((uint64_t)(now.QuadPart - start.QuadPart) >= ticks) break;
+        }
+    }
     AcquireSRWLockExclusive(&lock);
     unsigned i = 0;
     for (; i < WAITERS && waiters[i].active; ++i) {}

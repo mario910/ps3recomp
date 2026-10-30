@@ -6,6 +6,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 extern void spurs_job_set_spu_num(uint32_t);
 extern uint32_t spurs_job_get_spu_num(void);
@@ -128,6 +131,16 @@ static void execute(Batch* batch, unsigned index)
     abort(); /* claim() cannot produce an index outside validated ranges */
 }
 
+static unsigned logical_processors(void)
+{
+#ifdef _WIN32
+    return (unsigned)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+#else
+    const long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (unsigned)n : 1u;
+#endif
+}
+
 /* A chain separated by SYNCs arrives as many short stages (Buzz's studio:
  * ~165 per frame, ~14 jobs each), so lanes go idle at every stage boundary.
  * Sleeping on the condition variable there costs an OS wake-up per lane per
@@ -141,7 +154,7 @@ static uint64_t spin_ticks(void)
         const char* e = getenv("SPURS_POOL_SPIN_US");
         LARGE_INTEGER f; QueryPerformanceFrequency(&f);
         const long us = e ? atol(e) : 0;
-        const DWORD cpus = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+        const unsigned cpus = logical_processors();
         ticks = us > 0 && us <= 100000 && cpus >= 12
             ? (uint64_t)f.QuadPart * (uint64_t)us / 1000000u : 0;
         if (us > 0)
