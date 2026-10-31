@@ -68,6 +68,15 @@ unsigned ps3_host_get_texture_pack(const char** dir) {
     if(dir)*dir=s_texture_pack_dir;
     return (unsigned)host_load(&s_texture_pack_flags);
 }
+static host_atomic_int s_texture_pack_generation;
+void ps3_host_texture_pack_changed(void) {
+#ifdef _WIN32
+    InterlockedIncrement(&s_texture_pack_generation);
+#else
+    __atomic_add_fetch(&s_texture_pack_generation,1,__ATOMIC_ACQ_REL);
+#endif
+}
+unsigned ps3_host_texture_pack_generation(void) {return (unsigned)host_load(&s_texture_pack_generation);}
 ps3_host_rect ps3_host_fit_rect(unsigned tw,unsigned th,unsigned sw,unsigned sh) {
     ps3_host_rect r={0,0,tw,th};
     if(!tw||!th||!sw||!sh)return r;

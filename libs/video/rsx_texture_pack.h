@@ -27,6 +27,11 @@
  * family and DXT (whose blocks are decoded on the CPU), one channel for B8,
  * two for G8B8. Its full mip chain is built by box filtering.
  *
+ * replace/ is rescanned when ps3_host_texture_pack_changed() is signalled,
+ * so files added while running (an automatic upscaler writing replace/auto)
+ * apply from the next upload of their texture. A hand-made file wins over
+ * replace/auto's file of the same name.
+ *
  * Configured through ps3_host_set_texture_pack(); RSX_TEXPACK_DIR,
  * RSX_TEXPACK_DUMP=0/1 and RSX_TEXPACK_REPLACE=0/1 override it. Called on
  * the render thread only.

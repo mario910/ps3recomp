@@ -40,6 +40,11 @@ void ps3_host_get_upscaler(unsigned* filter,unsigned* sharpness);
 enum { PS3_HOST_TEXPACK_REPLACE = 1, PS3_HOST_TEXPACK_DUMP = 2 };
 int ps3_host_set_texture_pack(const char* dir,unsigned flags); /* 0 on invalid */
 unsigned ps3_host_get_texture_pack(const char** dir);
+/* Any thread: files were added to replace/ while running. The renderer
+ * rescans it before its next texture upload; a texture already uploaded
+ * picks its replacement up the next time the game uploads it. */
+void ps3_host_texture_pack_changed(void);
+unsigned ps3_host_texture_pack_generation(void);
 /* Destination rectangle that fits a source aspect ratio into a target,
  * centred, with bars on the remaining sides. Never larger than the target. */
 typedef struct ps3_host_rect {int x,y;unsigned width,height;} ps3_host_rect;

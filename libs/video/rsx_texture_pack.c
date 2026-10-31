@@ -35,11 +35,17 @@
 #define TP_SCAN_DEPTH      4       /* replace/ subfolder levels searched    */
 
 typedef struct { u64 key; char* path; u32 count; } tp_entry;   /* key 0 = empty */
+/* Replacement entries' count: where the file came from and whether it failed. */
+#define TP_AUTO            1u      /* replace/auto, the automatic upscaler's */
+#define TP_FAILED          2u      /* failed to load; not tried again        */
 typedef struct { tp_entry* e; u32 cap, n; } tp_table;
 
 static struct {
-    int ready, dump, replace;
+    int ready, dump, replace, replace_wanted;
+    unsigned generation;     /* ps3_host_texture_pack_generation() scanned */
     char dir[1024];
+    char auto_dir[1100];     /* "<dir>/replace<sep>auto<sep>" path prefix  */
+    size_t auto_len;
     tp_table replacements;   /* id -> replace/ file           */
     tp_table dumped;         /* ids already in dump/ (no path) */
     tp_table addresses;      /* where -> count of dumps there  */
@@ -94,11 +100,13 @@ static void tp_mkdir(const char* path)
 }
 #define TP_RB L"rb"
 #define TP_WB L"wb"
+#define TP_SEP "\\"
 #else
 static FILE* tp_fopen(const char* path, const char* mode) { return fopen(path, mode); }
 static void tp_mkdir(const char* path) { mkdir(path, 0755); }
 #define TP_RB "rb"
 #define TP_WB "wb"
+#define TP_SEP "/"
 #endif
 
 /* "<16 hex>_<w>x<h>_<2 hex>.png" -> id key; 0 when the name is not one. */
@@ -162,19 +170,38 @@ static void tp_scan(const char* dir, int depth, void (*fn)(const char* path, con
 #endif
 }
 
+/* user is non-NULL on a rescan, which only adds what is new. */
 static void tp_index_replacement(const char* path, const char* name, void* user)
 {
-    (void)user;
     const u64 key = tp_name_key(name);
     if (!key) return;
+    const u32 made = strncmp(path, s_tp.auto_dir, s_tp.auto_len) ? 0u : TP_AUTO;
     tp_entry* e = tp_insert(&s_tp.replacements, key);
-    if (!e || e->path) {
-        if (e) fprintf(stderr, "[texpack] duplicate replacement %s ignored\n", path);
-        return;
+    if (!e || (e->count & TP_FAILED)) return;
+    if (e->path) {
+        /* A hand-made file wins over replace/auto's upscale of the same
+         * texture, whichever the scan meets first. */
+        if ((e->count & TP_AUTO) && !made) {
+            free(e->path);
+            e->path = NULL;
+        } else {
+            if (!user && !made && !(e->count & TP_AUTO))
+                fprintf(stderr, "[texpack] duplicate replacement %s ignored\n", path);
+            return;
+        }
     }
     const size_t n = strlen(path) + 1;
     e->path = (char*)malloc(n);
     if (e->path) memcpy(e->path, path, n);
+    e->count = made;
+}
+
+static void tp_scan_replacements(int rescan)
+{
+    char sub[1100];
+    snprintf(sub, sizeof sub, "%s/replace", s_tp.dir);
+    tp_scan(sub, TP_SCAN_DEPTH, tp_index_replacement, rescan ? (void*)sub : NULL);
+    s_tp.replace = s_tp.replacements.n != 0;
 }
 static void tp_index_dump(const char* path, const char* name, void* user)
 {
@@ -198,12 +225,12 @@ static void tp_init(void)
     if (env_dir && *env_dir && !flags && !env_replace) s_tp.replace = 1;
     if (!dir || !*dir || strlen(dir) >= sizeof s_tp.dir - 16) { s_tp.dump = s_tp.replace = 0; return; }
     strcpy(s_tp.dir, dir);
+    snprintf(s_tp.auto_dir, sizeof s_tp.auto_dir, "%s/replace" TP_SEP "auto" TP_SEP, s_tp.dir);
+    s_tp.auto_len = strlen(s_tp.auto_dir);
     char sub[1100];
-    if (s_tp.replace) {
-        snprintf(sub, sizeof sub, "%s/replace", s_tp.dir);
-        tp_scan(sub, TP_SCAN_DEPTH, tp_index_replacement, NULL);
-        if (!s_tp.replacements.n) s_tp.replace = 0;
-    }
+    s_tp.replace_wanted = s_tp.replace;
+    s_tp.generation = ps3_host_texture_pack_generation();
+    if (s_tp.replace) tp_scan_replacements(0);
     if (s_tp.dump) {
         tp_mkdir(s_tp.dir);
         snprintf(sub, sizeof sub, "%s/dump", s_tp.dir);
@@ -217,6 +244,17 @@ static void tp_init(void)
 int rsx_texpack_enabled(void)
 {
     if (!s_tp.ready) tp_init();
+    /* Files added while running: the automatic upscaler's, or by hand. */
+    if (s_tp.replace_wanted) {
+        const unsigned generation = ps3_host_texture_pack_generation();
+        if (generation != s_tp.generation) {
+            s_tp.generation = generation;
+            const u32 before = s_tp.replacements.n;
+            tp_scan_replacements(1);
+            if (s_tp.replacements.n != before)
+                fprintf(stderr, "[texpack] %u new replacements\n", s_tp.replacements.n - before);
+        }
+    }
     return s_tp.dump || s_tp.replace;
 }
 
@@ -489,6 +527,7 @@ int rsx_texpack_lookup(u64 where, const u8* src, u32 rsx_fmt, u32 w, u32 h, u32 
             fprintf(stderr, "[texpack] %s failed to load; using the game's texture\n", e->path);
             free(e->path);
             e->path = NULL;   /* once is enough */
+            e->count |= TP_FAILED;
         }
     }
 
