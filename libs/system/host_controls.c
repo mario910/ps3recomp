@@ -1,4 +1,5 @@
 #include "ps3emu/host_controls.h"
+#include <string.h>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -52,6 +53,20 @@ void ps3_host_get_upscaler(unsigned* filter,unsigned* sharpness) {
     const unsigned packed=(unsigned)host_load(&s_upscaler);
     if(filter)*filter=packed>>8;
     if(sharpness)*sharpness=packed&0xFFu;
+}
+/* Written once before the renderer starts, read on its thread afterwards. */
+static char s_texture_pack_dir[1024];
+static host_atomic_int s_texture_pack_flags;
+int ps3_host_set_texture_pack(const char* dir,unsigned flags) {
+    if(flags&~(unsigned)(PS3_HOST_TEXPACK_REPLACE|PS3_HOST_TEXPACK_DUMP))return 0;
+    const size_t n=dir?strlen(dir):0;
+    if(n>=sizeof s_texture_pack_dir||(flags&&!n))return 0;
+    memcpy(s_texture_pack_dir,dir?dir:"",n);s_texture_pack_dir[n]=0;
+    host_store(&s_texture_pack_flags,(int)flags);return 1;
+}
+unsigned ps3_host_get_texture_pack(const char** dir) {
+    if(dir)*dir=s_texture_pack_dir;
+    return (unsigned)host_load(&s_texture_pack_flags);
 }
 ps3_host_rect ps3_host_fit_rect(unsigned tw,unsigned th,unsigned sw,unsigned sh) {
     ps3_host_rect r={0,0,tw,th};

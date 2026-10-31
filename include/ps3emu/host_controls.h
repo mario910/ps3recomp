@@ -33,6 +33,13 @@ unsigned ps3_host_get_render_scale(void);
 enum { PS3_HOST_UPSCALE_BILINEAR = 0, PS3_HOST_UPSCALE_FSR1 = 1 };
 int ps3_host_set_upscaler(unsigned filter,unsigned sharpness); /* 0 on invalid */
 void ps3_host_get_upscaler(unsigned* filter,unsigned* sharpness);
+/* Texture packs (rsx_texture_pack.h). dir is UTF-8 and holds replace/ and
+ * dump/; REPLACE loads replace/<id>.png in place of matching guest
+ * textures, DUMP writes each new 2D colour texture to dump/<id>.png. Set
+ * before backend initialization; later changes apply after a restart. */
+enum { PS3_HOST_TEXPACK_REPLACE = 1, PS3_HOST_TEXPACK_DUMP = 2 };
+int ps3_host_set_texture_pack(const char* dir,unsigned flags); /* 0 on invalid */
+unsigned ps3_host_get_texture_pack(const char** dir);
 /* Destination rectangle that fits a source aspect ratio into a target,
  * centred, with bars on the remaining sides. Never larger than the target. */
 typedef struct ps3_host_rect {int x,y;unsigned width,height;} ps3_host_rect;

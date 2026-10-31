@@ -16,6 +16,7 @@
 #include "rsx_primitives.h"
 #include "rsx_restart_cuts.h"
 #include "rsx_rt_region.h"
+#include "rsx_texture_pack.h"
 #include "rsx_vertex_formats.h"
 #include "rsx_vp_decompiler.h"
 
@@ -1192,6 +1193,22 @@ static u32 eng_texture_upload_impl(u32 location, u32 offset, u32 fmt, u32 w, u32
     const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
     const u8* src = eng_guest_ptr(NULL, location, offset, span);
     if (!src) return 0;
+
+    /* A texture pack's image in place of the guest's, at its own size and
+     * with its own mip chain; the remap and format byte stay the guest's, so
+     * the view presents its channels exactly as it would have. */
+    if (!cube && rsx_texpack_enabled()) {
+        rsx_texpack_image im;
+        if (rsx_texpack_lookup(((u64)location << 32) | offset, src, fmt, w, h, pitch, &im)) {
+            const u32 handle = g.be->texture_create(g.be->user, eng_texfmt(im.fmt), im.level[0].w,
+                                                    im.level[0].h, im.levels, 1, remap, fmt);
+            for (u32 m = 0; handle && m < im.levels; m++)
+                g.be->texture_upload(g.be->user, handle, 0, m, im.level[m].w, im.level[m].h,
+                                     im.level[m].data, im.level[m].row_bytes, im.level[m].h);
+            rsx_texpack_release(&im);
+            if (handle) return handle;
+        }
+    }
 
     const u32 handle = g.be->texture_create(g.be->user, eng_texfmt(lv[0].tl.fmt),
                                             w, h, nlv, faces, remap, fmt);

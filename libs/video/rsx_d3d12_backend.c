@@ -62,6 +62,7 @@
 #include "rsx_frame_boundary.h"
 #include "rsx_host_window.h"
 #include "rsx_fsr1.h"
+#include "rsx_texture_pack.h"
 
 /* ---- persistent pipeline library (see rsx_pso_disk_cache.h) ---------------- */
 static struct {
@@ -408,6 +409,9 @@ typedef struct {
                          * shift it, so keying on off never matches the raw offset
                          * a later draw arrives with, and every draw re-uploads. */
     int used;           /* referenced this frame */
+    int repl;           /* res holds a texture pack image, not the guest's texels */
+    u32 res_mips;       /* levels in res when repl (else 1) */
+    DXGI_FORMAT res_fmt;/* res format when repl */
 } VPTexSlot;
 /* Distinct textures uploadable per frame. Four was enough for a UI/atlas-style
  * frame but not for a scene: this title binds ~20 distinct textures per frame,
@@ -1897,7 +1901,7 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
             size_t budget=128u*1024u*1024u;
             for(u32 i=0;i<VP_TEX_SLOTS;++i) {
                 VPTexSlot* t=&s_d3d.vp_tex[i];
-                if(!t->used || !t->up || !t->res)continue;
+                if(!t->used || !t->up || !t->res || t->repl)continue;
                 rsx_tex_layout tl;rsx_texture_layout_pitched(t->fmt,t->w,t->h,t->source_pitch,&tl);
                 u32 pitch=(tl.dst_row_bytes+255)&~255u;
                 size_t size=(size_t)pitch*tl.rows; /* face zero only */
@@ -3104,6 +3108,76 @@ static u32 tex_csum(const u8* base, u32 nbytes)
     return h;
 }
 
+/* Put a texture pack image (rsx_texture_pack.h) in slot t: its own size,
+ * format and mip chain, uploaded through a buffer of its own. The slot keeps
+ * the guest's dimensions as its cache key; repl tells the SRV what is in it. */
+static int vp_upload_texpack(VPTexSlot* t, const rsx_texpack_image* im)
+{
+    const DXGI_FORMAT dxfmt = rsx_d3d12_texture_format(im->fmt);
+    if (dxfmt == DXGI_FORMAT_UNKNOWN) return 0;
+    u64 offsets[RSX_MAX_TEXTURE_LEVELS], total = 0;
+    for (u32 m = 0; m < im->levels; m++) {
+        total = (total + 511) & ~511ull;   /* D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT */
+        offsets[m] = total;
+        total += (u64)((im->level[m].row_bytes + 255) & ~255u) * im->level[m].h;
+    }
+    if (t->res) { t->res->lpVtbl->Release(t->res); t->res = NULL; }
+    if (t->up) { t->up->lpVtbl->Release(t->up); t->up = NULL; }
+    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC td = {0};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = im->level[0].w; td.Height = im->level[0].h; td.DepthOrArraySize = 1;
+    td.MipLevels = (UINT16)im->levels; td.Format = dxfmt; td.SampleDesc.Count = 1;
+    td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+            s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+            &IID_ID3D12Resource, (void**)&t->res)))
+        return 0;
+    D3D12_HEAP_PROPERTIES hu = {0}; hu.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bd = {0};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = total;
+    bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    void* mapped = NULL; D3D12_RANGE nr = {0,0};
+    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+            s_d3d.device, &hu, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+            &IID_ID3D12Resource, (void**)&t->up)) ||
+        FAILED(t->up->lpVtbl->Map(t->up, 0, &nr, &mapped)) || !mapped) {
+        if (t->up) { t->up->lpVtbl->Release(t->up); t->up = NULL; }
+        t->res->lpVtbl->Release(t->res); t->res = NULL;
+        return 0;
+    }
+    for (u32 m = 0; m < im->levels; m++) {
+        const rsx_texpack_level* l = &im->level[m];
+        const u32 pitch = (l->row_bytes + 255) & ~255u;
+        for (u32 y = 0; y < l->h; y++)
+            memcpy((u8*)mapped + offsets[m] + (u64)y * pitch, l->data + (size_t)y * l->row_bytes, l->row_bytes);
+    }
+    t->up->lpVtbl->Unmap(t->up, 0, NULL);
+    for (u32 m = 0; m < im->levels; m++) {
+        D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
+        dst.pResource = t->res; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = m;
+        src.pResource = t->up; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Offset = offsets[m];
+        src.PlacedFootprint.Footprint.Format = dxfmt;
+        src.PlacedFootprint.Footprint.Width = im->level[m].w;
+        src.PlacedFootprint.Footprint.Height = im->level[m].h;
+        src.PlacedFootprint.Footprint.Depth = 1;
+        src.PlacedFootprint.Footprint.RowPitch = (im->level[m].row_bytes + 255) & ~255u;
+        s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
+    }
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = t->res;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
+    t->repl = 1; t->res_mips = im->levels; t->res_fmt = dxfmt;
+    return 1;
+}
+
 static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips, u32 source_pitch,
                               u32 depth)
 {
@@ -3294,6 +3368,20 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
                   start_delta, w * h * bpp, 10); } } }
     if (slot < 0) slot = freeslot;
     VPTexSlot* t = &s_d3d.vp_tex[slot];
+    if (!cube && !vol && rsx_texpack_enabled()) {
+        rsx_texpack_image im;
+        if (rsx_texpack_lookup(key_off, vm_base + off, fmt, w, h, source_pitch, &im)) {
+            const int ok = vp_upload_texpack(t, &im);
+            rsx_texpack_release(&im);
+            if (ok) {
+                t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
+                t->source_pitch = source_pitch; t->mips = mips;
+                t->cube = cube; t->depth = depth; t->used = 1;
+                t->csum = TEX_CSUM(vm_base + off, tl.face_bytes);
+                return slot;
+            }
+        }
+    }
     /* The upload buffer's rows hold the DECODED image, so they are sized from
      * dst_row_bytes -- w * bpp is the source row, which is narrower for any
      * format rsx_texture_decode unpacks. */
@@ -3304,7 +3392,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * the same dimensions would otherwise be reused with 1 array slice while the
      * cube path copies 6 subresources and writes a 6x upload buffer -- which
      * crashes. */
-    if (t->res && (t->w != w || t->h != h || t->fmt != fmt || t->cube != cube || t->depth != depth)) {
+    if (t->res && (t->w != w || t->h != h || t->fmt != fmt || t->cube != cube || t->depth != depth || t->repl)) {
         t->res->lpVtbl->Release(t->res); t->res = NULL;
         if (t->up) { t->up->lpVtbl->Release(t->up); t->up = NULL; }
     }
@@ -3335,6 +3423,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
             t->res->lpVtbl->Release(t->res); t->res = NULL; return -1;
         }
         fresh = 1;
+        t->repl = 0; t->res_mips = 1;
     }
 
     void* mapped = NULL; D3D12_RANGE nr = {0,0};
@@ -4313,14 +4402,15 @@ static D3D12_CPU_DESCRIPTOR_HANDLE off_rt_rtv(int slot)
 
 /* Write a texture SRV (or a null SRV when res == NULL) at an absolute SRV
  * heap slot. Used to fill per-draw t0-t3 descriptor windows. */
-static void srv_write_ex(u32 heap_slot, ID3D12Resource* res, DXGI_FORMAT fmt,
-                         UINT mapping, int cube)   /* cube: 1 = TextureCube, 2 = Texture3D */
+/* mips: levels a 2D view exposes; only texture pack images have more than 1. */
+static void srv_write_lv(u32 heap_slot, ID3D12Resource* res, DXGI_FORMAT fmt,
+                         UINT mapping, int cube, u32 mips)   /* cube: 1 = TextureCube, 2 = Texture3D */
 {
     D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
     sv.Format = fmt;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     sv.Shader4ComponentMapping = mapping;
-    sv.Texture2D.MipLevels = 1;
+    sv.Texture2D.MipLevels = mips ? mips : 1;
     if (cube == 2) {   /* must match the Texture3D declaration in the HLSL */
         sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
         sv.Texture3D.MipLevels = 1;
@@ -4336,6 +4426,12 @@ static void srv_write_ex(u32 heap_slot, ID3D12Resource* res, DXGI_FORMAT fmt,
     s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &h);
     h.ptr += (u64)heap_slot * s_d3d.srv_inc;
     s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, res, &sv, h);
+}
+
+static void srv_write_ex(u32 heap_slot, ID3D12Resource* res, DXGI_FORMAT fmt,
+                         UINT mapping, int cube)
+{
+    srv_write_lv(heap_slot, res, fmt, mapping, cube, 1);
 }
 
 static void srv_write(u32 heap_slot, ID3D12Resource* res, DXGI_FORMAT fmt, UINT mapping)
@@ -5172,11 +5268,12 @@ static void render_frame(void)
                     if (ts >= 0) {
                         rsx_tex_layout layout;
                         rsx_texture_layout(dr->tex[_u].fmt,dr->tex[_u].w,dr->tex[_u].h,&layout);
-                        DXGI_FORMAT sf = rsx_d3d12_texture_format(layout.fmt);
-                        srv_write_ex(wslot, s_d3d.vp_tex[ts].res, sf,
+                        const VPTexSlot* vt = &s_d3d.vp_tex[ts];
+                        DXGI_FORMAT sf = vt->repl ? vt->res_fmt : rsx_d3d12_texture_format(layout.fmt);
+                        srv_write_lv(wslot, vt->res, sf,
                                   (_bf == 0x81) ? 0x1000
                                                 : rsx_remap_to_d3d(dr->tex[_u].ctrl1, _bf),
-                                  _cube ? 1 : _vol ? 2 : 0);
+                                  _cube ? 1 : _vol ? 2 : 0, vt->repl ? vt->res_mips : 1);
                         continue;
                     }
                 }
