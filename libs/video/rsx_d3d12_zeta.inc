@@ -37,16 +37,18 @@ static int zeta_get(const D3D12DrawRecord*dr){
     ZetaRT*r=&s_d3d.zeta[index];
     r->ea=dr->zeta_ea;r->w=dr->zeta_w;r->h=dr->zeta_h;r->pitch=dr->zeta_pitch;r->format=dr->zeta_format;
     r->sx=rsx_zeta_scale_x(r->format);r->sy=rsx_zeta_scale_y(r->format);
+    r->pw=d3d_up(r->w);r->ph=d3d_up(r->h);
     D3D12_HEAP_PROPERTIES hp={0};hp.Type=D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC td={0};td.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    td.Width=r->w;td.Height=r->h;td.DepthOrArraySize=1;td.MipLevels=1;td.SampleDesc.Count=1;
+    td.Width=r->pw;td.Height=r->ph;td.DepthOrArraySize=1;td.MipLevels=1;td.SampleDesc.Count=1;
     td.Format=DXGI_FORMAT_R24G8_TYPELESS;td.Flags=D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     D3D12_CLEAR_VALUE cv={0};cv.Format=DXGI_FORMAT_D24_UNORM_S8_UINT;cv.DepthStencil.Depth=1;
     HRESULT hr=s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device,&hp,D3D12_HEAP_FLAG_NONE,&td,D3D12_RESOURCE_STATE_DEPTH_WRITE,
         &cv,&IID_ID3D12Resource,(void**)&r->res);
     if(FAILED(hr))goto failed;
     r->state=D3D12_RESOURCE_STATE_DEPTH_WRITE;
-    td.Width*=r->sx;td.Height*=r->sy;td.Format=DXGI_FORMAT_R8G8B8A8_UNORM;td.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    /* The packed view is the guest's bytes: guest size, never scaled. */
+    td.Width=r->w*r->sx;td.Height=r->h*r->sy;td.Format=DXGI_FORMAT_R8G8B8A8_UNORM;td.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     hr=s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device,&hp,D3D12_HEAP_FLAG_NONE,&td,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         NULL,&IID_ID3D12Resource,(void**)&r->packed);
     if(FAILED(hr))goto failed;

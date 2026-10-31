@@ -26,6 +26,36 @@ int ps3_host_set_frame_limit(unsigned value) {
 unsigned ps3_host_get_frame_limit(void){return (unsigned)host_load(&s_frame_limit);}
 void ps3_host_set_fullscreen(int value){host_store(&s_fullscreen,value!=0);}
 int ps3_host_get_fullscreen(void){return host_load(&s_fullscreen);}
+/* One word, so the window thread never sees a torn width/height pair. */
+static host_atomic_int s_window_size;
+static host_atomic_int s_render_scale = 100;
+int ps3_host_set_window_size(unsigned width,unsigned height) {
+    if((width==0)!=(height==0)||width>PS3_HOST_MAX_WINDOW_EXTENT||height>PS3_HOST_MAX_WINDOW_EXTENT)return 0;
+    host_store(&s_window_size,(int)((width<<16)|height));return 1;
+}
+void ps3_host_get_window_size(unsigned* width,unsigned* height) {
+    const unsigned packed=(unsigned)host_load(&s_window_size);
+    if(width)*width=packed>>16;
+    if(height)*height=packed&0xFFFFu;
+}
+int ps3_host_set_render_scale(unsigned percent) {
+    if(percent<100||percent>300)return 0;
+    host_store(&s_render_scale,(int)percent);return 1;
+}
+unsigned ps3_host_get_render_scale(void){return (unsigned)host_load(&s_render_scale);}
+ps3_host_rect ps3_host_fit_rect(unsigned tw,unsigned th,unsigned sw,unsigned sh) {
+    ps3_host_rect r={0,0,tw,th};
+    if(!tw||!th||!sw||!sh)return r;
+    /* Compare tw/th with sw/sh in 64-bit integers: no rounding drift. */
+    if((unsigned long long)tw*sh>(unsigned long long)th*sw) {
+        r.width=(unsigned)(((unsigned long long)th*sw+sh/2)/sh);if(!r.width)r.width=1;
+        r.x=(int)((tw-r.width)/2);
+    } else {
+        r.height=(unsigned)(((unsigned long long)tw*sh+sw/2)/sw);if(!r.height)r.height=1;
+        r.y=(int)((th-r.height)/2);
+    }
+    return r;
+}
 void ps3_host_apply_volume(float* stereo,size_t frames,float* gain) {
     if(!stereo||!gain||!frames)return;
     const float target=(float)ps3_host_get_volume()/100.0f;

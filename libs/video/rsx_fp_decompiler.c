@@ -334,13 +334,20 @@ static void decode_src(u32 w, int abs_bit, Src* s)
 /* HLSL expression for the interpolated input selected by OPDEST.INPUT_SRC.
  * The backend's passthrough VS forwards COL0/COL1/FOG/TEXCOORD0..7; WPOS maps
  * to SV_POSITION (screen-space — an approximation of the RSX window coord). */
+/* Host render scale (internal resolution / guest resolution). WPOS is the
+ * guest's window position, so a scaled target divides SV_POSITION.xy back
+ * down. At 1.0 the plain expression is emitted and every program stays
+ * byte-identical to the unscaled translation (and its cached bytecode). */
+static float s_wpos_scale = 1.0f;
+void rsx_fp_set_render_scale(float scale) { s_wpos_scale = scale > 0.0f ? scale : 1.0f; }
+
 static const char* input_expr(u32 input_src)
 {
     static const char* tc[8] = {
         "input.tc0", "input.tc1", "input.tc2", "input.tc3",
         "input.tc4", "input.tc5", "input.tc6", "input.tc7" };
     switch (input_src) {
-    case 0x0: return "input.position"; /* WPOS */
+    case 0x0: return s_wpos_scale == 1.0f ? "input.position" : "_rsx_wpos(input.position)"; /* WPOS */
     /* RSX clamps fragment color-input reads before swizzle/abs/negate.
      * Texture coordinates and the vertex output registers remain unbounded. */
     case 0x1: return "saturate(input.col0)"; /* COL0 */
@@ -1267,6 +1274,12 @@ static int rsx_fp_decompile_internal(
      * SPIR-V FragCoord (Vulkan, and Metal's [[position]] is (x, y, z, 1/w));
      * the glslang paths define RSX_FRAGCOORD_W_IS_RCP. Emitted only where the
      * body uses it, so every other program stays byte-identical. */
+    if (strstr(o.p, "_rsx_wpos(")) {
+        char wpos[96];
+        snprintf(wpos, sizeof wpos, "#define _rsx_wpos(p) float4((p).xy * %.9g, (p).zw)\n",
+                 1.0 / s_wpos_scale);
+        out_puts(&p, wpos);
+    }
     if (strstr(o.p, "_rsx_inv_w("))
         out_puts(&p,
             "#ifdef RSX_FRAGCOORD_W_IS_RCP\n"

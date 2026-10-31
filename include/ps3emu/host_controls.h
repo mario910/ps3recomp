@@ -14,6 +14,22 @@ int ps3_host_set_frame_limit(unsigned fps); /* 0 or 30; legacy initial value abo
 unsigned ps3_host_get_frame_limit(void);
 void ps3_host_set_fullscreen(int enabled);
 int ps3_host_get_fullscreen(void); /* -1 initially: keep backend's existing mode */
+/* Display (window/swapchain) size, separate from the internal render size.
+ * Windowed client size in physical pixels; 0x0 keeps the backend's default.
+ * The backend fits it to the monitor's work area and letterboxes the image.
+ * Live: the window thread polls it like the fullscreen flag. */
+#define PS3_HOST_MAX_WINDOW_EXTENT 7680u
+int ps3_host_set_window_size(unsigned width,unsigned height); /* 0 on invalid */
+void ps3_host_get_window_size(unsigned* width,unsigned* height);
+/* Internal rendering resolution, percent of the guest's surface sizes
+ * (100..300). Read once when the backend creates its targets: set it before
+ * backend initialization. Later changes apply after a restart. */
+int ps3_host_set_render_scale(unsigned percent);
+unsigned ps3_host_get_render_scale(void);
+/* Destination rectangle that fits a source aspect ratio into a target,
+ * centred, with bars on the remaining sides. Never larger than the target. */
+typedef struct ps3_host_rect {int x,y;unsigned width,height;} ps3_host_rect;
+ps3_host_rect ps3_host_fit_rect(unsigned target_w,unsigned target_h,unsigned source_w,unsigned source_h);
 /* Single mixer consumer; ramp changes over one block to avoid a hard edge.
  * gain belongs to that consumer, not to the settings-writer thread. */
 void ps3_host_apply_volume(float* stereo,size_t frames,float* gain);

@@ -45,7 +45,8 @@ static ID3D12Resource* rt_sub_source(int index,D3D12DrawRecord* dr,unsigned unit
         RtSubregion* s=&r->sub[slot];
         D3D12_HEAP_PROPERTIES hp={0};hp.Type=D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC td={0};td.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        td.Width=rect.w;td.Height=rect.h;td.DepthOrArraySize=td.MipLevels=td.SampleDesc.Count=1;
+        const D3D12_RECT hr_=d3d_up_rect(rect.x,rect.y,rect.w,rect.h);
+        td.Width=(u64)(hr_.right-hr_.left);td.Height=(u32)(hr_.bottom-hr_.top);td.DepthOrArraySize=td.MipLevels=td.SampleDesc.Count=1;
         td.Format=(DXGI_FORMAT)r->dxgi;
         HRESULT hr=s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device,&hp,D3D12_HEAP_FLAG_NONE,
             &td,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,NULL,&IID_ID3D12Resource,(void**)&s->res);
@@ -70,7 +71,8 @@ static int rt_sub_copy(int index,unsigned slot)
     D3D12_TEXTURE_COPY_LOCATION dst={0},src={0};
     dst.pResource=s->res;dst.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.pResource=r->res;src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    D3D12_BOX box={s->rect.x,s->rect.y,0,s->rect.x+s->rect.w,s->rect.y+s->rect.h,1};
+    const D3D12_RECT hr_=d3d_up_rect(s->rect.x,s->rect.y,s->rect.w,s->rect.h);
+    D3D12_BOX box={(UINT)hr_.left,(UINT)hr_.top,0,(UINT)hr_.right,(UINT)hr_.bottom,1};
     s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list,&dst,0,0,0,&src,&box);
     zeta_barrier(s->res,&s->state,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     off_rt_transition(index,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);

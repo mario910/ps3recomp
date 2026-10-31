@@ -40,6 +40,9 @@ typedef struct rsx_fp_constant_block {
  * followed by a 16-bit half-word swap, yielding a host-order instruction
  * word. The decoder operates on host-order words. */
 u32 rsx_fp_read_word(const u8* p);
+/* Host internal-resolution scale for WPOS reads (1.0 = guest pixels). Set
+ * once by the backend before any program is translated. */
+void rsx_fp_set_render_scale(float scale);
 u32 rsx_fp_sanitize_constant_word(u32 w);
 extern unsigned long long g_rsx_fp_nonfinite_constants;
 
