@@ -26,6 +26,13 @@ void ps3_host_get_window_size(unsigned* width,unsigned* height);
  * backend initialization. Later changes apply after a restart. */
 int ps3_host_set_render_scale(unsigned percent);
 unsigned ps3_host_get_render_scale(void);
+/* How the finished frame reaches the window. FSR 1 (EASU + RCAS) applies
+ * only when the output rectangle is larger than the internal resolution;
+ * otherwise, and if the backend cannot build it, the frame is bilinear.
+ * sharpness 0..100 (RCAS 2..0 stops). Live: read at every present. */
+enum { PS3_HOST_UPSCALE_BILINEAR = 0, PS3_HOST_UPSCALE_FSR1 = 1 };
+int ps3_host_set_upscaler(unsigned filter,unsigned sharpness); /* 0 on invalid */
+void ps3_host_get_upscaler(unsigned* filter,unsigned* sharpness);
 /* Destination rectangle that fits a source aspect ratio into a target,
  * centred, with bars on the remaining sides. Never larger than the target. */
 typedef struct ps3_host_rect {int x,y;unsigned width,height;} ps3_host_rect;

@@ -43,6 +43,16 @@ int ps3_host_set_render_scale(unsigned percent) {
     host_store(&s_render_scale,(int)percent);return 1;
 }
 unsigned ps3_host_get_render_scale(void){return (unsigned)host_load(&s_render_scale);}
+static host_atomic_int s_upscaler; /* filter<<8 | sharpness */
+int ps3_host_set_upscaler(unsigned filter,unsigned sharpness) {
+    if(filter>PS3_HOST_UPSCALE_FSR1||sharpness>100)return 0;
+    host_store(&s_upscaler,(int)((filter<<8)|sharpness));return 1;
+}
+void ps3_host_get_upscaler(unsigned* filter,unsigned* sharpness) {
+    const unsigned packed=(unsigned)host_load(&s_upscaler);
+    if(filter)*filter=packed>>8;
+    if(sharpness)*sharpness=packed&0xFFu;
+}
 ps3_host_rect ps3_host_fit_rect(unsigned tw,unsigned th,unsigned sw,unsigned sh) {
     ps3_host_rect r={0,0,tw,th};
     if(!tw||!th||!sw||!sh)return r;

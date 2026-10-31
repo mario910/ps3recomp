@@ -61,6 +61,7 @@
 #include "rsx_d3d12_sampler.h"
 #include "rsx_frame_boundary.h"
 #include "rsx_host_window.h"
+#include "rsx_fsr1.h"
 
 /* ---- persistent pipeline library (see rsx_pso_disk_cache.h) ---------------- */
 static struct {
@@ -388,7 +389,8 @@ typedef struct {
 #define ZETA_SRV_BASE (DRAW_SRV_BASE + MAX_DRAWS * 4)
 #define COLOR_GRID_SRV_BASE (ZETA_SRV_BASE + MAX_ZETA_RTS * 3)
 #define PRESENT_SRV_BASE (COLOR_GRID_SRV_BASE + MAX_OFF_RTS * 2)
-#define SRV_HEAP_SIZE (PRESENT_SRV_BASE + FRAME_COUNT)
+#define FSR_SRV_SLOT (PRESENT_SRV_BASE + FRAME_COUNT) /* FSR's EASU output */
+#define SRV_HEAP_SIZE (FSR_SRV_SLOT + 1)
 
 /* Per-frame VP texture slot: a guest texture uploaded for this frame's VP
  * draws (re-uploaded every frame -- gcm/cube's plasma animates in guest
@@ -508,6 +510,12 @@ typedef struct {
     u32                        swap_w, swap_h;
     ID3D12RootSignature*       present_root;
     ID3D12PipelineState*       present_pso;
+    /* FSR 1: EASU into fsr_mid (output-rectangle sized), RCAS into the
+     * swapchain. Absent when the shaders could not be built. */
+    ID3D12RootSignature*       fsr_root;
+    ID3D12PipelineState*       fsr_easu, *fsr_rcas;
+    ID3D12Resource*            fsr_mid;
+    u32                        fsr_mid_w, fsr_mid_h;
     ID3D12CommandAllocator*    cmd_allocators[FRAME_COUNT];
     ID3D12GraphicsCommandList* cmd_list;
 
@@ -1023,7 +1031,7 @@ static int init_d3d12(u32 width, u32 height)
     }
     {
         D3D12_DESCRIPTOR_HEAP_DESC sd = {0};
-        sd.NumDescriptors = FRAME_COUNT;
+        sd.NumDescriptors = FRAME_COUNT + 1; /* + FSR's EASU output */
         sd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
         hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(
             s_d3d.device, &sd, &IID_ID3D12DescriptorHeap, (void**)&s_d3d.swap_rtv_heap);
@@ -7958,6 +7966,10 @@ void rsx_d3d12_backend_shutdown(void)
     if (s_d3d.swap_rtv_heap) s_d3d.swap_rtv_heap->lpVtbl->Release(s_d3d.swap_rtv_heap);
     if (s_d3d.present_pso) s_d3d.present_pso->lpVtbl->Release(s_d3d.present_pso);
     if (s_d3d.present_root) s_d3d.present_root->lpVtbl->Release(s_d3d.present_root);
+    if (s_d3d.fsr_easu) s_d3d.fsr_easu->lpVtbl->Release(s_d3d.fsr_easu);
+    if (s_d3d.fsr_rcas) s_d3d.fsr_rcas->lpVtbl->Release(s_d3d.fsr_rcas);
+    if (s_d3d.fsr_root) s_d3d.fsr_root->lpVtbl->Release(s_d3d.fsr_root);
+    if (s_d3d.fsr_mid) s_d3d.fsr_mid->lpVtbl->Release(s_d3d.fsr_mid);
     if (s_d3d.rtv_heap) s_d3d.rtv_heap->lpVtbl->Release(s_d3d.rtv_heap);
     if (s_d3d.swap_chain) s_d3d.swap_chain->lpVtbl->Release(s_d3d.swap_chain);
     if (s_d3d.cmd_queue) s_d3d.cmd_queue->lpVtbl->Release(s_d3d.cmd_queue);
