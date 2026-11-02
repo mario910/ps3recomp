@@ -151,10 +151,10 @@ static int fsr_mid_ensure(u32 w, u32 h)
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     sv.Texture2D.MipLevels = 1;
-    D3D12_CPU_DESCRIPTOR_HANDLE h;
-    s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &h);
-    h.ptr += (SIZE_T)FSR_SRV_SLOT * s_d3d.srv_inc;
-    s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, s_d3d.fsr_mid, &sv, h);
+    D3D12_CPU_DESCRIPTOR_HANDLE srv;
+    s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &srv);
+    srv.ptr += (SIZE_T)FSR_SRV_SLOT * s_d3d.srv_inc;
+    s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, s_d3d.fsr_mid, &sv, srv);
     return 1;
 }
 
