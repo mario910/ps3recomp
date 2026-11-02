@@ -302,6 +302,8 @@ typedef struct vk_state {
     u64              window_presented;
     const char*      dump_path;
     u32              dump_every;       /* write every nth presented frame */
+    int              dump_once, dump_once_inflight;
+    uint64_t         dump_once_epoch, dump_once_deadline;
 } vk_state;
 
 static vk_state s_vk;
@@ -2764,14 +2766,14 @@ static void vk_present_window(void)
     else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
 }
 
-static void vk_dump_ppm(const unsigned char* rgba)
+static int vk_dump_ppm(const unsigned char* rgba)
 {
     const size_t row_size = (size_t)s_vk.width * 3;
     unsigned char* row = (unsigned char*)malloc(row_size);
-    if (!row) { VK_LOG("cannot allocate the frame dump row\n"); return; }
+    if (!row) { VK_LOG("cannot allocate the frame dump row\n"); return 0; }
     FILE* f = fopen(s_vk.dump_path, "wb");
-    if (!f) { VK_LOG("cannot open %s for the frame dump\n", s_vk.dump_path); free(row); return; }
-    fprintf(f, "P6\n%u %u\n255\n", s_vk.width, s_vk.height);
+    if (!f) { VK_LOG("cannot open %s for the frame dump\n", s_vk.dump_path); free(row); return 0; }
+    int ok = fprintf(f, "P6\n%u %u\n255\n", s_vk.width, s_vk.height) > 0;
     /* Diagnostics must not issue one locked CRT write per pixel. Pack RGB
      * one row at a time; the rendered image and readback stay unchanged. */
     for (u32 y = 0; y < s_vk.height; y++) {
@@ -2779,11 +2781,12 @@ static void vk_dump_ppm(const unsigned char* rgba)
         for (u32 x = 0; x < s_vk.width; x++)
             memcpy(row + (size_t)x * 3, source + (size_t)x * 4, 3);
         if (fwrite(row, 1, row_size, f) != row_size) {
-            VK_LOG("frame dump write failed\n"); break;
+            VK_LOG("frame dump write failed\n"); ok = 0; break;
         }
     }
-    fclose(f);
+    if (fclose(f)) ok = 0;
     free(row);
+    return ok;
 }
 
 /* ---------------------------------------------------------------------------
@@ -2823,12 +2826,22 @@ static void vk_present_complete_locked(void)
     __atomic_store_n(&s_vk.present_inflight, 0, __ATOMIC_RELEASE);
 
     s_vk.presented++;
-    if(s_vk.present_readback){
+    if(s_vk.present_readback || s_vk.dump_once_inflight){
         vk_invalidate(&s_vk.readback);
         const unsigned char* px = (const unsigned char*)s_vk.readback.ptr;
         size_t c = ((size_t)(s_vk.height / 2) * s_vk.width + s_vk.width / 2) * 4;
         s_vk.last_center = ((u32)px[c] << 16) | ((u32)px[c + 1] << 8) | (u32)px[c + 2];
-        if (s_vk.dump_path && (s_vk.presented % s_vk.dump_every) == 0) vk_dump_ppm(px);
+        if (s_vk.dump_once_inflight) {
+            const int ok = vk_dump_ppm(px);
+            VK_LOG("one-shot frame dump %s frame=%u elapsed_ms=%.3f continuous_readback=%d\n",
+                ok ? "complete" : "FAILED", s_vk.presented,
+                (double)(ps3_ft_now()-s_vk.dump_once_epoch)/1e6, s_vk.present_readback);
+            /* Retire even a failed write: never turn diagnostics into ongoing
+             * readback, and never let an invalid proof pass the report gate. */
+            s_vk.dump_once_deadline = 0;
+            s_vk.dump_once_inflight = 0;
+        } else if (s_vk.dump_path && !s_vk.dump_once &&
+                   (s_vk.presented % s_vk.dump_every) == 0) vk_dump_ppm(px);
     }
     vk_present_window();
 #ifdef _WIN32
@@ -2869,7 +2882,8 @@ static VkCommandBuffer vk_present_record_begin(void)
 static void vk_present_record_end(VkCommandBuffer cb)
 {
     vk_barrier_image_on(cb, s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-    if(s_vk.present_readback){
+    s_vk.dump_once_inflight = s_vk.dump_once_deadline && ps3_ft_now() >= s_vk.dump_once_deadline;
+    if(s_vk.present_readback || s_vk.dump_once_inflight){
     VkBufferImageCopy region = {
         .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         .imageExtent = { s_vk.width, s_vk.height, 1 },
@@ -5362,7 +5376,21 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     s_vk.height = (s_vk.guest_h * s_vk.scale_pct + 50) / 100;
     rsx_fp_set_render_scale((float)s_vk.scale_pct / 100.0f);
     s_vk.dump_path = getenv("PS3RECOMP_VK_DUMP");
-    if(s_vk.dump_path && !s_vk.present_readback){
+    const char* dump_once_ms = getenv("PS3RECOMP_VK_DUMP_ONCE_AT_MS");
+    if (dump_once_ms) {
+        char* end = NULL;
+        unsigned long delay = strtoul(dump_once_ms, &end, 10);
+        if (!*dump_once_ms || strspn(dump_once_ms,"0123456789") != strlen(dump_once_ms) ||
+            *end || !delay || delay > 3600000 || !s_vk.dump_path || !*s_vk.dump_path) {
+            VK_LOG("invalid one-shot dump (requires path and integer delay 1..3600000 ms)\n");
+            return -1;
+        }
+        s_vk.dump_once = 1;
+        /* Start after backend setup, near the renderer's timing epoch. */
+        s_vk.dump_once_deadline = (uint64_t)delay * 1000000ull;
+        VK_LOG("one-shot frame dump armed delay_ms=%lu continuous_readback=%d\n", delay, s_vk.present_readback);
+    }
+    if(s_vk.dump_path && !s_vk.dump_once && !s_vk.present_readback){
         s_vk.present_readback=1;VK_LOG("frame dump requires presentation readback; keeping it enabled\n");
     }
     if(!s_vk.present_readback)VK_LOG("presentation readback disabled (presented pixel diagnostics unavailable)\n");
@@ -5474,7 +5502,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     if (vk_create_image(&s_vk.depth, s_vk.depth_format, s_vk.width, s_vk.height,
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, s_vk.depth_aspect)) return -1;
-    if (s_vk.present_readback && vk_create_host_buffer(&s_vk.readback, (VkDeviceSize)s_vk.width * s_vk.height * 4u,
+    if ((s_vk.present_readback || s_vk.dump_once) && vk_create_host_buffer(&s_vk.readback, (VkDeviceSize)s_vk.width * s_vk.height * 4u,
                               VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return -1;
     if (vk_create_render_pass()) return -1;
     if (vk_create_pipeline_objects()) return -1;
@@ -5504,6 +5532,10 @@ static int vk_init_all(u32 width, u32 height, const char* title)
         if (pvkCreateSemaphore(s_vk.device, &semi, NULL, &s_vk.sem_acquire) != VK_SUCCESS ||
             vk_create_swapchain())
             vk_window_drop("the swapchain could not be created");
+    }
+    if (s_vk.dump_once) {
+        s_vk.dump_once_epoch = ps3_ft_now();
+        s_vk.dump_once_deadline += s_vk.dump_once_epoch;
     }
     return 0;
 }

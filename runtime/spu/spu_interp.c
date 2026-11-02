@@ -10,6 +10,7 @@
 #include "spu_helpers.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include "spu_interp_counts.inc"
 
 /* Channel ABI (runtime/spu/spu_channels.c); the lifter emits these same protos
  * into each generated spu_recomp.h — declared here to stay header-independent. */
@@ -391,6 +392,7 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
 }
 
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
+    const int exact_counts=spu_interp_counts_enabled();
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;
     uint64_t steps = 0;
@@ -501,6 +503,9 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
             #undef LB
             fflush(stderr); _tr--; g_spu_interp_steps=steps; return 0x2000u;
         }
+        /* Count actual executor dispatches, not compiled rejoin checks, HLE
+         * transfers or the diagnostic step-cap return above. */
+        if(exact_counts)spu_interp_count_instruction(ctx);
         if (spu_step(ctx)) {
             /* stop 0x110 = SYS_SPU_THREAD_STOP_RECEIVE_EVENT. The worker writes
              * the SPU queue number to its out-mailbox, stops, and lv2 replies
