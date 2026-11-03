@@ -6,6 +6,51 @@
 > For the game port's supported inputs and build instructions, use
 > [buzz-quizworld-recomp](https://github.com/mario910/buzz-quizworld-recomp).
 
+## Buzz fork highlights (2026-11-03)
+
+This repository supplies the SDK/runtime. The game repository owns preparation,
+the launcher, phone buzzers, question-pack tools and version-bound native
+geometry/animation adapters. **Use the SDK commit pinned by the game**, followed
+by a full regeneration/build when updating lifters or generation scripts;
+the moving `master` tip is not a substitute for that pin.
+
+- **Windows Vulkan and D3D12:** both render Buzz! Quiz World; Vulkan is the
+  game launcher's default, D3D12 its fallback. The shared draw engine and Vulkan
+  backend include batched submissions, texture reuse, compact vertex remapping
+  and GPU conversion of depth sampled as colour. Qualification remains specific
+  to the downstream game/build, rather than every PS3 title.
+- **Host controls and Vulkan pause:** shared controls expose volume, display
+  settings, frame limits and a host overlay callback. The downstream Vulkan PC
+  menu pauses guest time, vblank and audio while open; D3D12 gameplay continues.
+- **Internal render scale and FSR 1:** window/swapchain dimensions are separate
+  from internal rendering. Both renderers support bilinear presentation or AMD
+  FSR 1 (EASU + RCAS) when enlarging the finished frame.
+- **PNG texture packs on both renderers:** dump eligible 2D colour textures to
+  stable content-based names, load replacements with mipmaps, and rescan packs
+  added while running. The game's optional Real-ESRGAN worker supplies automatic
+  replacements; the SDK does not download or run that tool itself.
+- **SPURS scheduling and local-store reuse:** idle-pool/JTS polling defaults to
+  1000 µs on hosts with at least 12 logical processors and off on smaller hosts.
+  Reused job contexts clear declared regions by default. Explicit environment
+  overrides retain control of these policies.
+- **Runtime correctness and diagnostics:** callback TLS comes from the loaded
+  ELF template; SPU dispatch can identify lifted runtime-loaded code by address
+  and contents. Optional cumulative SPU executor counts (`SPU_INTERP_EXACT=1`)
+  and a single timed Vulkan frame capture support targeted verification.
+
+The qualified **EU 1.00/Vulkan/AVX2 game EXE** enables its reviewed geometry,
+animation, completion and renderer profile before constructors run. Unsupported
+native jobs retain whole lifted-job fallbacks. These adapters and their measured
+29.57 FPS menu / 34.29 FPS solo-round result at 1280×720 belong to the downstream
+port, not a general SDK performance guarantee. See the game's
+[current results](https://github.com/mario910/buzz-quizworld-recomp/blob/main/docs/native-geometry-summary.md),
+[runtime defaults](https://github.com/mario910/buzz-quizworld-recomp/blob/main/docs/native-runtime-defaults-results.md)
+and [display/texture guide](https://github.com/mario910/buzz-quizworld-recomp/blob/main/docs/pc-launcher.md#display-size-and-internal-resolution).
+
+The overview and release changelog below retain upstream context. This fork
+keeps the validated **v0.17.0 baseline plus Buzz changes**; newer v0.18.0
+ancestry does not mean that runtime/code-generator upgrade is integrated.
+
 ### *Because the Cell processor deserves a second life*
 
 > Static recompilation runtime libraries for PlayStation 3 titles.
@@ -22,7 +67,10 @@ on, or find out what people are stuck on before you duplicate the effort.
 
 **ps3recomp** is an open-source toolkit that provides the runtime libraries, system stubs, and analysis tools needed to **statically recompile PlayStation 3 games into native PC executables**.
 
-Instead of interpreting or dynamically recompiling PowerPC/SPU instructions at runtime (what emulators like RPCS3 do brilliantly), we take the opposite approach: **translate everything ahead of time** into C/C++ that compiles with your favorite compiler on any modern platform.
+The main path **translates PowerPC/SPU instructions ahead of time** into C/C++
+and links them with the runtime. SPU interpreter fallbacks remain available for
+unresolved code paths; title-specific native adapters can replace recognized
+jobs. A port still needs validation on its target platform.
 
 This is the same philosophy behind:
 - [N64Recomp](https://github.com/N64Recomp/N64Recomp) (N64 -> native)
@@ -38,15 +86,15 @@ This is the same philosophy behind:
 
 The PlayStation 3 has over **3,000 titles** and some of the most beloved games ever made. RPCS3 has done heroic work making ~70% of the library playable through emulation, but static recompilation offers something different:
 
-- **Native performance** — no runtime translation overhead
-- **Lower hardware requirements** — runs on mid-range PCs
+- **Ahead-of-time compilation** — translated paths run as compiled C/C++; fallback coverage depends on the port
+- **Performance tuning** — shared runtime improvements and title-specific native kernels; hardware requirements depend on the port
 - **Moddability** — recompiled C/C++ is infinitely more hackable than PPC binaries
 - **Preservation** — native ports survive long after emulators stop being maintained
 - **Portability** — the output is C/C++, so it can target any platform a compiler does (see [platform support](#platform-support) for where the runtime actually stands today)
 
 ## Platform support
 
-CI builds and tests every row on every pull request: Windows (clang-cl), macOS
+The inherited upstream CI matrix covers Windows (clang-cl), macOS
 arm64, Linux (GCC and Clang), and Linux with the Vulkan backend on lavapipe
 under the validation layer. A green check means the runtime built and the tests
 passed. It does not mean a game ran; the last row is the only one that claims
@@ -56,10 +104,15 @@ that.
 |---|---|---|---|
 | Runtime library builds | yes | yes | yes |
 | Lifter test suites + C unit tests | yes | yes | yes |
-| Render backend | D3D12 | Metal | Vulkan (opt-in); null (headless, CI) |
+| Render backend | Vulkan (Buzz default), D3D12 | Metal | Vulkan (opt-in); null (headless, CI) |
 | Runs a recompiled game, in this tree | **yes** | **no** | **no** |
 
-**What stops macOS and Linux running a title is the PPU boot scaffold.**
+**Buzz! Quiz World is validated on Windows only.** Its standalone launcher also
+builds on Linux, but this does not establish a Linux or Steam Deck game port.
+The SDK's generic Vulkan backend remains a CMake opt-in; the downstream Buzz
+build selects it by default.
+
+**The generic PPU boot scaffold still needs per-title integration on POSIX.**
 `ppu_loader.cpp`, `boot_main.cpp` and the HLE dispatch are compiled per game,
 not into the library. They compile on POSIX with zero errors (a CI ratchet
 keeps it that way) and the frame clock runs there, but no title has yet been
@@ -247,7 +300,7 @@ HLE implementations of the PS3 system libraries, written for this project. RPCS3
 | **Fibers** | cellFiber (PPU fiber scheduler via Windows Fibers/ucontext) | ✅ Complete |
 | **AV Config** | cellAvconfExt (audio output info, gamma, sound availability) | ✅ Complete |
 | **Input Util** | cellKey2char (HID scancode → Unicode, US-101 layout) | ✅ Complete |
-| **Graphics** | cellGcmSys (cmd buffer, IO mapping, tile/zcull, flip handlers, timestamps, FIFO walker + ring recycle), RSX command processor (NV47xx parsing, state tracking, backend callbacks), **live D3D12 backend** (executes the title's real NV4097 vertex/fragment programs — indexed draws, per-draw VP constants + textures, render-to-texture, MRT, FP predication), null backend (Win32 window) | ✅ Complete |
+| **Graphics** | cellGcmSys, RSX command processor and shared draw engine; live Windows Vulkan/D3D12 backends (guest shaders, render-to-texture, MRT, depth, internal render scale, FSR 1 and texture packs); Metal and headless null backends | Implemented; validation varies by backend/title |
 | **SPURS** | cellSpurs (management APIs, event flags, task/workload tracking), cellSpursJq (job queues with wait/signal), cellDaisy (real ring buffer FIFO) | ✅ Complete |
 | **Core Runtime** | cellSysutil (BGM, cache, disc), cellSysmodule, sysPrxForUser (real lwmutex/lwcond/threads) | ✅ Complete |
 | **Media Pipeline** | cellPamf (PAMF header + stream descriptors), cellDmux (callback sequencing), cellVdec (H.264/MPEG-2 through FFmpeg loaded at run time, opt-in), cellAtrac (ATRAC3plus, all-in-memory), cellAdec (callbacks, no decode yet), cellSail (state machine) | 🔨 Partial |
@@ -274,7 +327,7 @@ We've written extensive docs covering every aspect of the project. Whether you'r
 | **[NID System](docs/NID_SYSTEM.md)** | How PS3 function linking works, NID computation, module registration framework |
 | **[Module Reference](docs/MODULES_REFERENCE.md)** | Detailed documentation for every HLE module — what they do and how they're implemented |
 | **[Module Status](docs/MODULE_STATUS.md)** | Quick-reference status table for all modules |
-| **[RSX Graphics](docs/RSX_GRAPHICS.md)** | RSX GPU translation architecture: command processor, D3D12 and Metal backends, shader strategy |
+| **[RSX Graphics](docs/RSX_GRAPHICS.md)** | RSX GPU translation architecture and shader strategy; see the fork highlights above for newer Vulkan/display features |
 | **[Tools Reference](docs/TOOLS.md)** | Every recompiler pipeline tool documented: ELF parser, disassembler, lifter, NID database |
 | **[SPU Lifter](docs/SPU_LIFTER.md)** | SPU ISA decoding/lifting, the runtime model (local store, channels, DMA, per-image dispatch), and the SPU tests |
 | **[Platform Abstraction](docs/PLATFORM_ABSTRACTION.md)** | How we handle Win32 vs POSIX: threading, sockets, timers, audio, memory, fibers |
@@ -287,16 +340,25 @@ We've written extensive docs covering every aspect of the project. Whether you'r
 
 ## Getting Started
 
-**Downloads:** each [release](https://github.com/sp00nznet/ps3recomp/releases/latest)
+For Buzz! Quiz World preparation, build, launch and update instructions, use
+the [game repository's README](https://github.com/mario910/buzz-quizworld-recomp#build-and-play).
+It defines the supported inputs, Windows toolchain and pinned SDK commit.
+
+**Upstream downloads:** each [upstream release](https://github.com/sp00nznet/ps3recomp/releases/latest)
 includes a prebuilt SDK bundle per platform (`ps3recomp-<version>-win-x64.zip`,
 `-mac-arm64.zip`, `-linux-x64.zip`) plus `SHA256SUMS.txt`. A bundle contains the
 runtime library, its headers and the Python pipeline. `VERSION.txt` inside it
-says what that platform can and cannot do yet.
+says what that platform can and cannot do yet. These are upstream bundles,
+not replacements for this fork's pinned Buzz runtime.
 
 > **Prerequisites (building from source)**: Python 3.10+, CMake 3.20+, a C17/C++20 compiler (MSVC 19.x / clang-cl, GCC 12+, or Clang 15+)
 
+The following is a **generic port-template workflow**. The SDK runtime itself
+is a library; the template links it into an executable after you supply a lift.
+It is a starting scaffold for adapting a title, not the Buzz build procedure.
+
 ```bash
-git clone https://github.com/sp00nznet/ps3recomp.git
+git clone https://github.com/mario910/ps3recomp.git
 cd ps3recomp
 pip install -r requirements.txt
 
@@ -319,16 +381,29 @@ cmake -B build -G Ninja
 cmake --build build
 ```
 
+Run that template from `templates/project`, supplying the same decrypted ELF:
+
+```powershell
+# Windows, Ninja build
+.\build\MyGameRecomp.exe C:/Games/YourTitle/EBOOT.ELF
+```
+
+On POSIX the equivalent is `./build/MyGameRecomp /path/to/EBOOT.ELF`.
+Additional SPU workloads, firmware bindings and title-specific fixes may be
+needed before gameplay; successful compilation alone does not validate a port.
+
 See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for the full walkthrough.
 
 ## Game Ports Using ps3recomp
 
-*Status as of 2026-10-12. Each port's own README carries the live detail and the run recipe.*
+*Buzz fork status updated 2026-11-03; other entries retain the upstream
+2026-10-12 snapshot. Each port's README carries its own current detail.*
 
 ### In game
 
 | Game | Title ID | Status | Repo |
 |------|----------|--------|------|
+| **Buzz! Quiz World** | BCES00647, BCES00644, BCES00645 (EU 1.00); BCUS98209 (US 1.00); optional BCES00647 1.02 | Experimental Windows port, Vulkan default/D3D12 fallback. Startup films, menus, audio and solo rounds tested; standard two-player gameplay tested on Polish EU assets and US 1.00. Full-game/long-session validation continues; PSN/MyBuzz unsupported | [mario910/buzz-quizworld-recomp](https://github.com/mario910/buzz-quizworld-recomp) |
 | **The Simpsons Arcade Game** (Konami) | NPUB30563 | **Playable, and playable online.** Boots through the Konami intro and character select into Stage 1, Downtown Springfield, with its ATRAC3plus music (#186) and correct flashes and glyphs (#185). **Two players meet over [psnr](https://github.com/sp00nznet/psnr)** and play a match together: lobby, character select, the host's game setup, then Stage 1 in sync on both machines with each player's input moving their character on both screens — including with one player behind a NAT, through psnr's relay (#200, see [docs/ONLINE.md](docs/ONLINE.md)). A Konami arcade *emulator* EBOOT: the 1991 coin-op ROM lives in `SIMPSONS.SR` and the binary emulates the hardware around it | [sp00nznet/simpsonsarcade-ps3](https://github.com/sp00nznet/simpsonsarcade-ps3) |
 | **Tornado Outbreak** (Loose Cannon / Konami) | BLUS30371 | **In game, rendering correctly with no per-title overrides.** Logos and Bink intro, title, main menu, New Game (the save is created), the story intro and dialogue, then the first level under stick control at ~10–16 fps. The runtime fixes it needed — raw-SPU proxy DMA, vertex-program flow control, GPU resolve copies — are shared (#189) | [sp00nznet/tornado](https://github.com/sp00nznet/tornado) |
 
@@ -390,7 +465,7 @@ Want to port a game? Start with the [Getting Started](#getting-started) section,
 ## Building Blocks We Leverage
 
 - **RPCS3**: a behavioural reference for HLE modules and syscalls. We read what it does and then write our own. No RPCS3 (GPL) code belongs in this tree.
-- **Direct3D 12 / Metal / Vulkan**: RSX graphics translation. D3D12 is the backend that runs games in this tree today. Metal (macOS) and Vulkan (Linux, opt-in, see [docs/BUILDING.md](docs/BUILDING.md#the-vulkan-backend-linux-opt-in)) run guest shaders on the shared draw engine. CI draws with the headless null backend.
+- **Direct3D 12 / Metal / Vulkan**: RSX graphics translation. Windows Vulkan and D3D12 run Buzz! Quiz World, with Vulkan selected by default by the port. Metal (macOS) and opt-in Vulkan (Linux) run guest shaders on the shared draw engine; this fork does not claim a validated Buzz game port there. CI draws with the headless null backend.
 - **SDL2**: input and audio off Windows. `cellPad` and `cellAudio` always use their SDL2 backends on non-Windows hosts, so SDL2 is required there; on Windows they use XInput and WASAPI. SDL2 does no windowing here; each graphics backend makes its own.
 - **FFmpeg** (optional, loaded at run time): video decode for cellVdec and ATRAC3plus for cellAtrac. It is never linked and never vendored.
 
@@ -400,7 +475,7 @@ This is a massive undertaking and we need help. Here's how to get involved:
 
 - **HLE Module Authors** — Fill in the partial modules (media decode, SPURS edge cases) from documented behaviour
 - **PPU/SPU Experts** — Improve the disassembler and lifter accuracy
-- **Graphics Engineers** — Bring Metal and Vulkan to D3D12 parity, then run a title on them
+- **Graphics Engineers** — Extend backend parity, investigate visual/frame-pacing issues, and validate more titles and platforms
 - **Game Testers** — Try recompiling titles and report what breaks
 - **Documentation** — Help us map out the PS3's system library landscape
 
@@ -422,6 +497,10 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 
 ## Changelog
+
+The Buzz fork changes from 2026-10-29 through 2026-11-02 are summarized in
+[Buzz fork highlights](#buzz-fork-highlights-2026-11-03). Entries below describe
+the inherited upstream releases; they are not new fork releases.
 
 ### v0.17.0 — *"Thirty-Three"* (October 2026)
 
