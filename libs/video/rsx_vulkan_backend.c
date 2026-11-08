@@ -66,13 +66,11 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #else
-#include "ps3emu/host_overlay.h"
-#include "ps3emu/host_controls.h"
-#ifdef _WIN32
 #include "rsx_host_window.h"
 #include "rsx_fsr1.h"
 #endif
-#endif
+#include "ps3emu/host_overlay.h"
+#include "ps3emu/host_controls.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -299,6 +297,7 @@ typedef struct vk_state {
     u32              last_center;
     int              present_readback;
     u32              presented;
+    u32              frame_draw_calls,present_draw_calls;
     u64              window_presented;
     const char*      dump_path;
     u32              dump_every;       /* write every nth presented frame */
@@ -1936,6 +1935,7 @@ static int vk_guest_draw(const rsx_state* st, u32 prim, u32 first, u32 count)
     VkDeviceSize off = 0;
     pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &s_g.vertices.buf, &off);
     pvkCmdDraw(s_vk.cmd, (u32)s_g.cpu_count, 1, 0, 0);
+    s_vk.frame_draw_calls++;
     pvkCmdEndRenderPass(s_vk.cmd);
     if (vk_submit_and_wait()) return 0;
     s_g.draws++;
@@ -1984,6 +1984,7 @@ static void vk_draw(u32 prim, u32 first, u32 count)
     VkDeviceSize off = 0;
     pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &s_vk.vertices.buf, &off);
     pvkCmdDraw(s_vk.cmd, (u32)s_vk.cpu_count, 1, 0, 0);
+    s_vk.frame_draw_calls++;
     pvkCmdEndRenderPass(s_vk.cmd);
     vk_submit_and_wait();
 }
@@ -2719,7 +2720,8 @@ static void vk_present_window(void)
                                                  s_vk.overlay_pass, s_vk.sc_min_count, s_vk.sc_count };
         const ps3_host_overlay_frame frame = { s_vk.window, s_vk.device, s_vk.queue, cb, 0,
                                                s_vk.sc_extent.width, s_vk.sc_extent.height, s_vk.sc_count,
-                                               (unsigned)s_vk.sc_format, PS3_HOST_OVERLAY_VULKAN, &vulkan };
+                                               (unsigned)s_vk.sc_format, PS3_HOST_OVERLAY_VULKAN, &vulkan,
+                                               s_vk.presented,s_vk.present_draw_calls,s_vk.width,s_vk.height };
         vk_mutex_lock(&s_vk.queue_mu);
         void* dpi = rsx_host_window_dpi_enter();
         ps3_host_overlay_draw(&frame);
@@ -2906,6 +2908,10 @@ static void vk_present_record_end(VkCommandBuffer cb)
     if (vk_queue_submit(&si, s_vk.present_fence) != VK_SUCCESS) {
         VK_LOG("vkQueueSubmit (present) failed\n"); return;
     }
+    /* present_mu protects the snapshot; the next walker frame has a separate
+     * counter, so async presentation never races the draw recorder. */
+    s_vk.present_draw_calls=s_vk.frame_draw_calls;
+    s_vk.frame_draw_calls=0;
     __atomic_store_n(&s_vk.present_inflight, 1, __ATOMIC_RELEASE);
     s_vk.present_order = 1;
     if (!(s_vk.present_split && s_vk.eng_active)) vk_present_complete_locked();
@@ -5148,6 +5154,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     } else {
         pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
     }
+    s_vk.frame_draw_calls++;
     if (!keep_pass) pvkCmdEndRenderPass(s_vk.cmd);
     if (batched) {
         if (ring) {

@@ -654,6 +654,7 @@ static void* vp_record_data(void)
 }
 char g_rsx_title_base[128] = "ps3recomp";
 static u32 s_dbg_last_draws = 0;
+static u32 s_overlay_draw_calls = 0; /* across offscreen batches until present */
 static u64 s_req_verts = 0, s_req_draws = 0, s_drop_draws = 0;
 /* Raw bind offset of the duck's texture, identified by CONTENT (duck.tga is
  * overwhelmingly yellow, avg 243,191,23). VRAM offsets move between runs, so a
@@ -5476,6 +5477,7 @@ static void render_frame(void)
             u32 start_vert = dr->vb_byte_offset / VERTEX_STRIDE;
             s_d3d.cmd_list->lpVtbl->DrawInstanced(
                 s_d3d.cmd_list, dr->vertex_count, 1, start_vert, 0);
+            s_overlay_draw_calls++;
         }
     }
 
@@ -5808,6 +5810,7 @@ static void render_frame(void)
                   } }
                 s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list,
                     dr->vertex_count, 1, s_d3d.vp_record_memory?0:dr->vb_byte_offset / 256, 0);
+                s_overlay_draw_calls++;
                 if(dr->cmask){
                     if(cur_rt>=0)rt_sub_dirty(&s_d3d.off_rt[cur_rt]);
                     for(unsigned m=0;m<3;++m)if(cur_m[m]>=0)rt_sub_dirty(&s_d3d.off_rt[cur_m[m]]);
@@ -6280,6 +6283,7 @@ skip_dump_consider: ;
         HRESULT present_result=s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain,host_limit==PS3_HOST_LEGACY_FRAME_LIMIT?1:0,0);
         rsx_pso_cache_tick();
         presented=present_result==S_OK; /* not an offscreen batch or DXGI_STATUS_OCCLUDED */
+        s_overlay_draw_calls=0;
         if(presented)__atomic_fetch_add(&s_d3d.window_present_count,1,__ATOMIC_RELAXED);
         if(presented && present_start)
             ps3_ft_span(PS3_FT_PRESENT,0,(u32)s_d3d.frame_count,s_dbg_last_draws,present_start,ps3_ft_now());

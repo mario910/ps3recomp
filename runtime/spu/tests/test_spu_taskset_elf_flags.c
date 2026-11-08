@@ -10,6 +10,8 @@ typedef int32_t LONG;
 static LONG InterlockedExchange(volatile LONG* value, LONG replacement)
 { LONG old = *value; *value = replacement; return old; }
 static void Sleep(unsigned ms) { (void)ms; }
+/* Diagnostics are outside this single-threaded scheduler fixture's contract. */
+static int async_log_message(unsigned stage, int image) { (void)stage; (void)image; return 0; }
 uint8_t* vm_base;
 uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
 static unsigned dispatches;

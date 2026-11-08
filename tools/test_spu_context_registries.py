@@ -25,7 +25,7 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
         if name != 'test_spu_coherency':
             command += [str(spu / c) for c in common if not
                         (name == 'test_spu_registry_allocation' and c == 'spu_coherency.c')]
-            command += [str(root / 'runtime/platform/win32_compat.c'), '-pthread', '-lm']
+            command += [str(root / 'runtime/platform/win32_compat.c'), str(root / 'libs/system/host_controls.c'), '-pthread', '-lm']
         subprocess.run(command + ['-o', str(binary)], check=True)
         if name == 'test_spu_registry_allocation':
             for mode, diagnostic in [('mfc', 'cannot allocate private MFC engine'),

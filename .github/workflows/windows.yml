@@ -16,24 +16,32 @@ on:
     branches: [ master, main ]
   pull_request:
   workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
+    timeout-minutes: 45
     name: Windows x64 (${{ matrix.build_type }})
-    runs-on: windows-latest
+    runs-on: windows-2022
     strategy:
       fail-fast: false
       matrix:
         build_type: [Debug, Release]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       # Puts cl, the Windows SDK and the MSVC headers on PATH. clang-cl needs
       # the MSVC headers even though it is doing the compiling, and the
       # conformance suite shells out to cl to build its generated driver.
       - name: Set up MSVC environment
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: x64
 
@@ -62,7 +70,7 @@ jobs:
           ls -la build/ps3recomp_runtime.lib
           test -s build/ps3recomp_runtime.lib
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
 

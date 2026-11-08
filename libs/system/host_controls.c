@@ -21,7 +21,7 @@ int ps3_host_set_volume(unsigned value) {
 }
 unsigned ps3_host_get_volume(void){return (unsigned)host_load(&s_volume);}
 int ps3_host_set_frame_limit(unsigned value) {
-    if(value!=0&&value!=30)return 0;
+    if(value!=0&&value!=30&&value!=60)return 0;
     host_store(&s_frame_limit,(int)value);return 1;
 }
 unsigned ps3_host_get_frame_limit(void){return (unsigned)host_load(&s_frame_limit);}
@@ -154,8 +154,8 @@ int ps3_host_get_paused(void){return host_load(&s_paused);}
 
 uint64_t ps3_host_frame_deadline(ps3_host_pacer* p,uint64_t now,unsigned fps) {
     if(!p)return now;
-    if(fps!=30){p->next_ns=0;p->fps=fps;return now;}
-    const uint64_t period=1000000000ull/30;
+    if(fps!=30&&fps!=60){p->next_ns=0;p->fps=fps;return now;}
+    const uint64_t period=1000000000ull/fps;
     if(p->fps!=fps||!p->next_ns||now>=p->next_ns) {
         p->fps=fps;p->next_ns=now+period;return now;
     }

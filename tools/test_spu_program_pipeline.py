@@ -72,7 +72,8 @@ class Pipeline(unittest.TestCase):
         channels = (runtime / 'spu_channels.c').read_text()
         channels = channels[channels.index('typedef void (*spu_fn)'):
                             channels.index('/* Which image registered')]
-        (self.root / 'registry.c').write_text('#include "spu_context.h"\n#include <stdio.h>\n' + channels)
+        platform_header = (runtime.parent / 'platform/win32_compat.h').as_posix()
+        (self.root / 'registry.c').write_text(f'#define _GNU_SOURCE 1\n#define _DARWIN_C_SOURCE 1\n#include "{platform_header}"\n#include "spu_context.h"\n#include <stdio.h>\n' + channels)
         return runtime
 
     def test_exact_dedup_and_same_address_isolation(self):

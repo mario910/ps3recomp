@@ -11,18 +11,26 @@ on:
     branches: [ master, main ]
   pull_request:
   workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
+    timeout-minutes: 45
     name: macOS arm64 (${{ matrix.build_type }})
-    runs-on: macos-14          # Apple Silicon runner
+    runs-on: macos-15          # Apple Silicon runner
     strategy:
       fail-fast: false
       matrix:
         build_type: [Debug, Release]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       # glslang and spirv-cross turn the decompilers' HLSL into MSL for the
       # Metal backend's guest-shader path; without them CMake builds the
@@ -47,7 +55,7 @@ jobs:
       # endianness bugs most recently). Running them here means they guard both
       # platforms, not just whoever last ran them on Windows.
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
 
@@ -130,7 +138,9 @@ jobs:
       # a rumble lasts until the title changes it (renewed from the pad poll).
       - name: Run the pad rumble test
         run: |
-          clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_rumble libs/input/tests/test_pad_rumble.c $(sdl2-config --libs)
+          read -r -a sdl_cflags <<< "$(sdl2-config --cflags)"
+          read -r -a sdl_libs <<< "$(sdl2-config --libs)"
+          clang -std=gnu17 -I include "${sdl_cflags[@]}" -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_rumble libs/input/tests/test_pad_rumble.c "${sdl_libs[@]}"
           /tmp/test_pad_rumble
 
       # Drives a real NV4097 command buffer through cellGcm -> RSX -> the Metal
@@ -333,20 +343,20 @@ jobs:
           # swizzles and types, the dest mask, inline constants, which
           # register file the colour export comes from, and how many
           # SV_TARGETs a program that writes more than one export gets.
-          clang -std=gnu17 -Wall -Wextra -I include -o /tmp/test_fp_decompiler libs/video/tests/test_fp_decompiler.c libs/video/rsx_fp_decompiler.c
+          clang -std=gnu17 -Wall -Wextra -I include -o /tmp/test_fp_decompiler libs/video/tests/test_fp_decompiler.c libs/video/rsx_fp_decompiler.c libs/video/rsx_texture_pack.c libs/system/host_controls.c -lm
           /tmp/test_fp_decompiler
           # The register-file draw engine's platform-neutral halves against a
           # stub backend -- surface keying and reallocation, render-target
           # aliasing on a texture bind, the texture cache's revalidation and
           # eviction, the pipeline key's stability under constant changes, and
           # restart cuts bounding topology expansion. Runs on Linux too.
-          clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_draw_engine libs/video/tests/test_rsx_draw_engine.c libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
+          clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_draw_engine libs/video/tests/test_rsx_draw_engine.c libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c libs/video/rsx_texture_pack.c libs/system/host_controls.c -lm
           /tmp/test_rsx_draw_engine
           # The vertex fetch plan's stable ranges against the per-attribute
           # walk they are now computed without.
           clang -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_fetch_plan libs/video/tests/test_vertex_fetch_plan.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c
           /tmp/test_vertex_fetch_plan
-          clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
+          clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c libs/video/rsx_texture_pack.c libs/system/host_controls.c -lm
           /tmp/test_color_feedback_engine
           # The NV4097 method decoder on its own: the vertex-constant window is
           # 32 dwords and the registers after it are not constants.
@@ -415,7 +425,7 @@ jobs:
             runtime/spu/tests/test_spu_lockline_peer.c \
             runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
             runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
-            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c runtime/spu/spurs_job_ls.c libs/system/host_controls.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
             runtime/platform/win32_compat.c \
@@ -432,7 +442,7 @@ jobs:
             runtime/spu/tests/test_spu_taskset_wake.c \
             runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
             runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
-            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c runtime/spu/spurs_job_ls.c libs/system/host_controls.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
             runtime/platform/win32_compat.c \
@@ -449,7 +459,7 @@ jobs:
             runtime/spu/tests/test_spurs_signalled_atomic.c \
             runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
             runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
-            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c runtime/spu/spurs_job_ls.c libs/system/host_controls.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
             runtime/platform/win32_compat.c \
@@ -466,7 +476,7 @@ jobs:
             runtime/spu/tests/test_spurs_taskset_bits_atomic.c libs/spurs/spurs_taskset.c \
             runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
             runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
-            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c runtime/spu/spurs_job_ls.c libs/system/host_controls.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
             runtime/platform/win32_compat.c \
@@ -513,7 +523,7 @@ jobs:
             runtime/spu/tests/test_spu_mfc_slots.c \
             runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
             runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
-            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c runtime/spu/spurs_job_ls.c libs/system/host_controls.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
             runtime/platform/win32_compat.c \
@@ -531,7 +541,7 @@ jobs:
             runtime/spu/tests/test_spurs_job_stack.c \
             runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
             runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
-            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c runtime/spu/spurs_job_ls.c libs/system/host_controls.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
             runtime/platform/win32_compat.c \

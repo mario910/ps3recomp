@@ -21,6 +21,8 @@ void ps3_indirect_call(ppu_context*) { std::abort(); }
 uint64_t ppu_guest_call(uint32_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t) { std::abort(); }
 void ppu_prof_stamp(void*,unsigned) {}
 void ppu_gcm_pump() {}
+int32_t cellSpursEventFlagTryWait(void*,uint16_t*,uint32_t) { std::abort(); }
+int spurs_event_flag_busy_probe(uint32_t,uint16_t) { std::abort(); }
 uint32_t ppu_prof_resolve_host(void*) { return 0; }
 void ps3_msf(const char*,...) {}
 int spu_coh_is_reserved(uint32_t) { return 0; }

@@ -11,7 +11,7 @@ if os.name == 'nt':
 root = Path(__file__).resolve().parents[1]
 spu = root / 'runtime/spu'
 sources = ['spu_channels.c', 'spu_drain.c', 'spu_lockstep.c', 'spu_coherency.c',
-           'spu_workload.c', 'spurs_policy.c', 'spurs_job.c', 'spu_tsp_weak.c',
+           'spu_workload.c', 'spurs_policy.c', 'spurs_job.c', 'spurs_job_ls.c', 'spu_tsp_weak.c',
            'spu_vm_pagemap.c', 'spurs_policy_blob_weak.c', 'spu_interp.c']
 with tempfile.TemporaryDirectory(prefix='spu-interp-handoff-') as tmp:
     binary = Path(tmp) / 'test'
@@ -20,7 +20,7 @@ with tempfile.TemporaryDirectory(prefix='spu-interp-handoff-') as tmp:
                     '-I'+str(root/'runtime/platform'),
                     str(spu/'tests/test_spu_interpreter_handoff.c'),
                     *[str(spu / name) for name in sources],
-                    str(root/'runtime/platform/win32_compat.c'), '-pthread', '-lm',
+                    str(root/'runtime/platform/win32_compat.c'), str(root/'libs/system/host_controls.c'), '-pthread', '-lm',
                     '-o', str(binary)], check=True)
     failed = []
     for mode in ['top', 'top-zero', 'nested-return', 'nested-return-unlifted', 'nested-calls', 'stop-zero',

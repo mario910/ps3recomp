@@ -7,6 +7,8 @@ uint8_t* vm_base;
 uint32_t ppu_vm_size;
 int g_resv_store_active;
 uint32_t g_ww_lo, g_ww_hi;
+volatile uint32_t g_ppu_wake_ea[2];
+void ps3_wake_address_hle(uint32_t ea) { (void)ea; }
 void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
 int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }

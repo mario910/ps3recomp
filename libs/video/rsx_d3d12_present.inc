@@ -371,7 +371,9 @@ static void present_pass(u32 fi)
     if (ps3_host_overlay_enabled()) {
         /* The menu draws at window resolution, over the bars too. */
         const ps3_host_overlay_frame frame = {s_d3d.hwnd, s_d3d.device, s_d3d.cmd_queue, cl, rtv.ptr,
-            s_d3d.swap_w, s_d3d.swap_h, FRAME_COUNT, DXGI_FORMAT_R8G8B8A8_UNORM};
+            s_d3d.swap_w, s_d3d.swap_h, FRAME_COUNT, DXGI_FORMAT_R8G8B8A8_UNORM,
+            PS3_HOST_OVERLAY_D3D12,NULL,s_d3d.window_present_count+1,
+            s_overlay_draw_calls,s_d3d.width,s_d3d.height};
         void* dpi = rsx_host_window_dpi_enter();
         ps3_host_overlay_draw(&frame);
         rsx_host_window_dpi_leave(dpi);

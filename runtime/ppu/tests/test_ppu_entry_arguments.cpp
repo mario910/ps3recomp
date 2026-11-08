@@ -7,6 +7,8 @@
 #include "win32_compat.h"
 extern "C" {
 uint8_t* vm_base;
+uint64_t g_spurs_command_wait_lines;
+void spurs_command_written(uint32_t) { std::abort(); }
 // This loader fixture has no guest threads, SPUs, RSX, or diagnostic watchers.
 // Any attempt to use those subsystems is a test failure, not a success stub.
 uint32_t ppu_hle_inject_base=0x20000000;

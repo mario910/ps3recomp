@@ -38,6 +38,7 @@ while depth:
 func = src[m.start():i]
 
 HARNESS = r'''
+#define _InterlockedIncrement(p) __atomic_add_fetch((p), 1, __ATOMIC_RELAXED)
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

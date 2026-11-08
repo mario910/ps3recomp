@@ -10,6 +10,9 @@
 void spu_indirect_branch(spu_context*);
 void spu_halt(spu_context*);
 uint8_t* vm_base;
+/* Jobchain event delivery is outside the manufactured-policy scheduler cases. */
+int sys_event_queue_push_by_id(uint32_t id,uint64_t source,uint64_t a,uint64_t b,uint64_t c)
+{ (void)id;(void)source;(void)a;(void)b;(void)c;abort(); }
 uint32_t ppu_vm_size=0x20000;
 int g_resv_store_active;
 uint32_t g_ww_lo,g_ww_hi,g_barrier_sync_watch;

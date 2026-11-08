@@ -10,7 +10,7 @@ extern "C" {
 #define PS3_HOST_LEGACY_FRAME_LIMIT UINT32_MAX
 int ps3_host_set_volume(unsigned percent); /* 0..100; never changes device pacing */
 unsigned ps3_host_get_volume(void);
-int ps3_host_set_frame_limit(unsigned fps); /* 0 or 30; legacy initial value above */
+int ps3_host_set_frame_limit(unsigned fps); /* 0, 30 or 60; legacy initial value above */
 unsigned ps3_host_get_frame_limit(void);
 void ps3_host_set_fullscreen(int enabled);
 int ps3_host_get_fullscreen(void); /* -1 initially: keep backend's existing mode */
@@ -66,7 +66,7 @@ int64_t ps3_host_guest_counter(void);
 typedef struct ps3_host_pacer {uint64_t next_ns;unsigned fps;} ps3_host_pacer;
 /* Pure deadline arithmetic. Zero means no wait; never accumulate catch-up debt. */
 uint64_t ps3_host_frame_deadline(ps3_host_pacer*,uint64_t now_ns,unsigned fps);
-/* The embedding port applies the 30 FPS cap by holding a flip's present and
+/* The embedding port applies its 30/60 FPS cap by holding a flip's present and
  * the FIFO drain behind it until the frame is due, while vblank keeps ticking.
  * Sleeping in present instead stalled both and cost whole vblanks. */
 #ifdef __cplusplus

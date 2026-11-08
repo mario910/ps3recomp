@@ -28,6 +28,12 @@ typedef struct ps3_host_overlay_frame {
     unsigned width,height,frames_in_flight,format;
     unsigned api; /* PS3_HOST_OVERLAY_*; zero-initialized D3D12 frames stay D3D12 */
     const ps3_host_overlay_vulkan* vulkan;
+    /* Completed game-frame sequence (unchanged on paused-menu redraws).
+     * Draws count game graphics commands, across offscreen passes/batches;
+     * excludes clears, final upscaling/compositing and the host UI itself.
+     * Snapshotted by the backend, never read from a concurrently active walker. */
+    uint64_t game_frame;
+    unsigned draw_calls,render_width,render_height;
 } ps3_host_overlay_frame;
 typedef struct ps3_host_overlay_hooks {
     int (*message)(void* window,unsigned message,uintptr_t wparam,intptr_t lparam);
