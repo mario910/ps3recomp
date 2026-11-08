@@ -3,6 +3,7 @@
  * and the runtime symbols it links against. See test_np_basic_after_np_init.c.
  */
 #include "../sceNp.c"
+#include <stdlib.h>
 uint8_t* vm_base;
 #ifdef _WIN32
 volatile uint32_t g_ppu_wake_ea[2];

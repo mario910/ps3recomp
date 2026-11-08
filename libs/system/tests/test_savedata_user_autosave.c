@@ -11,6 +11,7 @@
  * save root) as argv[1] and removes it afterwards.
  */
 #include "../cellSaveData.c"
+#include <stdlib.h>
 uint8_t* vm_base;
 #ifdef _WIN32
 volatile uint32_t g_ppu_wake_ea[2];
