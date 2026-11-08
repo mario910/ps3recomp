@@ -68,11 +68,17 @@ class Pipeline(unittest.TestCase):
         workload = (runtime / 'spu_workload.c').read_text()
         workload = workload[workload.index('uint64_t spu_workload_fingerprint('):
                             workload.index('/* ---- dispatch')]
-        (self.root / 'workload.c').write_text('#include "spu_workload.h"\n#include <stdio.h>\n#include <string.h>\n' + workload)
+        platform_header = (runtime.parent / 'platform/win32_compat.h').as_posix()
+        log_header = (TOOLS.parent / 'include/ps3emu/log_first.h').as_posix()
+        prefix = (f'#define _GNU_SOURCE 1\n#define _DARWIN_C_SOURCE 1\n#include "{platform_header}"\n'
+                  f'#include "{log_header}"\n#include "spu_workload.h"\n'
+                  '#include <stdio.h>\n#include <string.h>\n#include <stdlib.h>\n')
+        # The extracted Windows cache guard references the VM for diagnostics;
+        # these registry/ELF fixtures never dispatch a DMA or run a job guard.
+        (self.root / 'workload.c').write_text(prefix + 'uint8_t* vm_base;\n' + workload)
         channels = (runtime / 'spu_channels.c').read_text()
         channels = channels[channels.index('typedef void (*spu_fn)'):
                             channels.index('/* Which image registered')]
-        platform_header = (runtime.parent / 'platform/win32_compat.h').as_posix()
         (self.root / 'registry.c').write_text(f'#define _GNU_SOURCE 1\n#define _DARWIN_C_SOURCE 1\n#include "{platform_header}"\n#include "spu_context.h"\n#include <stdio.h>\n' + channels)
         return runtime
 

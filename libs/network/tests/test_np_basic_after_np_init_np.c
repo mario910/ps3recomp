@@ -4,6 +4,10 @@
  */
 #include "../sceNp.c"
 uint8_t* vm_base;
+#ifdef _WIN32
+volatile uint32_t g_ppu_wake_ea[2];
+void ps3_wake_address_hle(uint32_t ea) { (void)ea; abort(); }
+#endif
 uint32_t ppu_vm_size;
 int g_resv_store_active;
 uint32_t g_ww_lo, g_ww_hi;

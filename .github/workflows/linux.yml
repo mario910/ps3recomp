@@ -302,7 +302,7 @@ jobs:
           # register file the colour export comes from, and how many
           # SV_TARGETs a program that writes more than one export gets. It
           # had rotted to the point of not compiling while nothing ran it.
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -o /tmp/test_fp_decompiler libs/video/tests/test_fp_decompiler.c libs/video/rsx_fp_decompiler.c libs/video/rsx_texture_pack.c libs/system/host_controls.c -lm
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -o /tmp/test_fp_decompiler libs/video/tests/test_fp_decompiler.c libs/video/rsx_fp_decompiler.c
           /tmp/test_fp_decompiler
           # The register-file draw engine's platform-neutral halves, driven
           # through its dispatch sink against a stub backend: the surface set's
@@ -467,7 +467,7 @@ jobs:
             runtime/spu/spu_channels.c runtime/spu/spu_drain.c \
             runtime/spu/spu_lockstep.c runtime/spu/spu_coherency.c \
             runtime/spu/spu_workload.c runtime/spu/spurs_policy.c \
-            runtime/spu/spurs_job.c runtime/spu/spu_tsp_weak.c \
+            runtime/spu/spurs_job.c runtime/spu/spurs_job_ls.c libs/system/host_controls.c runtime/spu/spu_tsp_weak.c \
             runtime/spu/spu_vm_pagemap.c runtime/spu/spurs_policy_blob_weak.c \
             runtime/spu/spu_interp.c runtime/spu/spu_lifted_thread.c \
             runtime/syscalls/spu_fallback.c runtime/syscalls/sdk_version_weak.c \

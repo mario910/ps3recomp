@@ -16,6 +16,11 @@ uint8_t g_vm_page_bitmap[65536 / 8];
 int g_cri_video_dma;
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
 uint32_t g_barrier_sync_watch;
+#ifdef _WIN32
+/* This DMA fixture has no PPU usleep wait sites. */
+volatile uint32_t g_ppu_wake_ea[2];
+volatile long g_ppu_wake_count_dma;
+#endif
 void (*g_spu_put_hook)(uint32_t, uint32_t);
 void (*g_spu_put_notify)(uint32_t, uint32_t);
 void (*g_spu_dma_observer)(spu_context*, uint32_t, uint32_t, uint32_t, uint32_t, const void*);
