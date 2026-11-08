@@ -13,9 +13,14 @@
 #include "../sysNet.c"
 
 #include <assert.h>
+#include <stdlib.h>
 
 /* ppu_memory.h hooks the runtime supplies; inert here. */
 uint8_t* vm_base;
+#ifdef _WIN32
+volatile uint32_t g_ppu_wake_ea[2];
+void ps3_wake_address_hle(uint32_t ea) { (void)ea; abort(); }
+#endif
 int g_resv_store_active = 0;
 uint32_t g_ww_lo = 0, g_ww_hi = 0;
 void ppu_resv_break_store(uint64_t ea) { (void)ea; }
