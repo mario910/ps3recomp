@@ -595,7 +595,12 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                               lsa, (uint32_t)ea, size, (uint32_t)spu->pc, spu->image_id, "\n");
               }
           } }
-        /* GET: main memory -> local store */
+        /* GET: main memory -> local store. The acquire keeps this copy from
+         * reading ahead of what the SPU already observed (a flag it polled
+         * with an earlier GET or GETLLAR): the MFC executes an SPU's commands
+         * in order, and x86 loads stay in order anyway, but an arm64 core may
+         * satisfy these loads first and hand the SPU stale data. Free on x86. */
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
         memcpy(ls_ptr, ea_ptr, size);
         { extern void (*g_spu_dma_observer)(spu_context*, uint32_t, uint32_t, uint32_t, uint32_t, const void*);
           if (g_spu_dma_observer) g_spu_dma_observer(spu, 1, lsa, (uint32_t)ea, size, ls_ptr); }
@@ -666,6 +671,13 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * reserved between the scan and the end of the copy. That peer's
          * snapshot may be torn, so it gets its event and loses its reservation
          * rather than committing against a line it never saw whole. */
+        /* Release first: everything this SPU wrote before (earlier PUTs among
+         * them) becomes visible no later than this PUT's bytes. On x86 stores
+         * are seen in order; on arm64 a consumer polling the PUT that comes
+         * second -- a completion word, an RSX segment's JUMP -- could see it
+         * before the data the first PUT wrote and act on stale memory. Free on
+         * x86. */
+        __atomic_thread_fence(__ATOMIC_RELEASE);
         {
             extern int  spu_coh_is_reserved(uint32_t);
             extern void spu_coh_notify_write(uint32_t);

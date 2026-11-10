@@ -1811,10 +1811,19 @@ static int gcm_get_eq_put(void)
 
 static void gcm_rsx_process_fifo_unlocked(void)
 {
+    /* Diagnostic switches, read once: this runs for every drain pass, and
+     * getenv walks the whole environment each time. */
+    static int s_opt_rate = -1, s_opt_ctxdbg, s_opt_draindbg, s_opt_scanref;
+    if (s_opt_rate < 0) {
+        s_opt_ctxdbg = getenv("GCM_CTXDBG") != NULL;
+        s_opt_draindbg = getenv("GCM_DRAINDBG") != NULL;
+        s_opt_scanref = getenv("GCM_SCANREF") != NULL;
+        s_opt_rate = getenv("GCM_RATE") != NULL;
+    }
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
       extern unsigned long long ps3_ms_now(void);
       _n++;
-      if (getenv("GCM_RATE")) {
+      if (s_opt_rate) {
           unsigned long long now = ps3_ms_now();
           if (_t0 == 0) _t0 = now;
           if (now - _t0 >= 2000) {
@@ -1855,7 +1864,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * once at init; if the title repoints gCellGcmCurrentContext at a buffer of
      * its own, every field below moves with it and the FIFO the runtime walks
      * stops being the one the title fills. Reported on change, not per tick. */
-    if (getenv("GCM_CTXDBG") && s_gcm_ctx_out_ea) {
+    if (s_opt_ctxdbg && s_gcm_ctx_out_ea) {
         static u32 last_ptr = 0xFFFFFFFFu, last_cur = 0xFFFFFFFFu;
         u32 ptr = vm_read32(s_gcm_ctx_out_ea);
         u32 cur = ptr ? vm_read32(ptr + 0x8) : 0;
@@ -1875,7 +1884,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
     static int s_drain_every = -1;
     if (s_drain_every < 0) { const char* e = getenv("GCM_DRAINDBG_EVERY");
                              s_drain_every = (e && atoi(e) > 0) ? atoi(e) : 60; }
-    if (getenv("GCM_DRAINDBG")) {
+    if (s_opt_draindbg) {
         static int n = 0;
         if (n++ % s_drain_every == 0)
             printf("[DRAIN] getoff=%08X put=%08X ref=%08X ctx.current=%08X\n",
@@ -1888,7 +1897,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * two very different causes -- we missed the command, or it was never
      * submitted -- and only a direct scan of the ring separates them. */
     { static int scanned = 0;
-      if (!scanned && getenv("GCM_SCANREF") && put >= 0x19F0) { scanned = 1;
+      if (!scanned && s_opt_scanref && put >= 0x19F0) { scanned = 1;
         unsigned found = 0;
         for (u32 io = 0; io + 8 <= put; io += 4) {
             u32 ea = gcm_io2ea(io); if (!ea) continue;
