@@ -52,9 +52,38 @@ void spu_lockline_lock(void)
 void spu_lockline_unlock(void) { _InterlockedExchange(&g_lockline, 0); }
 #else
 #include <stdatomic.h>
-static atomic_flag g_lockline = ATOMIC_FLAG_INIT;
-void spu_lockline_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_lockline, memory_order_acquire)) { } }
-void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_order_release); }
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sched.h>
+#endif
+static atomic_uint g_lockline = ATOMIC_VAR_INIT(0);
+void spu_lockline_lock(void)
+{
+    unsigned spins = 0;
+    /* Match the Windows test-and-test-and-set policy. A failed exchange must
+     * not keep bouncing a cache line between the PPU and SPU cores while the
+     * owner is still inside its compare/copy/commit transaction. Relaxed
+     * reads are hints only: only a successful acquire exchange admits entry. */
+    while (atomic_exchange_explicit(&g_lockline, 1, memory_order_acquire)) {
+        do {
+#if defined(__aarch64__)
+            __asm__ volatile("yield");
+#elif defined(__i386__) || defined(__x86_64__)
+            __asm__ volatile("pause");
+#endif
+            if (++spins >= 4096) {
+                spins = 0;
+#ifdef _WIN32
+                SwitchToThread();
+#else
+                sched_yield();
+#endif
+            }
+        } while (atomic_load_explicit(&g_lockline, memory_order_relaxed));
+    }
+}
+void spu_lockline_unlock(void) { atomic_store_explicit(&g_lockline, 0, memory_order_release); }
 #endif
 
 /* ===========================================================================

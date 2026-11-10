@@ -101,6 +101,8 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
   #include <pthread.h>
   #include <unistd.h>
   #include <time.h>
+  #include <errno.h>
+  #include "audio_block_clock.h"
   typedef pthread_t thread_t;
   typedef pthread_mutex_t mutex_t;
   #define mutex_init(m)    pthread_mutex_init(m, NULL)
@@ -635,23 +637,68 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     return 0;
 }
 #else
+static uint64_t audio_monotonic_ns(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+}
+
 static void* audio_mix_thread_func(void* arg)
 {
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
+    const int report_rate = getenv("AUDIO_RATE") != NULL;
+    uint64_t rate_start = audio_monotonic_ns();
+    unsigned rate_blocks = 0;
+    audio_block_clock fallback_clock = {0};
 
     while (s_mix_thread_running) {
-        if (ps3_host_get_paused()) { usleep(5000); continue; }   /* host pause */
+        if (ps3_host_get_paused()) {
+            fallback_clock = (audio_block_clock){0};
+            usleep(5000);
+            continue;
+        }
+        /* SDL queues without bound. Wait BEFORE advancing guest buffers and
+         * issuing period events, as the WASAPI path does. A full queue is not
+         * a reason to generate another block every five milliseconds. */
+        const int room = audio_backend_room();
+        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) {
+            audio_backend_wait();
+            continue;
+        }
+        if (room < 0) {
+            /* A failed/missing output device still needs real-time events,
+             * not the old ~500 Hz polling loop. No catch-up after a stall. */
+            const uint64_t due = audio_block_clock_take(&fallback_clock, audio_monotonic_ns());
+            uint64_t now;
+            while (s_mix_thread_running && (now = audio_monotonic_ns()) < due) {
+                const uint64_t remaining = due - now;
+                struct timespec delay = {(time_t)(remaining / UINT64_C(1000000000)),
+                                         (long)(remaining % UINT64_C(1000000000))};
+                while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+            }
+            if (!s_mix_thread_running) break;
+            if (ps3_host_get_paused()) continue;
+        } else {
+            fallback_clock = (audio_block_clock){0};
+        }
         audio_mix_one_block();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         audio_notify_event_queues();
 
-        u32 queued = audio_backend_queued_samples();
-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-            usleep(5000);
-        } else {
-            usleep(2000);
+        if (report_rate) {
+            const uint64_t now = audio_monotonic_ns();
+            ++rate_blocks;
+            if (now - rate_start >= UINT64_C(5000000000)) {
+                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), queued %u samples\n",
+                        rate_blocks * 1e9 / (double)(now - rate_start),
+                        (unsigned)audio_backend_queued_samples());
+                rate_blocks = 0;
+                rate_start = now;
+            }
         }
+
     }
 
     printf("[cellAudio] Mixing thread stopped\n");
