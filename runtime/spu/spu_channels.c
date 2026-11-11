@@ -111,12 +111,26 @@ void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc
 static SPU_TLS jmp_buf s_spu_halt_env;
 static SPU_TLS int     s_spu_halt_armed = 0;
 
+/* The halt is a plain non-local return on the thread that armed it, never
+ * out of a signal handler, so the signal mask is the same at both ends.
+ * bionic and the BSDs implement setjmp as sigsetjmp(env, 1): two
+ * rt_sigprocmask system calls around every SPU job and SPU thread quantum
+ * (through ART's sigchain on Android), ~3% of a SPURS lane. The underscore
+ * forms keep the registers and skip the mask. */
+#if defined(_WIN32)
+#  define spu_halt_setjmp(env)        setjmp(env)
+#  define spu_halt_longjmp(env, v)    longjmp((env), (v))
+#else
+#  define spu_halt_setjmp(env)        _setjmp(env)
+#  define spu_halt_longjmp(env, v)    _longjmp((env), (v))
+#endif
+
 /* A non-local return replaces the old host call chain without changing
  * any architectural registers, local store, or pending guest work. */
 void spu_restart_dispatch(spu_context* ctx)
 {
     g_spu_trampoline_fn = 0;
-    if (s_spu_halt_armed) longjmp(s_spu_halt_env, 2);
+    if (s_spu_halt_armed) spu_halt_longjmp(s_spu_halt_env, 2);
     fprintf(stderr, "[spu] non-local return outside execution driver at 0x%05X\n", ctx->pc);
     ctx->status = SPU_STATUS_STOPPED_BY_HALT;
 }
@@ -162,7 +176,7 @@ void spu_halt(spu_context* ctx)
                 ctx->gpr[80]._u32[0], ctx->gpr[85]._u32[0]);
         fflush(stderr);
       } }
-    if (s_spu_halt_armed) { s_spu_halt_armed = 0; longjmp(s_spu_halt_env, 1); }
+    if (s_spu_halt_armed) { s_spu_halt_armed = 0; spu_halt_longjmp(s_spu_halt_env, 1); }
 }
 
 /* Diagnostic: dump the taskset-policy scheduler's working tables (LS 0x2700..)
@@ -252,7 +266,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * executes at a time. No-op when unarmed. The thread-local halt env above
      * makes a token pause/resume mid-run safe. */
     yz_lockstep_register(ctx);
-    switch (setjmp(s_spu_halt_env)) {
+    switch (spu_halt_setjmp(s_spu_halt_env)) {
     case 1:
         halted = 1;
         g_spu_trampoline_fn = 0;
@@ -1675,7 +1689,7 @@ void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
         if (ctx->pc == s_stack_reset[i].entry &&
             fn == spu_lookup(ctx->pc, s_stack_reset[i].image_id)) {
             g_spu_trampoline_fn = 0;
-            longjmp(s_spu_halt_env, 2);
+            spu_halt_longjmp(s_spu_halt_env, 2);
         }
 }
 
@@ -2455,7 +2469,7 @@ void spu_indirect_branch(spu_context* ctx)
              * Resume at depth zero so SPU_RET follows the restored guest link. */
             ctx->resident_task = ti;
             g_spu_trampoline_fn = 0;
-            longjmp(s_spu_halt_env, 2);
+            spu_halt_longjmp(s_spu_halt_env, 2);
         }
         if (!ti && !ctx->resident_task) ti = spu_taskset_task_image(ctx->pc);
         if (ti) ctx->resident_task = ti;

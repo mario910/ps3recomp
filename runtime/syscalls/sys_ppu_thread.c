@@ -118,6 +118,11 @@ static void* ppu_host_thread_proc(void* param)
      * then dies silently with an access violation INSIDE the handler and the
      * backtrace that would name the recursing function is lost. */
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+#else
+    /* The POSIX branch creates this thread with pthread_create, so there is
+     * no handle for the creator to name it through, and a new thread inherits
+     * its creator's name: it names itself. */
+    ps3_thread_name(GetCurrentThread(), "PPU %s", info->name);
 #endif
 
     /* Register this thread's context for lwarx/stwcx cross-thread reservation

@@ -1061,7 +1061,12 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
     return 0;
 }
 #else
-static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
+static void* spu_async_thread(void* p)
+{
+    ps3_thread_name(GetCurrentThread(), "SPU workload");    /* pthread_create'd: names itself */
+    spu_async_run((spu_async_job*)p);
+    return NULL;
+}
 #endif
 
 int spu_workload_job_image(const uint8_t* image, uint32_t size)

@@ -714,6 +714,8 @@ static void* spu_exec_thread_proc(void* arg)
 {
 #ifdef _WIN32
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
+#else
+    ps3_thread_name(GetCurrentThread(), "SPU thread");      /* pthread_create'd: names itself */
 #endif
     spu_thread_t* t = (spu_thread_t*)arg;
     spu_lifted_thread_result r;
