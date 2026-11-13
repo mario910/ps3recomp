@@ -393,6 +393,8 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
     const __m128i idx = _mm_xor_si128(_mm_and_si128(C, _mm_set1_epi8(0x0F)), _mm_set1_epi8(3));
     const __m128i fromb = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8(0x10)), _mm_set1_epi8(0x10));
     __m128i r = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(B, idx), fromb);
+    /* Generate-control and most constant masks have no selector >= 0x80. */
+    if (__builtin_expect(!_mm_movemask_epi8(C), 1)) { u128 out; memcpy(&out, &r, 16); return out; }
     /* Special selectors: 10x -> 0x00, 110 -> 0xFF, 111 -> 0x80. */
     const __m128i m80 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0x80)), _mm_set1_epi8((char)0x80));
     const __m128i mC0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xC0)), _mm_set1_epi8((char)0xC0));
