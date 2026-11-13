@@ -17,6 +17,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#if defined(__SSSE3__) && !defined(SPU_SCALAR_HELPERS)
+#include <tmmintrin.h>
+#endif
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -577,7 +580,12 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
     spu_ls_watch_hit2(lsa, 0, p, (uint32_t)ctx->pc & SPU_LS_MASK,
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK);
 #endif
-#if SPU_LS_FAST
+#if SPU_LS_FAST && defined(__SSSE3__) && !defined(SPU_SCALAR_HELPERS)
+    /* One load + per-word byte swap (lane i = SPU word i). */
+    __m128i x = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)p),
+        _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12));
+    memcpy(&v, &x, 16);
+#elif SPU_LS_FAST
     uint32_t w0, w1, w2, w3;
     memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
     memcpy(&w2, p + 8,  4); memcpy(&w3, p + 12, 4);
@@ -661,7 +669,13 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
     if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode)
         spu_ls_write_probe_pre(ctx, lsa, val);
 #endif
-#if SPU_LS_FAST
+#if SPU_LS_FAST && defined(__SSSE3__) && !defined(SPU_SCALAR_HELPERS)
+    {
+        __m128i x; memcpy(&x, &val, 16);
+        _mm_storeu_si128((__m128i*)p, _mm_shuffle_epi8(x,
+            _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12)));
+    }
+#elif SPU_LS_FAST
     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
     uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
     memcpy(p,      &w0, 4); memcpy(p + 4,  &w1, 4);

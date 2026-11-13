@@ -1481,9 +1481,48 @@ static inline u128 spu_cdd_pos(int pos) {
     for(int k=0;k<8;k++) r._u8[SPU_W(p+k)] = (uint8_t)k;   /* a SPU bytes 0..7 (preferred dword) */
     return r;
 }
+static inline u128 spu_cwd_ref(u128 a, int i7){ return spu_cwd_pos((int)a._u32[0]+i7); }
+#if defined(__SSE4_1__) && !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_INT)
+/* Same controls built in registers. The byte-store forms above compile to a
+ * stack temporary whose 16-byte reload misses store forwarding on x86. Host
+ * byte h holds SPU byte h^3, so the base is 0x10+(h^3); a word slot is the
+ * value 0x00010203 (SPU bytes 0..3 of a), a doubleword 0x00010203,0x04050607. */
+static inline __m128i spu__gen_base(void) {
+    return _mm_setr_epi8(0x13,0x12,0x11,0x10, 0x17,0x16,0x15,0x14, 0x1B,0x1A,0x19,0x18, 0x1F,0x1E,0x1D,0x1C);
+}
+static inline u128 spu__gen_st(__m128i v) { u128 r; memcpy(&r, &v, 16); return r; }
+static inline u128 spu_cbd_pos_sse(uint32_t pos) {
+    const __m128i iota = _mm_setr_epi8(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
+    const __m128i m = _mm_cmpeq_epi8(iota, _mm_set1_epi8((char)((pos & 15) ^ 3)));
+    return spu__gen_st(_mm_blendv_epi8(spu__gen_base(), _mm_set1_epi8(3), m));
+}
+static inline u128 spu_chd_pos_sse(uint32_t pos) {
+    const __m128i iota = _mm_setr_epi8(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
+    const uint32_t p = pos & 14;
+    const __m128i hi = _mm_cmpeq_epi8(iota, _mm_set1_epi8((char)(p ^ 3)));
+    const __m128i lo = _mm_cmpeq_epi8(iota, _mm_set1_epi8((char)((p + 1) ^ 3)));
+    __m128i r = _mm_blendv_epi8(spu__gen_base(), _mm_set1_epi8(2), hi);
+    return spu__gen_st(_mm_blendv_epi8(r, _mm_set1_epi8(3), lo));
+}
+static inline u128 spu_cwd_pos_sse(uint32_t pos) {
+    const __m128i m = _mm_cmpeq_epi32(_mm_setr_epi32(0, 1, 2, 3), _mm_set1_epi32((int)((pos >> 2) & 3)));
+    return spu__gen_st(_mm_blendv_epi8(spu__gen_base(), _mm_set1_epi32(0x00010203), m));
+}
+static inline u128 spu_cdd_pos_sse(uint32_t pos) {
+    const __m128i m = _mm_cmpeq_epi32(_mm_setr_epi32(0, 0, 1, 1), _mm_set1_epi32((int)((pos >> 3) & 1)));
+    return spu__gen_st(_mm_blendv_epi8(spu__gen_base(), _mm_setr_epi32(0x00010203, 0x04050607, 0x00010203, 0x04050607), m));
+}
+static inline u128 spu_cbd(u128 a, int i7){ return spu_cbd_pos_sse(a._u32[0] + (uint32_t)i7); }
+static inline u128 spu_chd(u128 a, int i7){ return spu_chd_pos_sse(a._u32[0] + (uint32_t)i7); }
+static inline u128 spu_cwd(u128 a, int i7){ return spu_cwd_pos_sse(a._u32[0] + (uint32_t)i7); }
+static inline u128 spu_cdd(u128 a, int i7){ return spu_cdd_pos_sse(a._u32[0] + (uint32_t)i7); }
+static inline u128 spu_cbx(u128 a, u128 b){ return spu_cbd_pos_sse(a._u32[0] + b._u32[0]); }
+static inline u128 spu_chx(u128 a, u128 b){ return spu_chd_pos_sse(a._u32[0] + b._u32[0]); }
+static inline u128 spu_cwx(u128 a, u128 b){ return spu_cwd_pos_sse(a._u32[0] + b._u32[0]); }
+static inline u128 spu_cdx(u128 a, u128 b){ return spu_cdd_pos_sse(a._u32[0] + b._u32[0]); }
+#else
 static inline u128 spu_cbd(u128 a, int i7){ return spu_cbd_pos((int)a._u32[0]+i7); }
 static inline u128 spu_chd(u128 a, int i7){ return spu_chd_pos((int)a._u32[0]+i7); }
-static inline u128 spu_cwd_ref(u128 a, int i7){ return spu_cwd_pos((int)a._u32[0]+i7); }
 #if defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_INT)
 static inline u128 spu_cwd(u128 a, int i7) {
     static const uint32_t base[4] = {0x10111213u, 0x14151617u, 0x18191A1Bu, 0x1C1D1E1Fu}, lane[4] = {0, 1, 2, 3};
@@ -1498,6 +1537,7 @@ static inline u128 spu_cbx(u128 a, u128 b){ return spu_cbd_pos((int)(a._u32[0]+b
 static inline u128 spu_chx(u128 a, u128 b){ return spu_chd_pos((int)(a._u32[0]+b._u32[0])); }
 static inline u128 spu_cwx(u128 a, u128 b){ return spu_cwd_pos((int)(a._u32[0]+b._u32[0])); }
 static inline u128 spu_cdx(u128 a, u128 b){ return spu_cdd_pos((int)(a._u32[0]+b._u32[0])); }
+#endif
 
 /* ---- Phase 3: rotate-and-mask family ---- */
 static inline u128 spu_rotm_ref(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=(0-b._u32[i])&0x3F; r._u32[i]=(sh>31)?0:(a._u32[i]>>sh); } return r; }
