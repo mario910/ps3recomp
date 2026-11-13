@@ -330,7 +330,10 @@ static int s_mfc_sharded;
 __attribute__((constructor)) static void mfc_directory_init(void)
 {
     const char* value = getenv("SPU_MFC_SHARDED");
-    s_mfc_sharded = value && value[0]=='1' && !value[1];
+    /* Default: sharded (Steam Deck ABBA: menu +2.3%, heavy views +3%; every
+     * job releases and re-creates its engine, and one shared lock line was
+     * contended by all job threads). SPU_MFC_SHARDED=0 restores one list. */
+    s_mfc_sharded = !(value && value[0]=='0' && !value[1]);
     if(value)fprintf(stderr,"[mfc-directory] buckets=%u\n",s_mfc_sharded?MFC_DIRECTORY_BUCKETS:1);
 }
 static spu_mfc_bucket* mfc_bucket_for(const spu_context* ctx)

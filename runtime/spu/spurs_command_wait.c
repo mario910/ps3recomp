@@ -44,6 +44,19 @@ void spurs_command_dma_written(uint32_t ea, uint32_t size)
     const uint64_t lo = ea, hi = (uint64_t)ea + size;
     for (uint64_t a = lo & ~127ull; a < hi; a += 128u) {
         if (!(lines & spurs_command_line_bit((uint32_t)a))) continue;
+        /* A large PUT covers most filter bits. Check the registered words
+         * before taking the lock: a waiter's fields are stored before its
+         * release RMW of the line mask observed (acquire) above, and a waiter
+         * cleared since is no longer parked. */
+        int overlap = 0;
+        for (unsigned i = 0; i < WAITERS && !overlap; ++i) {
+            Waiter* w = &waiters[i];
+            if (!__atomic_load_n(&w->active, __ATOMIC_RELAXED)) continue;
+            const uint64_t pc = __atomic_load_n(&w->pc, __ATOMIC_RELAXED);
+            const uint64_t chain = __atomic_load_n(&w->chain, __ATOMIC_RELAXED);
+            overlap = (pc < hi && pc + 8ull > lo) || (chain < hi && chain + 8ull > lo);
+        }
+        if (!overlap) return;
         AcquireSRWLockExclusive(&lock);
         for (unsigned i = 0; i < WAITERS; ++i) {
             Waiter* w = &waiters[i];
@@ -117,7 +130,8 @@ void spurs_command_wait(const uint8_t* memory, uint32_t pc, uint32_t chain,
         return;
     }
     Waiter* w = &waiters[i];
-    w->pc = pc; w->chain = chain; w->active = 1;
+    __atomic_store_n(&w->pc, pc, __ATOMIC_RELAXED); __atomic_store_n(&w->chain, chain, __ATOMIC_RELAXED);
+    __atomic_store_n(&w->active, 1, __ATOMIC_RELAXED);
     __atomic_fetch_or(&g_spurs_command_wait_lines,
                       spurs_command_line_bit(pc) | spurs_command_line_bit(chain), __ATOMIC_RELEASE);
     /* A write before registration is observed here; one after registration
@@ -125,7 +139,7 @@ void spurs_command_wait(const uint8_t* memory, uint32_t pc, uint32_t chain,
      * Native DMA/uninstrumented writes still have the bounded timeout. */
     if (read_be64(memory, pc) == 0x800000012ull && read_be64(memory, chain) == published_pc)
         SleepConditionVariableSRW(&w->wake, &lock, timeout_ms, 0);
-    w->active = 0;
+    __atomic_store_n(&w->active, 0, __ATOMIC_RELAXED);
     uint64_t lines = 0;
     for (unsigned n = 0; n < WAITERS; ++n)
         if (waiters[n].active)
