@@ -89,6 +89,8 @@ __attribute__((constructor)) static void native_image39_fp_init(void)
     const char* mode = getenv("SPURS_NATIVE_IMAGE39_FP");
     if (mode && (mode[0] == '1' || mode[0] == '2') && mode[1] == '\0')
         spu_native_image39_fp_mode = mode[0] - '0';
+    fprintf(stderr, "[image39-fp] mode=%d (0 reference, 1 checked native RTZ, 2 sampled compare)\n",
+            spu_native_image39_fp_mode);
 }
 #endif
 
@@ -291,6 +293,75 @@ static int spurs_job_ls_zero_mode(void)
     return m;
 }
 
+/* Lazy LS clearing (SPURS_JOB_LAZY_ZERO_IMAGES, default "41"; image 40 publishes cleared bytes). For images
+ * whose native whole-job driver reads only staged inputs, the large clear of
+ * the output/scratch/stack regions is deferred: everything a job can read as
+ * input (the gap below the ioBuffer, every input's alignment tail and a
+ * lookahead margin after the last input) is still cleared at staging. The
+ * deferred range is cleared by spurs_job_flush_lazy_zero() before any lifted
+ * execution of that job, so the original code always sees the cleared LS.
+ * Disabled while a job corpus is being captured. */
+static SPURS_JOB_TLS uint8_t* s_lazy_ls;
+static SPURS_JOB_TLS uint32_t s_lazy_begin, s_lazy_end;
+void spurs_job_set_lazy_zero(uint8_t* ls, uint32_t begin, uint32_t end)
+{
+    s_lazy_ls = end > begin ? ls : NULL; s_lazy_begin = begin; s_lazy_end = end;
+}
+void spurs_job_flush_lazy_zero(void)
+{
+    if (s_lazy_ls) memset(s_lazy_ls + s_lazy_begin, 0, s_lazy_end - s_lazy_begin);
+    s_lazy_ls = NULL;
+}
+static int spurs_job_lazy_zero_image(int image)
+{
+    static uint64_t mask = UINT64_MAX;
+    uint64_t m = __atomic_load_n(&mask, __ATOMIC_RELAXED);
+    if (m == UINT64_MAX) {
+        m = 0;
+        const char* e = getenv("SPURS_JOB_LAZY_ZERO_IMAGES");
+        if (!e) e = "41";
+        if (getenv("BUZZ_JOB_CORPUS")) e = "";
+        while (*e) {
+            char* end; long id = strtol(e, &end, 10);
+            if (end == e) break;
+            if (id > 0 && id < 64) m |= 1ull << id;
+            e = *end == ',' ? end + 1 : end;
+        }
+        __atomic_store_n(&mask, m, __ATOMIC_RELAXED);
+    }
+    return image > 0 && image < 64 && (m >> image & 1);
+}
+enum { LAZY_ZERO_LOOKAHEAD = 256 };
+
+/* Binary reuse on a pooled lane. Job binaries live in static guest memory and
+ * a job only writes its own globals at the top of the binary area. A native
+ * whole-job driver that knows the lowest offset its job can write vouches for
+ * the bytes below it (spurs_job_binary_clean_below); the next job with the
+ * same binary on this LS then copies only from that offset. Anything else
+ * (lifted code, another binary, another LS) keeps the full copy. */
+static SPURS_JOB_TLS const uint8_t* s_bin_ls;
+static SPURS_JOB_TLS uint32_t s_bin_ea, s_bin_size, s_bin_clean;
+void spurs_job_binary_clean_below(uint32_t offset)
+{
+    if (s_bin_ls) s_bin_clean = offset < s_bin_size ? offset : s_bin_size;
+}
+static uint32_t spurs_job_binary_copy_from(const uint8_t* ls, uint32_t ea, uint32_t size)
+{
+    static int enabled = -1;
+    if (enabled < 0) { const char* e = getenv("SPURS_JOB_BINARY_REUSE"); enabled = !(e && e[0] == '0'); }
+    uint32_t from = 0;
+    if (enabled && ls == s_bin_ls && ea == s_bin_ea && size == s_bin_size && s_bin_clean) {
+        from = s_bin_clean;
+        /* Guard: sampled quadwords must still equal the source. */
+        for (uint32_t at = 0; at + 16 <= from; at += (from / 8u) & ~15u) {
+            if (memcmp(ls + at, vm_base + ea + at, 16)) { from = 0; break; }
+            if (from < 128) break;
+        }
+    }
+    s_bin_ls = ls; s_bin_ea = ea; s_bin_size = size; s_bin_clean = 0;
+    return from;
+}
+
 static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size, spu_context* ctx, int exchange)
 {
@@ -338,7 +409,23 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
     uint8_t* ls=ctx->ls;
 
     /* ---- binary at LS 0 (PIC, so delta 0 keeps the lifted addresses) ---- */
-    memcpy(ls, vm_base + ea_bin, size_bin);
+    { const uint32_t from = spurs_job_binary_copy_from(ls, ea_bin, size_bin);
+      memcpy(ls + from, vm_base + ea_bin + from, size_bin - from);
+      static int check = -1;
+      if (check < 0) { const char* e = getenv("SPURS_JOB_BINARY_REUSE_CHECK"); check = e && e[0] == '1'; }
+      if (check && from) {
+          static unsigned long reused, bad;
+          /* Staging re-applies the kernel overlay quads after every copy. */
+          int differs = 0;
+          for (uint32_t at = 0; at < from && !differs; at += 16)
+              if (at != 0x170 && at != 0x1C0 && at != 0x210)
+                  differs = memcmp(ls + at, vm_base + ea_bin + at, from - at < 16 ? from - at : 16) != 0;
+          __atomic_fetch_add(&reused, 1, __ATOMIC_RELAXED);
+          if (differs) __atomic_fetch_add(&bad, 1, __ATOMIC_RELAXED);
+          if (differs || (__atomic_load_n(&reused, __ATOMIC_RELAXED) & 0xFFFF) == 0)
+              fprintf(stderr, "[binary-reuse] reused=%lu MISMATCH=%lu image=%d\n", reused, bad, image_id);
+          if (differs) memcpy(ls, vm_base + ea_bin, from);
+      } }
 
     /* ---- regions, following _cellSpursCheckJob's own arithmetic --------- */
     uint32_t p         = ALIGN1024(size_bin);
@@ -362,7 +449,12 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
     uint32_t s_ls      = p;
     uint32_t stack_top = p + ss_size;
     p += ss_size;
-    if (ls_zero == 1 && p > size_bin)
+    spurs_job_set_lazy_zero(NULL, 0, 0);
+    const uint32_t zero_end = p < SPU_LS_SIZE ? p : SPU_LS_SIZE;   /* before cache regions */
+    const int lazy_zero = ls_zero == 1 && p > size_bin && io_ls >= size_bin && spurs_job_lazy_zero_image(image_id);
+    if (lazy_zero)
+        memset(ls + size_bin, 0, io_ls - size_bin);
+    else if (ls_zero == 1 && p > size_bin)
         memset(ls + size_bin, 0, (p < SPU_LS_SIZE ? p : SPU_LS_SIZE) - size_bin);
 
     /* ---- cache-hinted read-only inputs ---------------------------------- */
@@ -391,8 +483,16 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
         if (!sz || !eal) continue;
         if (!io_ls || io_cur + sz > SPU_LS_SIZE) break;
         memcpy(ls + io_cur, vm_base + eal, sz);
+        if (lazy_zero && (sz & 15u)) memset(ls + io_cur + sz, 0, 16u - (sz & 15u));
         io_cur  += (sz + 15u) & ~15u;
         io_used += (sz + 15u) & ~15u;
+    }
+    if (lazy_zero) {
+        const uint32_t region_end = zero_end;
+        const uint32_t from = io_ls > io_cur ? io_ls : io_cur;
+        const uint32_t margin = from + LAZY_ZERO_LOOKAHEAD < region_end ? from + LAZY_ZERO_LOOKAHEAD : region_end;
+        if (margin > from) memset(ls + from, 0, margin - from);
+        spurs_job_set_lazy_zero(ls, margin, region_end);
     }
 
     /* ---- context + descriptor, parked above the job's memory region ------
@@ -679,6 +779,20 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
             ps3_ft_span(PS3_FT_SPU_JOB, GetCurrentThreadId(), (uint32_t)image_id, job_ea, trace_start, end);
     }
     if(phase_seconds)job_phase_report(image_id,phase_start,phase_enter,phase_leave,job_clock(),phase_seconds,phase_mfc,phase_atomic);
+    /* BUZZ_CAUSAL_DELAY=<image>:<us> -- diagnostic only: busy-wait after every
+     * job of one image (serial or pooled) to measure how much frame time
+     * depends on it. Unset: one cached load per job. */
+    { static int delay_image = -2; static long delay_us;
+      if (delay_image == -2) {
+          const char* e = getenv("BUZZ_CAUSAL_DELAY"); int image = -1;
+          if (e && *e) { char* end; image = (int)strtol(e, &end, 10); if (*end == ':') delay_us = strtol(end + 1, NULL, 10);
+              fprintf(stderr, "[causal] spin %ld us after every image %d job\n", delay_us, image); }
+          delay_image = image;
+      }
+      if (delay_image == image_id && delay_us > 0) {
+          const double due = job_clock() + delay_us * 1e-6;
+          while (job_clock() < due) YieldProcessor();
+      } }
     return 0;
 }
 

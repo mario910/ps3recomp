@@ -1865,4 +1865,30 @@ static inline u128 spu_fsmh(u128 a) { return spu_fsmh_ref(a); }
 static inline u128 spu_fsmb(u128 a) { return spu_fsmb_ref(a); }
 #endif
 
+
+/* SPU_WRCH_FASTPATH (lifted translation units only): the five MFC parameter
+ * channels just store into the context (mfc_channel_write). Doing that inline
+ * saves five of the six out-of-line spu_wrch calls of every DMA command. The
+ * out-of-line function publishes g_spu_wrch_param_slow on its first call
+ * (nonzero while the SPU_CHHIST channel histogram is armed); until then every
+ * write takes the original path. */
+#ifdef SPU_WRCH_FASTPATH
+SPU_GATE int g_spu_wrch_param_slow = -1;
+static inline void spu_wrch_dispatch(spu_context* ctx, uint32_t channel, u128 value)
+{
+    if (__builtin_expect(g_spu_wrch_param_slow == 0, 1)) {
+        switch (channel) {
+        case MFC_LSA:   ctx->mfc_lsa = value._u32[0]; return;
+        case MFC_EAH:   ctx->mfc_eah = value._u32[0]; return;
+        case MFC_EAL:   ctx->mfc_eal = value._u32[0]; return;
+        case MFC_Size:  ctx->mfc_size = value._u32[0]; return;
+        case MFC_TagID: ctx->mfc_tag = value._u32[0] & 0x1F; return;
+        default: break;
+        }
+    }
+    (spu_wrch)(ctx, channel, value);
+}
+#define spu_wrch(ctx, channel, value) spu_wrch_dispatch((ctx), (channel), (value))
+#endif
+
 #endif /* SPU_HELPERS_H */

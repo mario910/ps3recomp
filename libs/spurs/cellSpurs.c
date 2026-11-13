@@ -478,6 +478,10 @@ struct SpursPmSlot {
     const uint8_t* pm;
     u64 data;
     HANDLE thread;
+    /* Only this slot's worker waits here: the coordinator wakes exactly the
+     * worker it assigned instead of every worker on si->wake (which was a
+     * ~17k wake-ups/s thundering herd on the Deck). */
+    CONDITION_VARIABLE wake;
 };
 static struct SpursInst {
     u32 ea, nspus;
@@ -1725,7 +1729,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     AcquireSRWLockExclusive(&si->lock);
     for (;;) {
         while (!slot->busy && !si->stopping)
-            SleepConditionVariableSRW(&si->wake, &si->lock, INFINITE, 0);
+            SleepConditionVariableSRW(&slot->wake, &si->lock, INFINITE, 0);
         if (si->stopping && !slot->busy) break;
         ReleaseSRWLockExclusive(&si->lock);
         spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
@@ -1741,7 +1745,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         if (polls) si->idle[wid] = 0;
         else if (si->idle[wid] < 4) si->idle[wid]++;
         slot->busy = 0;
-        WakeAllConditionVariable(&si->wake);
+        WakeAllConditionVariable(&si->wake);   /* the coordinator only */
     }
     ReleaseSRWLockExclusive(&si->lock);
     return 0;
@@ -1799,7 +1803,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 vm_base[ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
                 ef_line_end(ea);
                 slot->busy = 1;
-                WakeAllConditionVariable(&si->wake);
+                WakeConditionVariable(&slot->wake);
                 break;
             }
         }
@@ -1827,6 +1831,7 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
 failed:
     AcquireSRWLockExclusive(&si->lock);
     si->stopping = 1; WakeAllConditionVariable(&si->wake);
+    for (u32 sn = 0; sn < si->nspus; sn++) WakeAllConditionVariable(&si->slots[sn].wake);
     ReleaseSRWLockExclusive(&si->lock);
     for (u32 sn = 0; sn < si->nspus; sn++) {
         HANDLE h = si->slots[sn].thread;
@@ -1846,6 +1851,7 @@ static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea)
     for (u32 wid = 0; wid < 16; wid++)
         if (si->active[wid]) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
     si->stopping = 1; WakeAllConditionVariable(&si->wake);
+    for (u32 sn = 0; sn < si->nspus; sn++) WakeAllConditionVariable(&si->slots[sn].wake);
     ReleaseSRWLockExclusive(&si->lock);
     if (si->coordinator) { WaitForSingleObject(si->coordinator, INFINITE); CloseHandle(si->coordinator); si->coordinator = NULL; }
     for (u32 sn = 0; sn < si->nspus; sn++) {
@@ -2052,6 +2058,49 @@ static void ef_wait_stats(uint32_t ea, long long t0, unsigned timeouts)
     ReleaseSRWLockExclusive(&lk);
 }
 
+/* One-shot scheduler snapshot for a PPU wait that has been blocked for 5 s
+ * (diagnoses the rare boot stall on a taskset completion flag). Reads only. */
+static void spurs_dump_hex(const char* tag, u32 ea, u32 n)
+{
+    fprintf(stderr, "[spurs-dump] %s ea=0x%08X:", tag, ea);
+    for (u32 i = 0; i < n; i++) {
+        if (i % 32 == 0) fprintf(stderr, "\n  +%03X ", i);
+        fprintf(stderr, "%02X", vm_base[ea + i]);
+        if (i % 4 == 3) fputc(' ', stderr);
+    }
+    fputc('\n', stderr);
+}
+static void jc_dump_state(void);
+static void spurs_dump_state(u32 flag_ea)
+{
+    jc_dump_state();
+    spurs_dump_hex("flag", flag_ea & ~127u, 128);
+    for (int k = 0; k < MAX_SPURS_INST; k++) {
+        struct SpursInst* si = &s_inst[k];
+        if (!si->ea) continue;
+        u32 ea = si->ea;
+        fprintf(stderr, "[spurs-dump] inst %d ea=0x%08X nspus=%u live=%d stopping=%d pass=%u enabled=0x%08X signal=0x%04X\n",
+                k, ea, si->nspus, si->kernel_live, si->stopping, si->pass_no,
+                vm_read32(ea + SPURS_WKL_ENABLED), vm_read16(ea + SPURS_WKL_SIGNAL1));
+        for (u32 sn = 0; sn < si->nspus && sn < 6; sn++)
+            fprintf(stderr, "[spurs-dump]   slot %u busy=%d wid=%u image=%d\n", sn, si->slots[sn].busy,
+                    si->slots[sn].wid, (int)si->slots[sn].image_id);
+        for (u32 wid = 0; wid < 16; wid++) {
+            if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea) continue;
+            u32 data = (u32)vm_read64(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8);
+            fprintf(stderr, "[spurs-dump]   wid %u state=%u ready=%u cur=%u max=%u active=%u idle=%u data=0x%08X prio=",
+                    wid, vm_read8(ea + SPURS_WKL_STATE1 + wid), vm_read8(ea + SPURS_WKL_READY1 + wid),
+                    vm_read8(ea + SPURS_WKL_CURCONT + wid), vm_read8(ea + SPURS_WKL_MAXCONT + wid),
+                    si->active[wid], si->idle[wid], data);
+            for (u32 sn = 0; sn < 8; sn++)
+                fprintf(stderr, "%02X", vm_read8(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x18 + sn));
+            fputc('\n', stderr);
+            if (data) spurs_dump_hex("  wkl-data", data, 0x60);
+        }
+    }
+    fflush(stderr);
+}
+
 s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
                            u32 mode)
 {
@@ -2108,6 +2157,9 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
                             current, ea);
                     fflush(stderr);
                 }
+                static volatile long s_dumped;
+                if (waits == 1500 && !__atomic_exchange_n(&s_dumped, 1, __ATOMIC_SEQ_CST))
+                    spurs_dump_state(ea);
             }
             if (s_force && waits >= 1000) {
                 fprintf(stderr, "[cellSpurs] EventFlagWait: SPURS_EF_FORCE -- faking pattern "
@@ -2588,6 +2640,27 @@ static struct {
     int active;
     CONDITION_VARIABLE wake;
 } s_jobguards[MAX_JOBGUARDS];
+
+static void jc_dump_state(void)
+{
+    for (int i = 0; i < MAX_JOBCHAINS; i++) {
+        if (!s_jobchains[i].jc_ea) continue;
+        u32 c = s_jobchains[i].jc_ea, r = s_jobchains[i].resume_pc;
+        fprintf(stderr, "[spurs-dump] chain %d ea=0x%08X entry=0x%08X runs=%d running=%ld kick=%ld "
+                "published=0x%016llX resume=0x%08X cmd@resume=0x%016llX next=0x%016llX\n",
+                i, c, s_jobchains[i].entry_ea, s_jobchains[i].run_count, s_jobchains[i].running,
+                s_jobchains[i].kick_pending, (unsigned long long)vm_read64(c), r,
+                r ? (unsigned long long)vm_read64(r) : 0ull, r ? (unsigned long long)vm_read64(r + 8) : 0ull);
+    }
+    for (int i = 0; i < MAX_JOBGUARDS; i++) {
+        if (!s_jobguards[i].active) continue;
+        u32 g = s_jobguards[i].ea;
+        fprintf(stderr, "[spurs-dump] guard ea=0x%08X chain=0x%08X count=%u reset=%u pending=%u auto=%u "
+                "guest+0=%u +4=%u +0x30=%u\n", g, s_jobguards[i].chain_ea, s_jobguards[i].count,
+                s_jobguards[i].reset, s_jobguards[i].pending, s_jobguards[i].auto_reset,
+                vm_read32(g), vm_read32(g + 4), vm_read32(g + 0x30));
+    }
+}
 
 /* Job launch configuration is fixed by the port at startup. Keep the SDK's
  * live environment behavior unless the explicit startup-cache mode is set. */

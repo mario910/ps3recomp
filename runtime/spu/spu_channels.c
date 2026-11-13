@@ -889,6 +889,8 @@ static int channel_is_mfc(uint32_t ch)
 /* ===========================================================================
  * Channel write
  * ===========================================================================*/
+/* Published for the inline MFC parameter fast path (spu_helpers.h). */
+SPU_GATE int g_spu_wrch_param_slow = -1;
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 {
     /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
@@ -901,6 +903,10 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
           if ((++n % (unsigned long long)s_c) == 0) { fprintf(stderr, "[chw] %llu writes:%c", n, 10);
               for (int i = 0; i < 128; i++) if (w[i])
                   fprintf(stderr, "   wrch ch%-3d %llu%c", i, w[i], 10); } } }
+    { if (__builtin_expect(g_spu_wrch_param_slow < 0, 0)) {
+          const char* h = getenv("SPU_CHHIST");
+          g_spu_wrch_param_slow = h ? 1 : 0;
+      } }
     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
 
     if (channel_is_mfc(channel)) {

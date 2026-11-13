@@ -425,6 +425,17 @@ static int spu_launch_no_ls0(void)
 /* Diagnostic step observer (job corpus replay prints a job's step order). */
 void (*g_spu_step_observer)(spu_context*, uint32_t) = 0;
 
+/* A fused lifted image may replace a drain step with a direct jump only when
+ * the step's startup-configured hooks reduce to ctx->steps++ (no forced full
+ * hooks or step traces, steps counted, no SPU_TAILRET break). The per-step
+ * state (interrupts, observer, lockstep, pm flow, stack resets) is checked by
+ * the caller at every step. */
+int spu_fast_lift_allowed(void)
+{
+    return !spu_launch_check_slow() && !spu_launch_no_ls0() &&
+           (g_spu_tailret >= 0 ? g_spu_tailret : spu_tailret_enabled()) == 0;
+}
+
 static inline void spu_step_hooks(spu_context* ctx, void* fn)
 {
     if (g_spu_step_observer) g_spu_step_observer(ctx, (uint32_t)ctx->pc & SPU_LS_MASK);
