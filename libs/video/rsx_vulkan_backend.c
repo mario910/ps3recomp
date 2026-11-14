@@ -327,10 +327,11 @@ static struct {
     VkDescriptorPool descriptors;
     int async_requested,async_ready;
     u32 active_context;
-    VkCommandBuffer context_cmd[2];
-    VkFence context_fence[2];
-    VkDescriptorPool context_pool[2];
-    int context_inflight[2];
+    u32 contexts;   /* in-flight draw contexts, PS3RECOMP_VK_DRAW_CONTEXTS (2..4) */
+    VkCommandBuffer context_cmd[4];
+    VkFence context_fence[4];
+    VkDescriptorPool context_pool[4];
+    int context_inflight[4];
     u64 async_submissions;
     u64 total_draws, flushes;
     u64 retired_texture_labels;
@@ -338,6 +339,8 @@ static struct {
 } s_batch;
 static int vk_batch_flush(void);
 static int vk_batch_flush_as(u32 reason);
+static int vk_present_thread_enabled(void);
+static void vk_present_thread_drain(void);
 
 #define VK_LOG(...)  fprintf(stderr, "[RSX vulkan] " __VA_ARGS__)
 /* Optional CPU-observed timings, not GPU timestamp queries. Atomic counters
@@ -858,12 +861,13 @@ static int vk_batch_async_init(void)
     s_batch.context_cmd[0]=s_vk.cmd;
     VkCommandBufferAllocateInfo ai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
         .commandPool=s_vk.pool,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
-    VK_CHECK(pvkAllocateCommandBuffers(s_vk.device,&ai,&s_batch.context_cmd[1]),"allocate async command buffer");
+    for(u32 i=1;i<s_batch.contexts;i++)
+        VK_CHECK(pvkAllocateCommandBuffers(s_vk.device,&ai,&s_batch.context_cmd[i]),"allocate async command buffer");
     VkFenceCreateInfo fi={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    for(u32 i=0;i<2;i++)
+    for(u32 i=0;i<s_batch.contexts;i++)
         VK_CHECK(pvkCreateFence(s_vk.device,&fi,NULL,&s_batch.context_fence[i]),"create async fence");
     s_batch.async_ready=1;
-    VK_LOG("two-context asynchronous draw batches enabled\n");
+    VK_LOG("%u-context asynchronous draw batches enabled\n",s_batch.contexts);
     return 0;
 }
 
@@ -901,7 +905,7 @@ static int vk_batch_submit_async(void)
         __atomic_fetch_add(&s_perf.submission_wall_total,elapsed,__ATOMIC_RELAXED);
         __atomic_fetch_add(&s_perf.submissions,1,__ATOMIC_RELAXED);
     }
-    const u32 next=current^1u;
+    const u32 next=(current+1u)%s_batch.contexts;
     if(vk_batch_wait_context(next))return -1;
     s_batch.active_context=next;
     s_vk.cmd=s_batch.context_cmd[next];
@@ -911,7 +915,8 @@ static int vk_batch_submit_async(void)
 
 static int vk_batch_flush_as(u32 reason)
 {
-    const int asynchronous=reason==8 && s_batch.async_ready && !s_batch.failed;
+    const int asynchronous=(reason==8 || (reason==2 && vk_present_thread_enabled())) &&
+        s_batch.async_ready && !s_batch.failed;
     if(s_batch.recording){
         __atomic_fetch_add(&s_batch.reason[reason],1,__ATOMIC_RELAXED);
         s_batch.recording=0;
@@ -928,7 +933,7 @@ static int vk_batch_flush_as(u32 reason)
     /* Resource retirement/readback/full guest completion must drain even if
      * the current context is empty and an older context is still in flight. */
     if(!asynchronous && s_batch.async_ready)
-        for(u32 i=0;i<2;i++)if(vk_batch_wait_context(i)){s_batch.failed=1;return -1;}
+        for(u32 i=0;i<s_batch.contexts;i++)if(vk_batch_wait_context(i)){s_batch.failed=1;return -1;}
     return 0;
 }
 static int vk_batch_flush(void) { return vk_batch_flush_as(0); }
@@ -4625,7 +4630,7 @@ static void vk_eng_bind_pipeline(void* user, u32 pipeline) { (void)user; s_e2.pi
 static void vk_eng2_shutdown(void* user)
 {
     vk_batch_flush();
-    for(u32 i=0;i<2;i++){
+    for(u32 i=0;i<4;i++){
         if(s_batch.context_pool[i])pvkDestroyDescriptorPool(s_vk.device,s_batch.context_pool[i],NULL);
         s_batch.context_pool[i]=VK_NULL_HANDLE;
     }
@@ -4940,7 +4945,7 @@ static int vk_batch_ring_prepare(void)
     const VkDeviceSize align = p.limits.minUniformBufferOffsetAlignment ?
         p.limits.minUniformBufferOffsetAlignment : 256;
     s_batch.uniform_stride = (s_g.ubo.size + align - 1) / align * align;
-    const u32 contexts=s_batch.async_ready?2u:1u;
+    const u32 contexts=s_batch.async_ready?s_batch.contexts:1u;
     const VkDeviceSize geometry_size = (VkDeviceSize)VK_BATCH_RING_GEOMETRY_BYTES*contexts;
     if (vk_create_host_buffer(&s_batch.ring_vertices, geometry_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) ||
         !s_batch.ring_vertices.coherent ||
@@ -5579,6 +5584,11 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
     memset(&s_batch, 0, sizeof s_batch);
     const char* asynchronous=getenv("PS3RECOMP_VK_DRAW_ASYNC");
     s_batch.async_requested=asynchronous && !strcmp(asynchronous,"1");
+    s_batch.contexts=2;
+    { const char* c=getenv("PS3RECOMP_VK_DRAW_CONTEXTS");
+      if(c && *c){ const unsigned long n=strtoul(c,NULL,10);
+        if(n<2 || n>4){VK_LOG("invalid draw contexts (expected 2..4)\n");return -1;}
+        s_batch.contexts=(u32)n; } }
     if(asynchronous && strcmp(asynchronous,"0") && strcmp(asynchronous,"1")){
         VK_LOG("invalid asynchronous draw option (expected 0 or 1)\n");return -1;
     }
@@ -5650,6 +5660,7 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
 
 void rsx_vulkan_backend_shutdown(void)
 {
+    vk_present_thread_drain();
     rsx_vulkan_backend_present_finish();   /* a host that began one and quit */
     if (rsx_get_backend() == &s_vulkan_backend) rsx_set_backend(NULL);
     if (s_vk.eng_active) { rsx_draw_engine_shutdown(); s_vk.eng_active = 0; }
@@ -5679,7 +5690,7 @@ void rsx_vulkan_backend_shutdown(void)
     if (s_vk.windowed || s_vk.window) vk_window_drop(NULL);
     if (s_vk.device) {
         vk_device_idle();
-        for(u32 i=0;i<2;i++){
+        for(u32 i=0;i<4;i++){
             if(s_batch.context_fence[i])pvkDestroyFence(s_vk.device,s_batch.context_fence[i],NULL);
             s_batch.context_fence[i]=VK_NULL_HANDLE;
         }
@@ -5749,8 +5760,88 @@ int rsx_vulkan_backend_pump_messages(void)
 }
 int rsx_vulkan_backend_windowed(void){return s_vk.windowed&&s_vk.swapchain!=VK_NULL_HANDLE;}
 
+/* BUZZ_VK_PRESENT_THREAD (default 1, Linux with asynchronous draw batches):
+ * the walker records and submits the present (begin) and returns to the
+ * FIFO; a present thread finishes it (waits for the frame on the GPU and
+ * blits it into the window). The flush at a present then submits the batch
+ * like any other instead of draining the GPU: the present's command buffer
+ * starts with a full dependency on everything submitted before it. */
+#ifndef _WIN32
+#include <pthread.h>
+extern int pthread_setname_np(pthread_t thread, const char* name);
+static struct {
+    pthread_mutex_t mu; pthread_cond_t cv;
+    int started, pending;
+} s_present_thread = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0 };
+static void* vk_present_thread_main(void* arg)
+{
+    (void)arg;
+    pthread_setname_np(pthread_self(), "vk present");
+    for (;;) {
+        pthread_mutex_lock(&s_present_thread.mu);
+        while (!s_present_thread.pending) pthread_cond_wait(&s_present_thread.cv, &s_present_thread.mu);
+        pthread_mutex_unlock(&s_present_thread.mu);
+        rsx_vulkan_backend_present_finish();
+        pthread_mutex_lock(&s_present_thread.mu);
+        s_present_thread.pending = 0;
+        pthread_cond_broadcast(&s_present_thread.cv);
+        pthread_mutex_unlock(&s_present_thread.mu);
+    }
+    return NULL;
+}
+#endif
+/* Wait for a present the present thread has not finished yet. */
+static void vk_present_thread_drain(void)
+{
+#ifndef _WIN32
+    if (!s_present_thread.started) return;
+    pthread_mutex_lock(&s_present_thread.mu);
+    while (s_present_thread.pending) pthread_cond_wait(&s_present_thread.cv, &s_present_thread.mu);
+    pthread_mutex_unlock(&s_present_thread.mu);
+#endif
+}
+
+static int vk_present_thread_enabled(void)
+{
+#ifdef _WIN32
+    return 0;
+#else
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* e = getenv("BUZZ_VK_PRESENT_THREAD");
+        enabled = !(e && !strcmp(e, "0"));
+        VK_LOG("present thread=%d\n", enabled);
+    }
+    return enabled && s_batch.async_ready;
+#endif
+}
+
 void rsx_vulkan_backend_present(void)
 {
+#ifndef _WIN32
+    if (vk_present_thread_enabled() && s_vk.device) {
+        if (!s_present_thread.started) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, vk_present_thread_main, NULL) == 0) {
+                pthread_detach(t);
+                s_present_thread.started = 1;
+            }
+        }
+        if (s_present_thread.started) {
+            /* One present in flight: the previous finish has run (it is
+             * also what frees the present's own command buffer). */
+            pthread_mutex_lock(&s_present_thread.mu);
+            while (s_present_thread.pending) pthread_cond_wait(&s_present_thread.cv, &s_present_thread.mu);
+            pthread_mutex_unlock(&s_present_thread.mu);
+            rsx_vulkan_backend_present_begin();
+            pthread_mutex_lock(&s_present_thread.mu);
+            s_present_thread.pending = 1;
+            pthread_cond_signal(&s_present_thread.cv);
+            pthread_mutex_unlock(&s_present_thread.mu);
+            return;
+        }
+    }
+#endif
     rsx_vulkan_backend_present_begin();
     rsx_vulkan_backend_present_finish();
 }

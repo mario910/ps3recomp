@@ -1055,8 +1055,19 @@ static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
 {
     const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
     if (!src) { *readable = 0; return 0; }
+    /* Four independent FNV lanes over 32-byte blocks: the same per-word
+     * bijective step (any single changed word changes its lane), without one
+     * serial multiply chain. Hashes are only compared within this process. */
     u64 hash = 1469598103934665603ull;
+    u64 lane[4] = { hash, hash ^ 1u, hash ^ 2u, hash ^ 3u };
     u32 i = 0;
+    for (; i + 32 <= span; i += 32)
+        for (u32 k = 0; k < 4; k++) {
+            u64 word;
+            memcpy(&word, src + i + k * 8u, sizeof(word));
+            lane[k] = (lane[k] ^ word) * 1099511628211ull;
+        }
+    for (u32 k = 0; k < 4; k++) hash = (hash ^ lane[k]) * 1099511628211ull;
     for (; i + 8 <= span; i += 8) {
         u64 word;
         memcpy(&word, src + i, sizeof(word));
@@ -2896,6 +2907,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
     if (!g.ready || !dc.n_packets || !dc.fetch_ok) return;
+    /* BUZZ_RSX_CAUSAL_NS=<ns>: diagnostic busy-wait per draw, to measure how
+     * frame time responds to renderer-thread cost (causal profiling). */
+    { static long long causal=-1;
+      if(causal<0){const char* e=getenv("BUZZ_RSX_CAUSAL_NS");causal=e?atoll(e):0;}
+      if(causal>0){struct timespec t0,t1;clock_gettime(CLOCK_MONOTONIC,&t0);
+        do clock_gettime(CLOCK_MONOTONIC,&t1);
+        while((t1.tv_sec-t0.tv_sec)*1000000000ll+(t1.tv_nsec-t0.tv_nsec)<causal);} }
     /* Mixed geometry sources have no defined concatenation here. Reject the
      * whole group instead of drawing partial/misordered geometry. */
     if (dc.n_immediate && (dc.n_arr || dc.n_idx || dc.inl_bytes ||
