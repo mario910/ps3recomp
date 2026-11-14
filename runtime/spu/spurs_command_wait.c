@@ -99,6 +99,45 @@ static uint64_t spin_ticks(void)
     return t;
 }
 
+/* SPURS_JTS_PARK_US (default 200; 0 = the caller's millisecond bound): how
+ * long a parked walker sleeps before re-reading its slot. Notifications cover
+ * PPU std stores and instrumented SPU PUTs, but some publications arrive by
+ * other paths (native host jobs, unhooked DMA), and those were seen only when
+ * the 1 ms bound expired -- several times a frame on the critical chain. */
+static unsigned park_us(void)
+{
+    static int us = -1;
+    int v = __atomic_load_n(&us, __ATOMIC_RELAXED);
+    if (v < 0) {
+        const char* e = getenv("SPURS_JTS_PARK_US");
+        v = e && *e ? atoi(e) : 200;
+        if (v < 0 || v > 1000000) v = 200;
+        __atomic_store_n(&us, v, __ATOMIC_RELAXED);
+    }
+    return (unsigned)v;
+}
+
+#ifndef _WIN32
+/* SleepConditionVariableSRW with a microsecond bound (the shim's is in ms). */
+static void sleep_srw_us(CONDITION_VARIABLE* c, SRWLOCK* l, unsigned us)
+{
+    ps3_condvar* cv = ps3_cv(c);
+    if (!cv) { ReleaseSRWLockExclusive(l); usleep(us); AcquireSRWLockExclusive(l); return; }
+    pthread_mutex_lock(&cv->m);
+    const unsigned g = cv->gen;
+    ReleaseSRWLockExclusive(l);
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += (long)(us % 1000000u) * 1000L;
+    ts.tv_sec += (time_t)(us / 1000000u);
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    int rc = 0;
+    while (cv->gen == g && rc == 0) rc = pthread_cond_timedwait(&cv->c, &cv->m, &ts);
+    pthread_mutex_unlock(&cv->m);
+    AcquireSRWLockExclusive(l);
+}
+#endif
+
 static int published(const uint8_t* memory, uint32_t pc, uint32_t chain, uint64_t published_pc)
 {
     return __builtin_bswap64(__atomic_load_n((const uint64_t*)(memory + pc), __ATOMIC_ACQUIRE)) != 0x800000012ull ||
@@ -137,8 +176,14 @@ void spurs_command_wait(const uint8_t* memory, uint32_t pc, uint32_t chain,
     /* A write before registration is observed here; one after registration
      * takes this lock to notify, so cannot slip between check and park.
      * Native DMA/uninstrumented writes still have the bounded timeout. */
-    if (read_be64(memory, pc) == 0x800000012ull && read_be64(memory, chain) == published_pc)
+    if (read_be64(memory, pc) == 0x800000012ull && read_be64(memory, chain) == published_pc) {
+#ifndef _WIN32
+        const unsigned us = park_us();
+        if (us && us < timeout_ms * 1000u) sleep_srw_us(&w->wake, &lock, us);
+        else
+#endif
         SleepConditionVariableSRW(&w->wake, &lock, timeout_ms, 0);
+    }
     __atomic_store_n(&w->active, 0, __ATOMIC_RELAXED);
     uint64_t lines = 0;
     for (unsigned n = 0; n < WAITERS; ++n)

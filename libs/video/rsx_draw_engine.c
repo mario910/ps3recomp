@@ -1316,13 +1316,30 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     if (!span) return 0;
     eng_texture_input_dump(location,offset,fmt,w,h,pitch,remap,cube,depth);
 
-    for (u32 i = 0; i < g.n_textures; i++) {
+    /* Direct-mapped hint: key hash -> slot + 1. Always verified by the full
+     * compare below; a stale or colliding hint only costs the linear scan. */
+    static u16 s_tex_hint[4096];
+    const u32 hint_key = (u32)(((((u64)offset * 0x9E3779B97F4A7C15ull) ^
+        ((u64)(location | fmt << 4 | (u32)(cube != 0) << 12) << 32) ^
+        ((u64)w << 16 | h) * 0xC2B2AE3D27D4EB4Full) ^ ((u64)pitch << 7) ^
+        ((u64)remap * 0x165667B19E3779F9ull) ^ depth) >> 52);
+    u32 hinted = s_tex_hint[hint_key];
+    for (u32 n = 0; n <= g.n_textures; n++) {
+        u32 i;
+        if (n == 0) {
+            if (!hinted || hinted > g.n_textures) continue;
+            i = hinted - 1u;
+        } else {
+            i = n - 1u;
+            if (hinted && i == hinted - 1u) continue;
+        }
         eng_texture* e = &g.textures[i];
         if (e->location != location || e->offset != offset ||
             e->format != fmt || e->width != w || e->height != h ||
             e->pitch != pitch || e->remap != remap ||
             e->cubemap != (u32)(cube != 0) || e->depth != depth)
             continue;
+        s_tex_hint[hint_key] = (u16)(i + 1u);
         if (e->handle && e->last_hash_frame != g.frames) {
             /* Every cached texture used to be hashed in full every frame;
              * in a big scene that is hundreds of MB a second for the few
@@ -1383,7 +1400,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
                                   cube, remap, depth);
     if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);
-    if (e.handle || !evicted) g.textures[index] = e;
+    if (e.handle || !evicted) { g.textures[index] = e; s_tex_hint[hint_key] = (u16)(index + 1u); }
     return e.handle;
 }
 
@@ -1643,9 +1660,12 @@ static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][2])
 {
     u32 mask = 0;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
+        dim[u][0] = dim[u][1] = 0;
+        /* CONTROL0 bit 31 (enable) is all a disabled unit needs; skip the
+         * full decode for it (rsx_dsp_get_texture: unit block 0x1A00+u*0x20). */
+        if (!(rsx_dsp_reg(&g.rsx, 0x1A00u + u * 0x20u + 0x0Cu) >> 31)) continue;
         rsx_dsp_texture t;
         rsx_dsp_get_texture(&g.rsx, u, &t);
-        dim[u][0] = dim[u][1] = 0;
         if (!t.enabled || !(t.format & RSX_TEX_FMT_UNNORM) || !t.width || !t.height)
             continue;
         mask |= 1u << u;
@@ -2427,12 +2447,13 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
     u32 mask = 0;
     u32 feedback[RSX_BE_MAX_COLOR_TARGETS] = {0};
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
-        rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
         /* A unit left enabled by an earlier draw but not sampled by this
          * program is skipped: resolving it would cost a cache check, and an
          * aliased surface a store to guest memory, for nothing. */
-        if (!t.enabled || !((tex_used >> u) & 1u)) continue;
+        if (!((tex_used >> u) & 1u)) continue;
+        rsx_dsp_texture t;
+        rsx_dsp_get_texture(&g.rsx, u, &t);
+        if (!t.enabled) continue;
         mask |= 1u << u;
         eng_decode_sampler(t.filter, t.wrap, t.control0, &samplers[u]);
 
