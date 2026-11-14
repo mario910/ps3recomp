@@ -405,6 +405,13 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
      * again. Per-job ownership and the guest bytes are unchanged. */
     const int ls_zero = exchange ? spurs_job_ls_zero_mode() : 0;
     spu_context_init_keep_ls_prefix(ctx,0,ls_zero ? SPU_LS_SIZE : size_bin);
+    /* An exchanged context is unregistered when it is staged: every job that
+     * ran on it ended with the check below. Registration happens only on the
+     * executing thread, so an unchanged count at the end means "still not
+     * registered". SPURS_JOB_COH_SKIP=1 enables the skip (default: unconditional call). */
+    static int coh_skip = -1;
+    if (coh_skip < 0) { const char* e = getenv("SPURS_JOB_COH_SKIP"); coh_skip = e && e[0] == '1';   /* opt-in: no measurable gain on the Deck */ }
+    const unsigned long coh_mark = spu_coh_thread_registrations();
     ctx->image_id=image_id;
     uint8_t* ls=ctx->ls;
 
@@ -752,7 +759,8 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
     const unsigned phase_mfc=phase_seconds && ctx->mfc_private!=NULL;
     const unsigned phase_atomic=phase_seconds && ctx->dbg_getllar!=0;
     spu_mfc_release(ctx);
-    spu_coh_unregister(ctx);   /* no outstanding reservation may retain ctx */
+    if (!exchange || !coh_skip || spu_coh_thread_registrations() != coh_mark)
+        spu_coh_unregister(ctx);   /* no outstanding reservation may retain ctx */
     /* The snapshot's only reader is the printf service, which follows a
      * mailbox the job posted. SPURS_JOB_LS_PUBLISH=mbox hands over only such
      * jobs' LS; others keep their context on this thread, warm in its cache,

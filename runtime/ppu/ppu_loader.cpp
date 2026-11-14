@@ -1591,6 +1591,20 @@ static struct VmInlineInit {
     }
 } s_vm_inline_init;
 
+/* ppu_recomp.h's inline stores (vm_write*_inl, PPU_INLINE_STORES) skip the
+ * out-of-line writers' diagnostics, so they run only while none is armed.
+ * PPU_NO_INLINE_STORES=1 sends every store through the out-of-line path. */
+extern "C" int vm_store_inline_ok = 0;
+static struct VmStoreInlineInit {
+    VmStoreInlineInit() {
+        static const char* const vars[] = {
+            "PPU_WVAL", "PPU_WWATCH", "PPU_NO_INLINE_STORES", "PPU_RESV_STORE", "PT", 0 };
+        int d = 0;
+        for (int i = 0; vars[i]; i++) if (getenv(vars[i])) d = 1;
+        vm_store_inline_ok = !d;
+    }
+} s_vm_store_inline_init;
+
 uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap((uint32_t)a,1);
     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 1, __builtin_return_address(0));
 #ifdef VM_SAMPLE_READS

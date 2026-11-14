@@ -215,6 +215,75 @@ static inline uint64_t vm_read64_inl(uint64_t a)
 #define vm_read64(a) vm_read64_inl(a)
 #endif
 
+/* Inline guest-store fast paths (opt-in per TU: PPU_INLINE_STORES). Every
+ * lifted store -- each prologue register save included -- was an out-of-line
+ * call that itself called the lock-line lookup. The fast path makes the same
+ * decisions inline: no write diagnostic armed, an ordinary mapped address
+ * (not the null page, not the raw-SPU register windows) and no SPU lock-line
+ * reservation marked on the line. Everything else, and every store while
+ * PPU_NO_INLINE_STORES is set in the environment, takes the out-of-line path. */
+#if defined(PPU_INLINE_STORES) && !defined(_WIN32)
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern int      vm_store_inline_ok;
+extern uint32_t g_null_sweep_hi, g_barrier_sync_watch;
+struct spu_coh_armed_s { int value; unsigned char padding[64 - sizeof(int)]; };
+extern struct spu_coh_armed_s g_spu_coh_armed;
+extern unsigned char g_spu_coh_bitmap[];
+extern uint64_t g_spurs_command_wait_lines;
+void spurs_command_written(uint32_t address);
+#ifdef __cplusplus
+}
+#endif
+static inline int vm_st_ok(uint32_t ea, uint32_t n)
+{
+    if (!(__builtin_expect(vm_store_inline_ok, 1) && ea >= 0x10000u && ea < 0xE0000000u &&
+          !(g_null_sweep_hi | g_barrier_sync_watch) &&
+          (ppu_vm_size == 0 || (uint64_t)ea + n <= ppu_vm_size))) return 0;
+    if (__builtin_expect(g_spu_coh_armed.value != 0, 1)) {
+        const uint32_t line = ea >> 7;
+        if (__builtin_expect((g_spu_coh_bitmap[line >> 3] >> (line & 7)) & 1u, 0)) return 0;
+    }
+    return 1;
+}
+static inline void vm_write8_inl(uint64_t a, uint8_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_st_ok(ea, 1)) { vm_base[ea] = v; return; }
+    vm_write8(a, v);
+}
+static inline void vm_write16_inl(uint64_t a, uint16_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_st_ok(ea, 2)) { const uint16_t r = __builtin_bswap16(v); memcpy(vm_base + ea, &r, 2); return; }
+    vm_write16(a, v);
+}
+static inline void vm_write32_inl(uint64_t a, uint32_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_st_ok(ea, 4)) { const uint32_t r = __builtin_bswap32(v); memcpy(vm_base + ea, &r, 4); return; }
+    vm_write32(a, v);
+}
+static inline void vm_write64_inl(uint64_t a, uint64_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_st_ok(ea, 8)) {
+        const uint64_t r = __builtin_bswap64(v); memcpy(vm_base + ea, &r, 8);
+        /* Same JTS command-slot hint as the out-of-line store. */
+        if (__builtin_expect((__atomic_load_n(&g_spurs_command_wait_lines, __ATOMIC_ACQUIRE) &
+                              (1ull << (((ea >> 7) ^ (ea >> 13)) & 63))) != 0, 0))
+            spurs_command_written(ea);
+        return;
+    }
+    vm_write64(a, v);
+}
+#define vm_write8(a, v)  vm_write8_inl((a), (v))
+#define vm_write16(a, v) vm_write16_inl((a), (v))
+#define vm_write32(a, v) vm_write32_inl((a), (v))
+#define vm_write64(a, v) vm_write64_inl((a), (v))
+#endif
+
 /* Syscall handler */
 #ifdef __cplusplus
 extern "C"

@@ -65,6 +65,8 @@ void spu_coh_notify_write(uint32_t ea);
 /* Remove a context from the reserving set. MUST be called before a
  * transient (stack-allocated) spu_context goes out of scope. */
 void spu_coh_unregister(spu_context* ctx);
+/* Number of holder entries the calling host thread has added so far. */
+unsigned long spu_coh_thread_registrations(void);
 void spu_coh_forget_range(uintptr_t lo, uintptr_t hi);  /* thread exit */
 /* As above, but leaves `self`'s own reservation alone: an SPU's own MFC
  * write does not cost it its reservation on hardware. */

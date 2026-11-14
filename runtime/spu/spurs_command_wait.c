@@ -38,10 +38,33 @@ void spurs_command_written(uint32_t address)
 void spurs_command_dma_written(uint32_t ea, uint32_t size)
 {
     if (!size) return;
+    const uint64_t lo = ea, hi = (uint64_t)ea + size;
+    /* Unfenced pre-check (SPURS_DMA_NOTIFY_FENCE=1 restores the fence on every
+     * PUT). Nearly every PUT is vertex or media data that no walker waits
+     * for, and the store-load fence cost more than the rest of this function
+     * on each of them. Without it, a walker that registers in the few
+     * nanoseconds between this PUT's copy and the load below can be missed;
+     * it then re-reads its slot after one park step (SPURS_JTS_PARK_US), the
+     * same bound that already covers unhooked publications. A PUT that does
+     * hit a registered line is fenced and re-checked as before. */
+    static int always_fence = -1;
+    if (__builtin_expect(always_fence < 0, 0)) {
+        const char* e = getenv("SPURS_DMA_NOTIFY_FENCE");
+        always_fence = !(e && e[0] == '0');   /* default: fence every PUT; =0 measured 17 vs 37 FPS (PPU word-wait relies on this fence) */
+    }
+    if (!always_fence) {
+        const uint64_t hint = __atomic_load_n(&g_spurs_command_wait_lines, __ATOMIC_RELAXED);
+        if (!hint) return;
+        if (size < 8192) {
+            int maybe = 0;
+            for (uint64_t a = lo & ~127ull; a < hi && !maybe; a += 128u)
+                maybe = (hint & spurs_command_line_bit((uint32_t)a)) != 0;
+            if (!maybe) return;
+        }
+    }
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     const uint64_t lines = __atomic_load_n(&g_spurs_command_wait_lines, __ATOMIC_ACQUIRE);
     if (!lines) return;
-    const uint64_t lo = ea, hi = (uint64_t)ea + size;
     for (uint64_t a = lo & ~127ull; a < hi; a += 128u) {
         if (!(lines & spurs_command_line_bit((uint32_t)a))) continue;
         /* A large PUT covers most filter bits. Check the registered words

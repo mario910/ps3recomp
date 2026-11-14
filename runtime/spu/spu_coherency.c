@@ -102,7 +102,9 @@ void spu_lockline_unlock(void) { atomic_store_explicit(&g_lockline, 0, memory_or
 #define SPU_COH_LINES       (1u << (32 - SPU_COH_LINE_SHIFT))   /* 2^25 lines */
 #define SPU_COH_BITMAP_SZ   (SPU_COH_LINES / 8)                 /* 4 MiB */
 
-static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
+/* Exported (read-only) for the inline PPU store fast path in ppu_recomp.h. */
+unsigned char g_spu_coh_bitmap[SPU_COH_BITMAP_SZ];
+#define s_coh_bitmap g_spu_coh_bitmap
 
 /* Zero until the first GETLLAR anywhere. Keeps the PPU fast path off the
  * bitmap entirely for a title that runs no SPU code, and keeps every existing
@@ -112,14 +114,15 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
 #if defined(_MSC_VER)
 __declspec(align(64))
 #endif
-static struct {
+struct spu_coh_armed_s {
     int value;
     unsigned char padding[64 - sizeof(int)];
-} s_coh_armed
+} g_spu_coh_armed
 #if !defined(_MSC_VER)
 __attribute__((aligned(64)))
 #endif
 ;
+#define s_coh_armed g_spu_coh_armed
 
 /* Every live virtual context may retain a reservation between scheduling
  * quanta; physical SPU count is not a bound on this set. All access is under
@@ -131,6 +134,17 @@ typedef struct spu_coh_entry {
 static spu_coh_entry* s_coh_ctxs;
 
 unsigned long g_spu_lr_raise = 0;
+
+/* Holder entries this host thread has added. A context only ever registers on
+ * the thread that is executing it (GETLLAR), so a job that starts on an
+ * unregistered context and ends with this count unchanged has nothing to
+ * unregister -- and need not take the process-wide lock-line lock to find
+ * that out (spurs_job.c; every pooled geometry job paid it). */
+#if defined(_MSC_VER) && !defined(__clang__)
+static __declspec(thread) unsigned long t_coh_registrations;
+#else
+static _Thread_local unsigned long t_coh_registrations;
+#endif
 
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
@@ -157,7 +171,10 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
     entry->ctx = ctx;
     entry->next = s_coh_ctxs;
     s_coh_ctxs = entry;
+    ++t_coh_registrations;
 }
+
+unsigned long spu_coh_thread_registrations(void) { return t_coh_registrations; }
 
 /* Drop a context from the reserving set.
  *

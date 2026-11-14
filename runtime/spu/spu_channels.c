@@ -908,7 +908,7 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
                   fprintf(stderr, "   wrch ch%-3d %llu%c", i, w[i], 10); } } }
     { if (__builtin_expect(g_spu_wrch_param_slow < 0, 0)) {
           const char* h = getenv("SPU_CHHIST");
-          g_spu_wrch_param_slow = h ? 1 : 0;
+          g_spu_wrch_param_slow = (h || getenv("SPU_WRCH_WRAP_OFF")) ? 1 : 0;
       } }
     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
 
@@ -993,6 +993,33 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         break;
     }
 }
+
+#ifdef SPU_WRCH_WRAP
+/* Linked with -Wl,--wrap=spu_wrch: every reference from another object (the
+ * lifted SPU code, the native job drivers) lands here first. The five MFC
+ * parameter channels only store into the context (mfc_channel_write), and a
+ * DMA command writes all five before its MFC_Cmd; answering them here keeps
+ * the full channel writer -- a very large frame with a dozen saved registers --
+ * for the one write per command that needs it. The body of spu_wrch is
+ * untouched, so its profile data still applies. The first write always takes
+ * the full path, which publishes g_spu_wrch_param_slow (nonzero while the
+ * SPU_CHHIST histogram is armed, or with SPU_WRCH_WRAP_OFF set). */
+void __real_spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
+void __wrap_spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
+{
+    if (__builtin_expect(g_spu_wrch_param_slow == 0, 1)) {
+        switch (channel) {
+        case MFC_LSA:   ctx->mfc_lsa  = value._u32[0];        return;
+        case MFC_EAH:   ctx->mfc_eah  = value._u32[0];        return;
+        case MFC_EAL:   ctx->mfc_eal  = value._u32[0];        return;
+        case MFC_Size:  ctx->mfc_size = value._u32[0];        return;
+        case MFC_TagID: ctx->mfc_tag  = value._u32[0] & 0x1F; return;
+        default: break;
+        }
+    }
+    __real_spu_wrch(ctx, channel, value);
+}
+#endif
 
 /* ===========================================================================
  * Channel-stall contract (faithful-adopt, from canersaka's fork).
