@@ -4960,6 +4960,9 @@ static int vk_batch_ring_prepare(void)
         VK_LOG("mapped draw slices unavailable; retaining command-copy batching\n");
         return 0;
     }
+    /* A consumer may write only the used prefix of a constant block (the
+     * unwritten transform constants are zero): start every slot zeroed. */
+    memset(s_batch.ring_constants.ptr, 0, (size_t)(s_batch.uniform_stride * s_batch.limit * contexts));
     s_batch.ring_ready = 1;
     VK_LOG("mapped draw slices ready (%u slots, uniform stride %llu)\n", s_batch.limit,
            (unsigned long long)s_batch.uniform_stride);

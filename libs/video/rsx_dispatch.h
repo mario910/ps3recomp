@@ -311,6 +311,14 @@ u32 rsx_dsp_restart_index(const rsx_dispatch* rsx);
  * the register block was never written. */
 void rsx_dsp_vertex_default(const rsx_dispatch* rsx, u32 index, float out[4]);
 
+/* Transform-constant extent (rsx_dispatch.c). */
+extern u32 g_rsx_dsp_constants_hw;
+void rsx_dsp_constants_note(u32 slots);
+void rsx_dsp_constants_draw_limit(u32 slots);
+u32  rsx_dsp_constants_extent(void);
+int  rsx_dsp_constants_extent_check(void);
+void rsx_dsp_constants_extent_full(void);
+
 #ifdef __cplusplus
 }
 #endif

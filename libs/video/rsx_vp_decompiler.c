@@ -64,6 +64,34 @@ u32 rsx_vp_program_size_instrs(const u8* ucode, u32 max_bytes)
     return 0;
 }
 
+/* One past the highest transform constant a program can read, or 512 when
+ * any source uses indexed addressing (vp_c[base + aN.x]) or the program is
+ * not terminated. Every source field is counted whether or not its opcode
+ * uses it, so the result can only be too large. A consumer that uploads the
+ * constant block per draw needs no more than this prefix (plus whatever it
+ * appends after slot 511). */
+u32 rsx_vp_constant_slots(const u8* ucode, u32 max_bytes)
+{
+    if (!ucode) return 512u;
+    u32 off = 0, slots = 0;
+    while (off + 16 <= max_bytes) {
+        const u32 d0 = rd_le(ucode + off + 0), d1 = rd_le(ucode + off + 4);
+        const u32 d2 = rd_le(ucode + off + 8), d3 = rd_le(ucode + off + 12);
+        (void)d0;
+        const u32 src[3] = { ((d2 >> 23) & 0x1FF) | ((d1 & 0xFF) << 9),
+                             (d2 >> 6) & 0x1FFFF,
+                             ((d3 >> 21) & 0x7FF) | ((d2 & 0x3F) << 11) };
+        if ((src[0] & 3) == 3 || (src[1] & 3) == 3 || (src[2] & 3) == 3) {
+            if ((d3 >> 1) & 1) return 512u;                 /* indexed */
+            const u32 slot = ((d1 >> 12) & 0x3FF) & 511u;
+            if (slot + 1u > slots) slots = slot + 1u;
+        }
+        off += 16;
+        if (d3 & 1u) return slots;                          /* D3.end */
+    }
+    return 512u;
+}
+
 /* ---- output appender --------------------------------------------------- */
 typedef struct { char* p; u32 cap; u32 len; int overflow; } Out;
 static void emit(Out* o, const char* s)

@@ -245,12 +245,56 @@ void rsx_dispatch_seed_transform_program(rsx_dispatch* rsx, const u32* words, u3
     memcpy(rsx->vp, words, count * sizeof(u32));
 }
 
+/* Transform-constant extent: one past the highest slot ever written through
+ * the dispatcher (never shrinks). Slots above it still hold their initial
+ * zeros, so a renderer that uploads the whole 512-slot block per draw may
+ * copy only this prefix into a destination whose tail is already zero.
+ * The draw engine narrows it further per draw to what the bound vertex
+ * program can read (rsx_dsp_constants_draw_limit).
+ * RSX_CONST_EXTENT=0 reports the full block; =2 also makes the draw engine
+ * verify the never-written tail on every draw. */
+u32 g_rsx_dsp_constants_hw = 0;
+static int s_constants_extent_mode = -1;
+static int rsx_dsp_constants_mode(void)
+{
+    if (s_constants_extent_mode < 0) {
+        const char* e = getenv("RSX_CONST_EXTENT");
+        s_constants_extent_mode = e && e[0] >= '0' && e[0] <= '2' ? e[0] - '0' : 1;
+    }
+    return s_constants_extent_mode;
+}
+void rsx_dsp_constants_note(u32 slots)
+{
+    if (slots > RSX_DSP_NUM_CONSTANTS) slots = RSX_DSP_NUM_CONSTANTS;
+    if (slots > g_rsx_dsp_constants_hw) {
+        /* Log each time the extent crosses a 32-slot boundary. */
+        if (((slots + 31u) >> 5) != ((g_rsx_dsp_constants_hw + 31u) >> 5))
+            fprintf(stderr, "[rsx] transform constant extent %u slots\n", slots);
+        g_rsx_dsp_constants_hw = slots;
+    }
+}
+/* The draw being issued reads at most this many slots (its vertex program's
+ * rsx_vp_constant_slots); set by the draw engine before it binds constants. */
+static u32 s_constants_draw_limit = RSX_DSP_NUM_CONSTANTS;
+void rsx_dsp_constants_draw_limit(u32 slots)
+{
+    s_constants_draw_limit = slots < RSX_DSP_NUM_CONSTANTS ? slots : RSX_DSP_NUM_CONSTANTS;
+}
+u32 rsx_dsp_constants_extent(void)
+{
+    if (!rsx_dsp_constants_mode()) return RSX_DSP_NUM_CONSTANTS;
+    return g_rsx_dsp_constants_hw < s_constants_draw_limit ? g_rsx_dsp_constants_hw : s_constants_draw_limit;
+}
+int rsx_dsp_constants_extent_check(void) { return rsx_dsp_constants_mode() == 2; }
+void rsx_dsp_constants_extent_full(void) { g_rsx_dsp_constants_hw = RSX_DSP_NUM_CONSTANTS; }
+
 void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, u32 count)
 {
     const u32 max_words = RSX_DSP_NUM_CONSTANTS * 4;
     if (count > max_words)
         count = max_words;
     memcpy(rsx->constants, words, count * sizeof(u32));
+    rsx_dsp_constants_note((count + 3u) / 4u);
 }
 
 /* Every NV4097_SET_VERTEX_DATA* variant writes the same constant ("current")
@@ -354,8 +398,10 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
     if (method >= M_VP_UPLOAD_CONST && method < M_VP_UPLOAD_CONST + 32 * 4) {
         const u32 word = (method - M_VP_UPLOAD_CONST) >> 2;
         const u32 slot = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2] + (word >> 2);
-        if (slot < RSX_DSP_NUM_CONSTANTS)
+        if (slot < RSX_DSP_NUM_CONSTANTS) {
             rsx->constants[slot][word & 3] = arg;
+            if (slot >= g_rsx_dsp_constants_hw) rsx_dsp_constants_note(slot + 1u);
+        }
         /* RSX_CONST_LOG=<lo>,<hi>: every transform-constant upload into that
          * slot range (first 400) -- what a shader's constants really were. */
         { static int lo = -2, hi = 0, n = 0;

@@ -203,6 +203,7 @@ typedef struct {
     u32 handle;
     u8 fixed;
     u16 tex_used;           /* units the pixel program samples */
+    u16 vs_slots;           /* transform constants the vertex program can read */
     u64 fp_hash;            /* eng_fp_debug_hash of the guest fragment program */
 } eng_pipeline;
 
@@ -1791,6 +1792,9 @@ static void eng_vertex_layout(rsx_vertex_layout_plan* layout,const eng_program_p
  * Vertex constant rows 0..3 are the transform when the guest programmed them
  * and identity when it did not: an all-zero matrix would collapse every vertex
  * onto the origin. */
+/* Transform constants the pipeline last returned by the lookup can read. */
+static u32 s_eng_vs_slots = RSX_DSP_NUM_CONSTANTS;
+
 static const char* const kEngFixedVS =
 "struct VSInput {\n"
 "    float4 a0:ATTR0;  float4 a1:ATTR1;  float4 a2:ATTR2;  float4 a3:ATTR3;\n"
@@ -2021,6 +2025,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         if (g.pipelines[i].key == key) {
             *out_fixed = g.pipelines[i].fixed;
             *out_tex_used = g.pipelines[i].tex_used;
+            s_eng_vs_slots = g.pipelines[i].vs_slots;
             *out_fp_hash = g.pipelines[i].fp_hash;
             return g.pipelines[i].handle;
         }
@@ -2097,6 +2102,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     g.pipelines[g.n_pipelines].fp_hash = fp_hash;
     g.pipelines[g.n_pipelines].handle = handle;
     g.pipelines[g.n_pipelines].fixed = (u8)fixed;
+    g.pipelines[g.n_pipelines].vs_slots =
+        (u16)(fixed ? RSX_DSP_NUM_CONSTANTS : rsx_vp_constant_slots(vp_uc, vp_instrs * 16u));
+    s_eng_vs_slots = g.pipelines[g.n_pipelines].vs_slots;
     g.pipelines[g.n_pipelines].tex_used =
         (u16)(fixed ? 0xFFFFu : eng_sampled_units(s_ps_hlsl));
     *out_tex_used = g.pipelines[g.n_pipelines].tex_used;
@@ -3056,7 +3064,24 @@ static void sink_end(void* user, const rsx_dispatch* r)
         xf[5] = -((vp.translate[1] - Hv * 0.5f) / (Hv * 0.5f));
         xf[6] = vp.translate[2];
     }
-    memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
+    /* Only the slots the title has ever written; the rest of vp_cb is still
+     * the zeros it was allocated with (rsx_dsp_constants_extent). */
+    { u32 vs_slots = g_rsx_dsp_constants_hw;
+      if (rsx_dsp_constants_extent_check() && vs_slots < RSX_DSP_NUM_CONSTANTS) {
+          const u32* tail = &g.rsx.constants[vs_slots][0];
+          u32 any = 0;
+          for (u32 i = 0; i < (RSX_DSP_NUM_CONSTANTS - vs_slots) * 4u; i++) any |= tail[i];
+          if (any) {
+              fprintf(stderr, "[rsx] transform constant extent %u MISSED a writer; using the full block\n", vs_slots);
+              rsx_dsp_constants_extent_full();
+              vs_slots = RSX_DSP_NUM_CONSTANTS;
+          }
+      }
+      /* ... and of those, only what this draw's vertex program can read.
+       * Slots above stay stale in vp_cb; no consumer looks at them. */
+      rsx_dsp_constants_draw_limit(pipeline_is_fixed ? RSX_DSP_NUM_CONSTANTS : s_eng_vs_slots);
+      vs_slots = rsx_dsp_constants_extent();
+      memcpy(g.vp_cb, g.rsx.constants, vs_slots * 16u); }
     memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
 
     /* The buffered fragment constants, then fp_alpha: the layout

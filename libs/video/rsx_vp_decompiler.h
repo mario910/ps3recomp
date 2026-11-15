@@ -23,6 +23,8 @@ extern "C" {
 
 /* Number of instructions in the program at `ucode` (each 16 bytes), up to and
  * including the one with the D3.end bit, bounded by max_bytes. 0 if none. */
+/* One past the highest transform constant the program can read (512 if indexed). */
+u32 rsx_vp_constant_slots(const u8* ucode, u32 max_bytes);
 u32 rsx_vp_program_size_instrs(const u8* ucode, u32 max_bytes);
 
 typedef struct rsx_vp_input_analysis {
