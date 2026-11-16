@@ -408,9 +408,9 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
     /* An exchanged context is unregistered when it is staged: every job that
      * ran on it ended with the check below. Registration happens only on the
      * executing thread, so an unchanged count at the end means "still not
-     * registered". SPURS_JOB_COH_SKIP=1 enables the skip (default: unconditional call). */
+     * registered". SPURS_JOB_COH_SKIP=0 restores the unconditional call. */
     static int coh_skip = -1;
-    if (coh_skip < 0) { const char* e = getenv("SPURS_JOB_COH_SKIP"); coh_skip = e && e[0] == '1';   /* opt-in: no measurable gain on the Deck */ }
+    if (coh_skip < 0) { const char* e = getenv("SPURS_JOB_COH_SKIP"); coh_skip = !(e && e[0] == '0');   /* exact; pays off once native drivers reserve holder-less */ }
     const unsigned long coh_mark = spu_coh_thread_registrations();
     ctx->image_id=image_id;
     uint8_t* ls=ctx->ls;

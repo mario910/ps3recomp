@@ -436,8 +436,21 @@ int spu_fast_lift_allowed(void)
            (g_spu_tailret >= 0 ? g_spu_tailret : spu_tailret_enabled()) == 0;
 }
 
+/* spu_direct_hops.h: 1 once the startup-configured part of these hooks is
+ * known to reduce to ctx->steps++, 0 if not (or SPU_DIRECT_HOPS=0). Lifted
+ * code keeps returning here until then. */
+int g_spu_direct_hops = -1;
+static void spu_direct_hops_init(void)
+{
+    const char* e = getenv("SPU_DIRECT_HOPS");
+    __atomic_store_n(&g_spu_direct_hops,
+        spu_fast_lift_allowed() && !getenv("SPU_PCHIST") && !(e && e[0] == '0') ? 1 : 0,
+        __ATOMIC_RELAXED);
+}
+
 static inline void spu_step_hooks(spu_context* ctx, void* fn)
 {
+    if (__builtin_expect(g_spu_direct_hops < 0, 0)) spu_direct_hops_init();
     if (g_spu_step_observer) g_spu_step_observer(ctx, (uint32_t)ctx->pc & SPU_LS_MASK);
     if (g_yz_lockstep_on != 0) yz_lockstep_tick(ctx);
     if (spu_launch_check_slow() || g_pm_flow_ctx == (void*)ctx ||
@@ -466,7 +479,12 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
      * loop exits, whichever first. */
     spu_irq_frame f;
     f.prev = 0; f.depth = 0; f.image_id = 0;
-#define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; } while (0)
+    /* A fragment that hops directly after this bracket (spu_direct_hops.h)
+     * never passes the enclosing loop's re-set, so hand its value back
+     * instead of clearing it. Without direct hops the enclosing loop
+     * overwrites it before its next step either way. */
+    const uint32_t outer_ret_pc = ctx->drain_ret_pc;
+#define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = outer_ret_pc; } while (0)
     for (;;) {
         while (g_spu_trampoline_fn) {
             if (g_spu_trampoline_fn == spu_indirect_branch &&

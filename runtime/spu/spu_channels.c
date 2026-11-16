@@ -639,7 +639,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         /* Tell the PPU store paths this line is live, so a store into it goes
          * through the lock and raises SPU_EVENT_LR here instead of landing
          * unannounced. Nothing else about this transaction changes. */
-        spu_coh_reserve(ctx, ea);
+        spu_coh_reserve(spu_coh_holderless() ? NULL : ctx, ea);
 
         /* ONE read of guest memory, then the snapshot from that copy.
          *

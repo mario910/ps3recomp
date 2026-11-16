@@ -11,6 +11,7 @@
  */
 
 #include <stdlib.h>
+#include <string.h>
 #include "spu_coherency.h"
 
 #include <stdint.h>
@@ -175,6 +176,52 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 }
 
 unsigned long spu_coh_thread_registrations(void) { return t_coh_registrations; }
+
+/* Holder-less reservations (SPU_COH_HOLDERLESS=0 disables). A native driver
+ * that knows its GETLLAR is followed by an unconditional PUTLLUC of the same
+ * line, with no conditional store and no event read in between, does not need
+ * to be found by writers of that line: the reservation is never tested. While
+ * the flag is set on this thread, GETLLAR marks the line but registers no
+ * holder, so the job needs neither the registration nor the unregister at its
+ * end (both under the process-wide lock-line lock). A driver that instead has
+ * to hand the reservation to original code calls spu_coh_reserve_late first. */
+#if defined(_MSC_VER) && !defined(__clang__)
+static __declspec(thread) int t_coh_holderless;
+#else
+static _Thread_local int t_coh_holderless;
+#endif
+static int spu_coh_holderless_allowed(void)
+{
+    static int allowed = -1;
+    int v = __atomic_load_n(&allowed, __ATOMIC_RELAXED);
+    if (v < 0) {
+        const char* e = getenv("SPU_COH_HOLDERLESS");
+        v = !(e && e[0] == '0');
+        __atomic_store_n(&allowed, v, __ATOMIC_RELAXED);
+    }
+    return v;
+}
+void spu_coh_set_holderless(int on) { t_coh_holderless = on && spu_coh_holderless_allowed(); }
+int spu_coh_holderless(void) { return t_coh_holderless; }
+/* Make a holder-less reservation an ordinary one: if the line still equals
+ * the snapshot, register the holder; otherwise the reservation is lost, as it
+ * would have been when the line was written. */
+void spu_coh_reserve_late(spu_context* ctx, const unsigned char* line_now)
+{
+    if (!ctx || !ctx->resv_valid) return;
+    spu_lockline_lock();
+    if (line_now && memcmp(line_now, ctx->resv_line, sizeof ctx->resv_line) != 0) {
+        ctx->resv_valid = 0;
+        ctx->event_status |= SPU_EVENT_LR;
+        g_spu_lr_raise++;
+    } else {
+        const int saved = t_coh_holderless;
+        t_coh_holderless = 0;
+        spu_coh_reserve(ctx, ctx->resv_ea);
+        t_coh_holderless = saved;
+    }
+    spu_lockline_unlock();
+}
 
 /* Drop a context from the reserving set.
  *

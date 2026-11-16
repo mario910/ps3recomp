@@ -1934,3 +1934,12 @@ static inline void spu_wrch_dispatch(spu_context* ctx, uint32_t channel, u128 va
 #endif
 
 #endif /* SPU_HELPERS_H */
+
+/* Outside the include guard on purpose. Lifted translation units include this
+ * header directly as their last runtime header; a build may also force-include
+ * it earlier through another header (port/spu_shuffle.h), whose own functions
+ * must not see the redefined `return`. Only the direct inclusion from the
+ * lifted source file activates direct hops. */
+#if defined(SPU_DIRECT_HOPS) && defined(__INCLUDE_LEVEL__) && __INCLUDE_LEVEL__ == 1
+#include "spu_direct_hops.h"
+#endif
