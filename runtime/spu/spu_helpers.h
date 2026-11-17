@@ -1916,6 +1916,14 @@ static inline u128 spu_fsmb(u128 a) { return spu_fsmb_ref(a); }
  * write takes the original path. */
 #ifdef SPU_WRCH_FASTPATH
 SPU_GATE int g_spu_wrch_param_slow = -1;
+/* The out-of-line writer under a private C name: `spu_wrch` itself becomes an
+ * object-like macro below, so that the prototype a lifted spu_recomp.h
+ * repeats afterwards merely redeclares the inline dispatcher. */
+#if defined(__APPLE__)
+extern void spu_wrch_out_of_line(spu_context* ctx, uint32_t channel, u128 value) __asm__("_spu_wrch");
+#else
+extern void spu_wrch_out_of_line(spu_context* ctx, uint32_t channel, u128 value) __asm__("spu_wrch");
+#endif
 static inline void spu_wrch_dispatch(spu_context* ctx, uint32_t channel, u128 value)
 {
     if (__builtin_expect(g_spu_wrch_param_slow == 0, 1)) {
@@ -1928,9 +1936,9 @@ static inline void spu_wrch_dispatch(spu_context* ctx, uint32_t channel, u128 va
         default: break;
         }
     }
-    (spu_wrch)(ctx, channel, value);
+    spu_wrch_out_of_line(ctx, channel, value);
 }
-#define spu_wrch(ctx, channel, value) spu_wrch_dispatch((ctx), (channel), (value))
+#define spu_wrch spu_wrch_dispatch
 #endif
 
 #endif /* SPU_HELPERS_H */

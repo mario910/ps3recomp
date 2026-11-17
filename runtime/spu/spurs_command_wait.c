@@ -12,6 +12,8 @@ static Waiter waiters[WAITERS];
 static SRWLOCK lock = SRWLOCK_INIT;
 uint64_t g_spurs_command_wait_lines;
 
+extern int spurs_job_idle_step(void);
+
 static uint64_t read_be64(const uint8_t* memory, uint32_t address)
 {
     uint64_t value;
@@ -183,6 +185,11 @@ void spurs_command_wait(const uint8_t* memory, uint32_t pc, uint32_t chain,
             if ((uint64_t)(now.QuadPart - start.QuadPart) >= ticks) break;
         }
     }
+    /* About to park: do this thread's idle job-staging work first, one chunk
+     * at a time, rechecking the slot in between (spurs_job.c). */
+    while (spurs_job_idle_step())
+        if (published(memory, pc, chain, published_pc)) return;
+    if (published(memory, pc, chain, published_pc)) return;
     AcquireSRWLockExclusive(&lock);
     unsigned i = 0;
     for (; i < WAITERS && waiters[i].active; ++i) {}

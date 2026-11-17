@@ -39,6 +39,7 @@
 #include "spu_workload.h"
 #include "spu_context.h"
 #include "spurs_job_ls.h"
+#include "spurs_job_pool.h"
 #include "spurs_job_options.h"
 #if defined(SPU_NATIVE_RTZ_IMAGE) || defined(SPU_NATIVE_RTZ_EXTRA_IMAGE) || defined(SPU_NATIVE_RTZ_IMAGE39)
 #include <immintrin.h>
@@ -293,7 +294,8 @@ static int spurs_job_ls_zero_mode(void)
     return m;
 }
 
-/* Lazy LS clearing (SPURS_JOB_LAZY_ZERO_IMAGES, default "41"; image 40 publishes cleared bytes). For images
+/* Lazy LS clearing (SPURS_JOB_LAZY_ZERO_IMAGES, default "41,40"; image 40's
+ * native driver zeroes the few deferred bytes it reads, spurs_job_lazy_zero_span). For images
  * whose native whole-job driver reads only staged inputs, the large clear of
  * the output/scratch/stack regions is deferred: everything a job can read as
  * input (the gap below the ioBuffer, every input's alignment tail and a
@@ -307,6 +309,17 @@ void spurs_job_set_lazy_zero(uint8_t* ls, uint32_t begin, uint32_t end)
 {
     s_lazy_ls = end > begin ? ls : NULL; s_lazy_begin = begin; s_lazy_end = end;
 }
+/* Zero [lsa, lsa+bytes) of a pending deferred clear now: a native driver that
+ * reads a few LS bytes of the deferred range (image 40 reads past each GET
+ * target, as the original does) sees exactly what eager clearing left there. */
+void spurs_job_lazy_zero_span(const uint8_t* ls, uint32_t lsa, uint32_t bytes)
+{
+    if (!s_lazy_ls || ls != s_lazy_ls) return;
+    uint64_t lo = lsa, hi = (uint64_t)lsa + bytes;
+    if (lo < s_lazy_begin) lo = s_lazy_begin;
+    if (hi > s_lazy_end) hi = s_lazy_end;
+    if (lo < hi) memset(s_lazy_ls + lo, 0, (size_t)(hi - lo));
+}
 void spurs_job_flush_lazy_zero(void)
 {
     if (s_lazy_ls) memset(s_lazy_ls + s_lazy_begin, 0, s_lazy_end - s_lazy_begin);
@@ -319,7 +332,7 @@ static int spurs_job_lazy_zero_image(int image)
     if (m == UINT64_MAX) {
         m = 0;
         const char* e = getenv("SPURS_JOB_LAZY_ZERO_IMAGES");
-        if (!e) e = "41";
+        if (!e) e = "41,40";
         if (getenv("BUZZ_JOB_CORPUS")) e = "";
         while (*e) {
             char* end; long id = strtol(e, &end, 10);
@@ -360,6 +373,84 @@ static uint32_t spurs_job_binary_copy_from(const uint8_t* ls, uint32_t ea, uint3
     }
     s_bin_ls = ls; s_bin_ea = ea; s_bin_size = size; s_bin_clean = 0;
     return from;
+}
+
+/* Idle pre-clearing (SPURS_JOB_PRECLEAR=0 disables). Staging a job on an
+ * exchanged context zeroes everything above the job binary (ls_zero mode 1):
+ * up to ~200 KiB per job, on the serial chain thread among others. The next
+ * job of this thread will use s_spare_context, and nothing else reads that
+ * context until then, so a thread that is about to wait -- the chain walker
+ * parked on an unpublished command, a pool worker without work -- zeroes it
+ * instead, in chunks, top down. Opt-in (SPURS_JOB_PRECLEAR=1): measured neutral. [s_pre_from, SPU_LS_SIZE) of s_pre_ctx is then
+ * known to be zero and staging skips clearing it. Any staging on this thread
+ * ends the state first, so a nested or interleaved job never relies on it. */
+static SPURS_JOB_TLS spu_context* s_pre_ctx;
+static SPURS_JOB_TLS uint32_t s_pre_from, s_pre_low, s_pre_high;
+static SPURS_JOB_TLS int s_job_depth;
+static int spurs_job_preclear_enabled(void)
+{
+    static int v = -1;
+    int e = __atomic_load_n(&v, __ATOMIC_RELAXED);
+    if (e < 0) {
+        const char* s = getenv("SPURS_JOB_PRECLEAR");
+        e = s && s[0] == '1' && !getenv("BUZZ_JOB_CORPUS");   /* opt-in: neutral on the Deck (2026-11-17) */
+        __atomic_store_n(&v, e, __ATOMIC_RELAXED);
+    }
+    return e;
+}
+/* One chunk of idle work. Returns 1 while more remains. */
+int spurs_job_idle_step(void)
+{
+    spu_context* ctx = s_pre_ctx;
+    if (!ctx || s_job_depth || ctx != s_spare_context || s_pre_from <= s_pre_low) return 0;
+    /* [s_pre_from, s_pre_high) is zero; extend it downwards. */
+    enum { CHUNK = 32 * 1024 };
+    const uint32_t next = s_pre_from - s_pre_low > CHUNK ? s_pre_from - CHUNK : s_pre_low;
+    memset(ctx->ls_store + next, 0, s_pre_from - next);
+    s_pre_from = next;
+    /* Binary reuse trusts bytes below s_bin_clean; never below what was just zeroed. */
+    if (s_bin_ls == ctx->ls_store && s_bin_clean > next) s_bin_clean = next;
+    return s_pre_from > s_pre_low;
+}
+/* Arm for the region the last job's staging cleared eagerly, [low, high):
+ * the next job on this thread is usually the same image with the same layout.
+ * Images with deferred clearing stage almost nothing eagerly; not armed. */
+static void spurs_job_preclear_arm(spu_context* ctx, uint32_t low, uint32_t high, int lazy)
+{
+    s_pre_ctx = NULL;
+    if (!ctx || lazy || !spurs_job_preclear_enabled() || spurs_job_ls_zero_mode() != 1) return;
+    low = (low + 15u) & ~15u; high &= ~15u;
+    if (high > SPU_LS_SIZE) high = SPU_LS_SIZE;
+    if (high <= low) return;
+    s_pre_ctx = ctx; s_pre_from = high; s_pre_high = high; s_pre_low = low;
+}
+
+static SPURS_JOB_TLS uint8_t* s_lane_ls;
+static int spurs_job_lane_deferred_image(int image)
+{
+    static uint64_t mask = UINT64_MAX;
+    uint64_t m = __atomic_load_n(&mask, __ATOMIC_RELAXED);
+    if (m == UINT64_MAX) {
+        m = 0;
+        const char* e = getenv("SPURS_POOL_DEFER_IMAGES");
+        if (!e) e = "41";
+        while (*e) {
+            char* end; long id = strtol(e, &end, 10);
+            if (end == e) break;
+            if (id > 0 && id < 64) m |= 1ull << id;
+            e = *end == ',' ? end + 1 : end;
+        }
+        __atomic_store_n(&mask, m, __ATOMIC_RELAXED);
+    }
+    return image > 0 && image < 64 && (m >> image & 1);
+}
+void spurs_job_bind_lane(void)
+{
+    if (!s_lane_ls) return;
+    const uint32_t id = spurs_job_pool_lane_acquire();
+    uint8_t* q = s_lane_ls + 0x1C8;
+    q[0] = (uint8_t)(id >> 24); q[1] = (uint8_t)(id >> 16); q[2] = (uint8_t)(id >> 8); q[3] = (uint8_t)id;
+    s_lane_ls = NULL;
 }
 
 static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
@@ -404,6 +495,11 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
      * calloc'ed a second 256 KiB store, then zeroed ctx and copied all of it
      * again. Per-job ownership and the guest bytes are unchanged. */
     const int ls_zero = exchange ? spurs_job_ls_zero_mode() : 0;
+    /* [zero_lo, zero_hi) of this LS is known to be zero (idle pre-clear). */
+    const int pre = ls_zero == 1 && ctx == s_pre_ctx;
+    const uint32_t zero_lo = pre ? s_pre_from : SPU_LS_SIZE, zero_hi = pre ? s_pre_high : SPU_LS_SIZE;
+    s_pre_ctx = NULL;
+    ++s_job_depth;
     spu_context_init_keep_ls_prefix(ctx,0,ls_zero ? SPU_LS_SIZE : size_bin);
     /* An exchanged context is unregistered when it is staged: every job that
      * ran on it ended with the check below. Registration happens only on the
@@ -461,8 +557,11 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
     const int lazy_zero = ls_zero == 1 && p > size_bin && io_ls >= size_bin && spurs_job_lazy_zero_image(image_id);
     if (lazy_zero)
         memset(ls + size_bin, 0, io_ls - size_bin);
-    else if (ls_zero == 1 && p > size_bin)
-        memset(ls + size_bin, 0, (p < SPU_LS_SIZE ? p : SPU_LS_SIZE) - size_bin);
+    else if (ls_zero == 1 && p > size_bin) {
+        const uint32_t e = p < SPU_LS_SIZE ? p : SPU_LS_SIZE;
+        /* Skip only a range wholly inside the known-zero interval. */
+        if (!(zero_lo <= size_bin && e <= zero_hi)) memset(ls + size_bin, 0, e - size_bin);
+    }
 
     /* ---- cache-hinted read-only inputs ---------------------------------- */
     uint32_t dma_base   = job_ea + JH_SIZE;          /* input list ... */
@@ -534,7 +633,16 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
      * job's own instruction words and it indexed per-SPU tables with an opcode
      * and halted. The lifted code never reads those bytes as data, so overlay
      * the kernel's view: SPU 0, our DMA tag, tracing off. */
+    /* Pool helpers: lane ids are tokens. Images in SPURS_POOL_DEFER_IMAGES
+     * (default 41) bind theirs late (spurs_job_bind_lane); others now. */
+    s_lane_ls = NULL;
+    if (spurs_job_pool_lane_dynamic()) {
+        if (spurs_job_lane_deferred_image(image_id)) s_lane_ls = ls;
+        else (void)spurs_job_pool_lane_acquire();
+    }
+    int lane_staged = 0;
     if (jm_iface) {
+        lane_staged = 1;
         memset(ls + 0x170, 0, 0x10);
         memset(ls + 0x1C0, 0, 0x10);
         ls32(ls, 0x1C8, g_spurs_job_spu_num);
@@ -550,7 +658,9 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
         ls32(ls,0x1C4,g32(s_job_owner+0x7C));
         ls32(ls,0x1C8,g_spurs_job_spu_num);
         ls32(ls,0x1CC,JOB_DMA_TAG);
+        lane_staged = 1;
     }
+    if (!lane_staged) s_lane_ls = NULL;
     ls32(ls, ctx_ls + JC_SIZE_JOB_DESC,
          ((dsz == 64 ? 0u : (dsz / 128u) & 0xFu) << 28) | jm_iface);
     ls16(ls, ctx_ls + JC_NUM_IO_BUFFER,    (uint16_t)n_dma);
@@ -756,6 +866,8 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
         fflush(stderr);
     }
 
+    --s_job_depth;
+    s_lane_ls = NULL;
     const unsigned phase_mfc=phase_seconds && ctx->mfc_private!=NULL;
     const unsigned phase_atomic=phase_seconds && ctx->dbg_getllar!=0;
     spu_mfc_release(ctx);
@@ -773,6 +885,7 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
     if (exchange && publish_mbox_only && !g_spurs_job_mbox_valid) {
         spurs_job_release_thread_context();
         s_spare_context = ctx;
+        spurs_job_preclear_arm(s_spare_context, size_bin, zero_end, lazy_zero);
     } else if (exchange) {
         void* previous = NULL;
         int adopted = spurs_job_ls_exchange(job_owner, ctx, ctx->ls, &previous);
@@ -780,6 +893,7 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
          * reuse a still-running outer context through the TLS cache. */
         spurs_job_release_thread_context();
         s_spare_context = adopted ? (spu_context*)previous : ctx;
+        spurs_job_preclear_arm(s_spare_context, size_bin, zero_end, lazy_zero);
     }
     if (trace_start) {
         uint64_t end = ps3_ft_now();

@@ -36,6 +36,10 @@ int spurs_job_pool_run_sequence(uint32_t instance, unsigned nspus, unsigned work
                                 const SpursPoolRange* ranges, unsigned range_count,
                                 uint32_t chain, spurs_pool_job_fn run,
                                 spurs_pool_next_fn next, void* context);
+/* Dynamic lane ids (SPURS_POOL_HELPERS); see spurs_job_pool.c. */
+int spurs_job_pool_lane_dynamic(void);
+uint32_t spurs_job_pool_lane_acquire(void);
+void spurs_job_pool_lane_release(void);
 /* Join idle workers. Call only after submission owners have stopped. */
 void spurs_job_pool_shutdown(void);
 #endif

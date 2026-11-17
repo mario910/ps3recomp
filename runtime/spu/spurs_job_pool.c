@@ -12,6 +12,7 @@
 
 extern void spurs_job_set_spu_num(uint32_t);
 extern uint32_t spurs_job_get_spu_num(void);
+extern int spurs_job_idle_step(void);
 typedef struct Batch {
     uint32_t first, stride, chain;
     unsigned count, next, remaining;
@@ -32,8 +33,13 @@ typedef struct Batch {
 static struct {
     SRWLOCK admission, lock;
     CONDITION_VARIABLE work, done;
-    HANDLE threads[5];
-    unsigned workers;
+    HANDLE threads[8];
+    unsigned workers;        /* lanes = virtual SPU ids 1..workers */
+    unsigned thread_count;   /* workers + helpers */
+    int dynamic;
+    SRWLOCK token_lock;
+    CONDITION_VARIABLE token_free;
+    unsigned token_busy;
     uint32_t instance;
     int initialized, stopping;
     Batch* head;
@@ -43,6 +49,39 @@ static struct {
     int caller_help;
 } pool;
 static _Thread_local int in_worker;
+static _Thread_local unsigned t_lane_token, t_lane_preferred;
+/* Dynamic lane ids (SPURS_POOL_HELPERS): with more workers than ids, a job
+ * binds an id only when it first needs one (spurs_job_bind_lane), and the
+ * worker loop returns it after the job; at most one job holds an id. */
+int spurs_job_pool_lane_dynamic(void) { return in_worker && pool.dynamic; }
+uint32_t spurs_job_pool_lane_acquire(void)
+{
+    if (!in_worker || !pool.dynamic) return spurs_job_get_spu_num();
+    if (t_lane_token) return t_lane_token;
+    AcquireSRWLockExclusive(&pool.token_lock);
+    unsigned id = 0;
+    for (;;) {
+        if (!(pool.token_busy & (1u << t_lane_preferred))) id = t_lane_preferred;
+        else for (unsigned n = 1; n <= pool.workers && !id; ++n)
+            if (!(pool.token_busy & (1u << n))) id = n;
+        if (id) break;
+        SleepConditionVariableSRW(&pool.token_free, &pool.token_lock, INFINITE, 0);
+    }
+    pool.token_busy |= 1u << id;
+    ReleaseSRWLockExclusive(&pool.token_lock);
+    t_lane_token = id;
+    spurs_job_set_spu_num(id);
+    return id;
+}
+void spurs_job_pool_lane_release(void)
+{
+    if (!t_lane_token) return;
+    AcquireSRWLockExclusive(&pool.token_lock);
+    pool.token_busy &= ~(1u << t_lane_token);
+    ReleaseSRWLockExclusive(&pool.token_lock);
+    WakeConditionVariable(&pool.token_free);
+    t_lane_token = 0;
+}
 
 /* Caller holds pool.lock. A submitting thread may claim its own tail batch;
  * remove it without changing the order of other ready batches. */
@@ -188,9 +227,13 @@ static DWORD WINAPI job_worker(LPVOID argument)
 {
     const unsigned lane_bit = 1u << (unsigned)(uintptr_t)argument;
     in_worker = 1;
-    spurs_job_set_spu_num((uint32_t)(uintptr_t)argument);
+    t_lane_preferred = ((unsigned)(uintptr_t)argument - 1u) % pool.workers + 1u;
+    spurs_job_set_spu_num(t_lane_preferred);
     for (;;) {
         spin_for_work(lane_bit);
+        /* No queued work: do idle job-staging work first (spurs_job.c). */
+        while (!__atomic_load_n(&pool.head, __ATOMIC_ACQUIRE) &&
+               !__atomic_load_n(&pool.stopping, __ATOMIC_RELAXED) && spurs_job_idle_step()) {}
         AcquireSRWLockExclusive(&pool.lock);
         while (!pool.stopping && (!pool.head || (pool.borrowed_lanes & lane_bit)))
             SleepConditionVariableSRW(&pool.work, &pool.lock, INFINITE, 0);
@@ -208,6 +251,7 @@ static DWORD WINAPI job_worker(LPVOID argument)
             ps3_ft_span(PS3_FT_POOL_READY, GetCurrentThreadId(), batch->chain,
                         batch->first, batch->queued_ns, ps3_ft_now());
         execute(batch, index);
+        spurs_job_pool_lane_release();
 
         AcquireSRWLockExclusive(&pool.lock);
         pool.busy_lanes &= ~lane_bit;
@@ -247,15 +291,24 @@ int spurs_job_pool_run_sequence(uint32_t instance, unsigned nspus, unsigned work
         const char* help = getenv("SPURS_POOL_CALLER_HELP");
         pool.caller_help = help && help[0] && help[0] != '0';
         (void)spin_ticks();   /* read once, before any lane polls */
-        for (unsigned n = 0; n < workers; ++n) {
+        unsigned helpers = 0;
+        { const char* e = getenv("SPURS_POOL_HELPERS");
+          if (e && *e && !pool.caller_help) helpers = (unsigned)atoi(e);
+          if (helpers > 3) helpers = 3; }
+        pool.workers = workers;
+        pool.thread_count = 0;
+        for (unsigned n = 0; n < workers + helpers; ++n) {
             HANDLE thread = CreateThread(NULL, 1024 * 1024, job_worker,
                                           (LPVOID)(uintptr_t)(n + 1), 0, NULL);
             if (!thread) break;
-            ps3_thread_name(thread, "SPURS pool lane %u", n + 1);
-            pool.threads[pool.workers++] = thread;
+            if (n < workers) ps3_thread_name(thread, "SPURS pool lane %u", n + 1);
+            else ps3_thread_name(thread, "SPURS pool helper %u", n + 1 - workers);
+            pool.threads[pool.thread_count++] = thread;
         }
-        fprintf(stderr, "[job-pool] instance=%08X workers=%u virtual-SPUs=1..%u (0 reserved)\n",
-                instance, pool.workers, pool.workers);
+        if (pool.thread_count < workers) pool.workers = pool.thread_count;
+        pool.dynamic = pool.thread_count > pool.workers;
+        fprintf(stderr, "[job-pool] instance=%08X workers=%u virtual-SPUs=1..%u (0 reserved) helpers=%u\n",
+                instance, pool.workers, pool.workers, pool.thread_count - pool.workers);
     }
     if (pool.instance != instance || !pool.workers || pool.workers > workers ||
         pool.workers >= nspus) {
@@ -329,12 +382,14 @@ void spurs_job_pool_shutdown(void)
     pool.stopping = 1;
     WakeAllConditionVariable(&pool.work);
     ReleaseSRWLockExclusive(&pool.lock);
-    for (unsigned n = 0; n < pool.workers; ++n) {
+    for (unsigned n = 0; n < pool.thread_count; ++n) {
         WaitForSingleObject(pool.threads[n], INFINITE);
         CloseHandle(pool.threads[n]);
         pool.threads[n] = NULL;
     }
     pool.workers = 0;
+    pool.thread_count = 0;
+    pool.dynamic = 0;
     pool.instance = 0;
     pool.initialized = 0;
     pool.stopping = 0;

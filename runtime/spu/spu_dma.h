@@ -15,6 +15,9 @@
 #ifndef SPU_DMA_H
 #define SPU_DMA_H
 
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include "spu_context.h"
 #include "../../include/ps3emu/log_first.h"
 #include "spu_coherency.h"
@@ -1047,6 +1050,22 @@ static inline int mfc_lean_enabled(void)
     return v;
 }
 
+/* Plain copy for the lean path. Most job DMAs are a few quadwords (image 39
+ * issues ~700 transfers of 128 bytes or less per job); for those an inline
+ * 16-byte loop replaces the libc call and its size dispatch. Same bytes, same
+ * single pass over source and destination. */
+static inline void mfc_lean_copy(uint8_t* dst, const uint8_t* src, uint32_t size)
+{
+#if defined(__SSE2__)
+    if (size <= 128 && !(size & 15u)) {
+        for (uint32_t o = 0; o < size; o += 16)
+            _mm_storeu_si128((__m128i*)(dst + o), _mm_loadu_si128((const __m128i*)(src + o)));
+        return;
+    }
+#endif
+    memcpy(dst, src, size);
+}
+
 /* 1 = handled here, 0 = not eligible (the caller runs the full path). */
 static inline int mfc_submit_lean(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 {
@@ -1071,7 +1090,7 @@ static inline int mfc_submit_lean(mfc_engine* mfc, spu_context* spu, uint32_t cm
     extern void (*g_spu_dma_observer)(spu_context*, uint32_t, uint32_t, uint32_t, uint32_t, const void*);
     if (cmd == MFC_GET_CMD) {
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        memcpy(ls_ptr, ea_ptr, size);
+        mfc_lean_copy(ls_ptr, ea_ptr, size);
         if (g_spu_dma_observer) g_spu_dma_observer(spu, 1, lsa, e, size, ls_ptr);
         { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
           spu_overlay_note_get(spu, e, (const uint8_t*)ls_ptr, size); }
@@ -1097,7 +1116,7 @@ static inline int mfc_submit_lean(mfc_engine* mfc, spu_context* spu, uint32_t cm
             }
             spu_lockline_unlock();
         } else {
-            memcpy(ea_ptr, ls_ptr, size);
+            mfc_lean_copy(ea_ptr, ls_ptr, size);
             for (uint32_t a = a0; ; a += 128u) {
                 if (spu_coh_is_reserved(a)) {
                     spu_lockline_lock();
