@@ -1,3 +1,6 @@
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE   /* sched_setaffinity, CPU_SET: lane placement */
+#endif
 #include "spurs_job_pool.h"
 #include "../platform/thread_name.h"
 #include "spurs_job_ls.h"
@@ -223,12 +226,48 @@ static void spin_for_work(unsigned lane_bit)
     }
 }
 
+/* Lane placement (SPURS_POOL_PIN: 1 on, 0 off; default on only for four
+ * physical cores with two threads each, i.e. the Steam Deck). Lane n runs on
+ * the first logical CPU of physical core n-1, so the geometry lanes never
+ * share a core with each other and the other game threads float on the SMT
+ * siblings. Deck, answer reveal (geometry bound): 27.3 vs 26.5 FPS; menu
+ * unchanged. Helpers and non-Linux hosts are not pinned. */
+#if defined(__linux__)
+#include <sched.h>
+static int pool_lane_cpu(unsigned lane)
+{
+    static int cpus[64], ncores = -1, enabled = -1;
+    if (ncores < 0) {
+        int logical = 0, n = 0;
+        for (int c = 0; c < 64; ++c) {
+            char path[96]; snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", c);
+            FILE* f = fopen(path, "r"); if (!f) break;
+            int first = -1; if (fscanf(f, "%d", &first) != 1) first = -1; fclose(f);
+            ++logical;
+            if (first == c && n < 64) cpus[n++] = c;     /* first thread of its core */
+        }
+        ncores = n;
+        const char* e = getenv("SPURS_POOL_PIN");
+        enabled = e && *e ? e[0] == '1' : (n == 4 && logical == 8);
+        if (enabled) fprintf(stderr, "[job-pool] lanes pinned one per physical core (%d cores, %d logical)\n", n, logical);
+    }
+    if (!enabled || !lane || (int)lane > ncores) return -1;
+    return cpus[lane - 1];
+}
+#endif
+
 static DWORD WINAPI job_worker(LPVOID argument)
 {
     const unsigned lane_bit = 1u << (unsigned)(uintptr_t)argument;
     in_worker = 1;
     t_lane_preferred = ((unsigned)(uintptr_t)argument - 1u) % pool.workers + 1u;
     spurs_job_set_spu_num(t_lane_preferred);
+#if defined(__linux__)
+    if ((unsigned)(uintptr_t)argument <= pool.workers) {
+        const int cpu = pool_lane_cpu((unsigned)(uintptr_t)argument);
+        if (cpu >= 0) { cpu_set_t set; CPU_ZERO(&set); CPU_SET(cpu, &set); sched_setaffinity(0, sizeof set, &set); }
+    }
+#endif
     for (;;) {
         spin_for_work(lane_bit);
         /* No queued work: do idle job-staging work first (spurs_job.c). */
