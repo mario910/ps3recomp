@@ -795,6 +795,20 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
                                uint32_t num_left, uint32_t dest_lsa,
                                uint64_t ea_base, uint32_t base_cmd, uint32_t tag)
 {
+    /* Gather lists read many small records other cores just wrote; copied
+     * one by one, each miss is taken in turn. Touch every source line first
+     * so the misses overlap (a hint only: no state changes). */
+    if (mfc_is_get(base_cmd) && num_left > 1 && vm_base) {
+        for (uint32_t i = 0; i < num_left; i++) {
+            const uint32_t el = (elem_lsa + i * 8) & SPU_LS_MASK;
+            const uint32_t word0 = spu_ls_read32(spu, el);
+            const uint32_t size = word0 & 0x7FFF;
+            const uint8_t* src = vm_base + spu_ls_read32(spu, el + 4);
+            for (uint32_t at = 0; at < size; at += 64) __builtin_prefetch(src + at);
+            if (size) __builtin_prefetch(src + size - 1);
+            if (word0 >> 31) break;
+        }
+    }
     for (uint32_t i = 0; i < num_left; i++) {
         uint32_t el = (elem_lsa + i * 8) & SPU_LS_MASK;
         uint32_t size_and_flags = spu_ls_read32(spu, el);
