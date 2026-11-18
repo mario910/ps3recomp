@@ -582,6 +582,16 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
 
     /* ---- input DMA list -> ioBuffer, each entry 16-byte aligned ---------- */
     uint32_t io_cur = io_ls, io_used = 0;
+    /* Touch every input's lines first: they were just written by other
+     * threads, and copying them one by one serializes the misses. */
+    if (n_dma > 1)
+        for (uint32_t i = 0; i < n_dma; i++) {
+            uint64_t e   = g64(dma_base + i * 8u);
+            uint32_t sz  = (uint32_t)((e >> 32) & 0x7FFFu);
+            const uint8_t* src = vm_base + (uint32_t)e;
+            if (!sz || !(uint32_t)e) continue;
+            for (uint32_t at = 0; at < sz && at < 4096u; at += 64) __builtin_prefetch(src + at);
+        }
     for (uint32_t i = 0; i < n_dma; i++) {
         uint64_t e   = g64(dma_base + i * 8u);
         uint32_t sz  = (uint32_t)((e >> 32) & 0x7FFFu);
