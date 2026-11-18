@@ -31,11 +31,15 @@
 #include "ps3emu/ps3_ftrace.h"
 static int spurs_create_log_full;
 static unsigned spurs_create_log_samples;
+static int spurs_chain_log_full;
+static unsigned spurs_chain_end_samples;
+static unsigned spurs_signal_samples;
 __attribute__((constructor)) static void spurs_create_log_init(void)
 {
     const char* mode=getenv("SPURS_ASYNC_TRACE");
     spurs_create_log_full=mode ? (mode[0] && mode[0]!='0') :
         (getenv("SPURS_TASKSET_TRACE")!=NULL || ps3_log_verbose());
+    spurs_chain_log_full = getenv("SPURS_JOB_TRACE") != NULL || ps3_log_verbose();
 }
 
 /* Bridge the real (BE) taskset EA + selected taskId from CreateTask to the image-22
@@ -2302,7 +2306,8 @@ s32 _cellSpursEventFlagInitialize(void* spurs, void* taskset,
 s32 _cellSpursSendSignal(void* taskset, u32 taskId)
 {
     uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
-    printf("[cellSpurs] _SendSignal(taskset=0x%08X id=%u)\n", taskset_ea, taskId);
+    if (spurs_create_log_full || ps3_log_sample(&spurs_signal_samples, 32))
+        printf("[cellSpurs] _SendSignal(taskset=0x%08X id=%u)\n", taskset_ea, taskId);
     /* Real delivery now that SPU tasks execute (comment was stale). */
     if (taskset_ea) spu_taskset_signal_task(taskset_ea, taskId);
     return CELL_OK;
@@ -3335,7 +3340,9 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc, u32* resume_pc)
         if (op == 7) {
             if (ext == (7 | (15 << 3))) {                     /* END */
                 if (native_abi) *resume_pc=pc+8;
-                printf("[cellSpurs] chain 0x%08X: END after %d job(s) pc=%08X cmd=%016llX\n", jc_ea, jobs,pc,(unsigned long long)cmd);
+                if (spurs_chain_log_full || ps3_log_sample(&spurs_chain_end_samples, 32))
+                    printf("[cellSpurs] chain 0x%08X: END after %d job(s) pc=%08X cmd=%016llX\n",
+                           jc_ea, jobs, pc, (unsigned long long)cmd);
                 if (jobs) jc_signal_done(jc_ea, jobs - 1);
                 return;
             }
