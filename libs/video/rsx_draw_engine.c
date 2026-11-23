@@ -2992,11 +2992,16 @@ static void sink_end(void* user, const rsx_dispatch* r)
     if (!g.ready || !dc.n_packets || !dc.fetch_ok) return;
     /* BUZZ_RSX_CAUSAL_NS=<ns>: diagnostic busy-wait per draw, to measure how
      * frame time responds to renderer-thread cost (causal profiling). */
-    { static long long causal=-1;
-      if(causal<0){const char* e=getenv("BUZZ_RSX_CAUSAL_NS");causal=e?atoll(e):0;}
-      if(causal>0){struct timespec t0,t1;clock_gettime(CLOCK_MONOTONIC,&t0);
-        do clock_gettime(CLOCK_MONOTONIC,&t1);
-        while((t1.tv_sec-t0.tv_sec)*1000000000ll+(t1.tv_nsec-t0.tv_nsec)<causal);} }
+    static long long causal_ns = -1;
+    if (causal_ns < 0) {
+        const char* value = getenv("BUZZ_RSX_CAUSAL_NS");
+        causal_ns = value ? atoll(value) : 0;
+        if (causal_ns < 0) causal_ns = 0;
+    }
+    if (causal_ns > 0) {
+        const u64 start = ps3_ft_now();
+        while (ps3_ft_now() - start < (u64)causal_ns) { }
+    }
     /* Mixed geometry sources have no defined concatenation here. Reject the
      * whole group instead of drawing partial/misordered geometry. */
     if (dc.n_immediate && (dc.n_arr || dc.n_idx || dc.inl_bytes ||
