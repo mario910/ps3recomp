@@ -4026,7 +4026,7 @@ static vk_eng_pipe s_epipe[VK_ENG_MAX_PIPE];
 static struct {
     VkRenderPass rp[VK_ENG_RT_FORMATS][RSX_BE_MAX_COLOR_TARGETS + 1]; /* by format, colour count */
     struct { u32 key[RSX_BE_MAX_COLOR_TARGETS + 1]; VkFramebuffer fb; } fb[VK_ENG_FB_CACHE];
-    u32          fb_count;
+    u32          fb_count, last_fb;
     vk_image     scratch_depth;                          /* when no zeta is bound */
     u32          scratch_w, scratch_h;
     u32          pipeline;
@@ -4724,8 +4724,15 @@ static VkFramebuffer vk_eng_framebuffer(VkRenderPass rp, const u32* rt, u32 n, V
     u32 key[RSX_BE_MAX_COLOR_TARGETS + 1] = { 0 };
     for (u32 i = 0; i < n; i++) key[i] = rt[i];
     key[RSX_BE_MAX_COLOR_TARGETS] = dkey;
-    for (u32 i = 0; i < s_e2.fb_count; i++)
-        if (!memcmp(s_e2.fb[i].key, key, sizeof key)) return s_e2.fb[i].fb;
+    if (s_e2.last_fb < s_e2.fb_count &&
+        !memcmp(s_e2.fb[s_e2.last_fb].key, key, sizeof key))
+        return s_e2.fb[s_e2.last_fb].fb;
+    for (u32 i = 0; i < s_e2.fb_count; i++) {
+        if (!memcmp(s_e2.fb[i].key, key, sizeof key)) {
+            s_e2.last_fb = i;
+            return s_e2.fb[i].fb;
+        }
+    }
     if (s_e2.fb_count >= VK_ENG_FB_CACHE) vk_eng_drop_framebuffers();
     VkImageView views[RSX_BE_MAX_COLOR_TARGETS + 1];
     for (u32 i = 0; i < n; i++) views[i] = s_eobj[rt[i]].im.view;
@@ -4736,6 +4743,7 @@ static VkFramebuffer vk_eng_framebuffer(VkRenderPass rp, const u32* rt, u32 n, V
     VkFramebuffer fb = VK_NULL_HANDLE;
     if (pvkCreateFramebuffer(s_vk.device, &fci, NULL, &fb) != VK_SUCCESS) return VK_NULL_HANDLE;
     memcpy(s_e2.fb[s_e2.fb_count].key, key, sizeof key);
+    s_e2.last_fb = s_e2.fb_count;
     s_e2.fb[s_e2.fb_count++].fb = fb;
     return fb;
 }
@@ -5155,10 +5163,18 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     const VkBuffer vb = ring && batched ? s_batch.ring_vertices.buf : s_vk.vertices.buf;
     pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &vb, &off);
     if(s_gpu.pool)s_gpu.has_draw=1;
+    // An active merged pass keeps the same command buffer. Bind the entire
+    // index ring and select its slice via firstIndex for successive draws.
+    static VkBuffer pass_index_buffer;
+    if (!reuse_pass) pass_index_buffer=VK_NULL_HANDLE;
     if (indices && index_count) {
-        pvkCmdBindIndexBuffer(s_vk.cmd, ring && batched ? s_batch.ring_indices.buf : s_e2.indices.buf,
-                             ring && batched ? context_base+s_batch.index_head : 0, VK_INDEX_TYPE_UINT32);
-        pvkCmdDrawIndexed(s_vk.cmd, index_count, 1, 0, 0, 0);
+        const VkBuffer buffer=ring && batched ? s_batch.ring_indices.buf : s_e2.indices.buf;
+        if (!keep_pass || pass_index_buffer!=buffer) {
+            pvkCmdBindIndexBuffer(s_vk.cmd,buffer,0,VK_INDEX_TYPE_UINT32);
+            if (keep_pass) pass_index_buffer=buffer;
+        }
+        const u32 first_index=ring && batched ? (u32)((context_base+s_batch.index_head)/4) : 0;
+        pvkCmdDrawIndexed(s_vk.cmd,index_count,1,first_index,0,0);
     } else {
         pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
     }

@@ -28,6 +28,13 @@ class ResumeElementsTests(unittest.TestCase):
         self.assertEqual(p.returncode,0,p.stdout+p.stderr)
         self.assertIn('OK: actual parked/resume',p.stdout)
         self.assertEqual(p.stderr.count('[mfc-list] RESUME-ELEMS '),16)
+    def test_ordered_get_channels(self):
+        for full in (False, True):
+            env={k:v for k,v in os.environ.items() if not k.startswith(('SPU_','YDKJ_','LBP_'))}
+            if full:env['SPU_DMA_FULL']='1'
+            p=subprocess.run([str(self.exe),'channels'],capture_output=True,text=True,env=env,timeout=30)
+            self.assertEqual(p.returncode,0,p.stdout+p.stderr)
+            self.assertIn('OK: ordered GET channels',p.stdout)
     def test_empty_resume_beyond_cap(self):self.run_mode('empty')
     def test_actual_get_and_put_beyond_cap(self):self.run_mode('transfer')
     def test_repark_then_complete_beyond_cap(self):self.run_mode('repark')

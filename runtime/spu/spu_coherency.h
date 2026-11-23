@@ -54,6 +54,8 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea);
 /* Is `addr`'s line marked? The PPU store fast path -- a range-free O(1) bitmap
  * lookup guarded by a global that is zero until the first GETLLAR. */
 int spu_coh_is_reserved(uint32_t addr);
+/* Check the inclusive, line-aligned endpoints of one DMA transfer. */
+int spu_coh_span_reserved(uint32_t first, uint32_t last);
 
 /* A store by the PPU landed on `ea`'s line. Raise SPU_EVENT_LR on every SPU
  * whose live reservation covers it, drop that reservation, and wake the host

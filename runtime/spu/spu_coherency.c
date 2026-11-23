@@ -285,6 +285,23 @@ int spu_coh_is_reserved(uint32_t addr)
     return (__atomic_load_n(&s_coh_bitmap[line >> 3], __ATOMIC_ACQUIRE) >> (line & 7)) & 1u;
 }
 
+/* Inclusive, 128-byte-aligned endpoints. Unsigned line addresses wrap at
+ * the end of guest memory just like the per-line notification loop. */
+int spu_coh_span_reserved(uint32_t first, uint32_t last)
+{
+    if (!__atomic_load_n(&s_coh_armed.value, __ATOMIC_ACQUIRE)) return 0;
+    const uint32_t last_byte = last >> 10;
+    uint32_t byte = first >> 10;
+    unsigned mask = 0xffu << ((first >> 7) & 7);
+    for (;;) {
+        if (byte == last_byte) mask &= 0xffu >> (7 - ((last >> 7) & 7));
+        if (__atomic_load_n(&s_coh_bitmap[byte], __ATOMIC_ACQUIRE) & mask) return 1;
+        if (byte == last_byte) return 0;
+        byte = (byte + 1) & (SPU_COH_BITMAP_SZ - 1);
+        mask = 0xffu;
+    }
+}
+
 /* A DMA PUT is issued BY an SPU, and hardware does not take that SPU's own
  * reservation away for its own MFC write -- the MFC is part of the same SPE.
  * Our notify had no way to say "everyone but me", so an SPU that reserved a

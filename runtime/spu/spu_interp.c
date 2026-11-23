@@ -391,6 +391,40 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
     return spu_interp_run_until(ctx, start_lsa, 0);
 }
 
+/* Streamed image 2 overlay: accumulate four rotated samples and retain their
+ * component maxima. Verify every opcode before entering: LS is mutable. */
+static unsigned spu_sample_reduce(spu_context* ctx, uint32_t stop_lsa)
+{
+    static const unsigned char signature[] = {
+        0x38,0x82,0x03,0x15, 0x18,0x02,0x03,0x16, 0x3f,0xe0,0x0f,0x10,
+        0x1c,0x01,0x03,0x06, 0x78,0x02,0x43,0x0f, 0x3b,0x85,0x8a,0x94,
+        0x58,0x22,0xca,0x13, 0x58,0x44,0x09,0x91, 0x58,0x84,0xc3,0x87,
+        0x83,0xc4,0xc8,0x11, 0x20,0x7f,0xfb,0x0f
+    };
+    const unsigned start = 0x2f834, end = start + sizeof(signature);
+    u128* r = ctx->gpr;
+    const uint32_t bytes = r[9]._u32[0] - r[6]._u32[0];
+    if (!bytes || (bytes & 3) || bytes > SPU_LS_SIZE ||
+        (stop_lsa >= start && stop_lsa < end) ||
+        memcmp(ctx->ls + start, signature, sizeof(signature))) return 0;
+    for (unsigned pc = start + 4; pc < end; pc += 4)
+        if (spu_lifted_lookup(ctx, pc)) return 0;
+    for (unsigned left = bytes; left; left -= 4) {
+        r[21] = spu_ls_read128(ctx, r[6]._u32[0] + r[8]._u32[0]);
+        r[22] = spu_a(r[6], r[8]);
+        r[16] = r[30];
+        r[6] = spu_ai(r[6], 4);
+        r[15] = spu_ceq(r[6], r[9]);
+        r[20] = spu_rotqby(r[21], r[22]);
+        r[19] = spu_andc(r[20], r[11]);
+        r[17] = spu_fcgt(r[19], r[16]);
+        r[7] = spu_fa(r[7], r[19]);
+        r[30] = spu_selb(r[16], r[19], r[17]);
+    }
+    ctx->pc = end;
+    return (bytes / 4) * 11;
+}
+
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
     const int exact_counts=spu_interp_counts_enabled();
     ctx->pc = start_lsa & 0x3FFFC;
@@ -407,6 +441,8 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
      * (pc left the fn), when r3 and the leaf's non-restored intermediates are still live. */
     static int _g1=-1; if(_g1<0){const char*e=getenv("YDKJ_CRI_GATE1TRACE");_g1=e?atoi(e):0;}
     static int _g1in=0;
+    static long s_is = -1;
+    if (s_is < 0) { const char* e = getenv("SPU_INTERP_STATS"); s_is = e ? atol(e) : 0; }
     uint32_t ring[64]; int rc=0, rn=0;
     for (;;) {
         /* Match the lifted path: only synthetic HLE tasks may bypass the
@@ -431,6 +467,11 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
         /* ponytail: pc-only match; a recursive call through the same site would stop early -- compare r1 too if one shows up. */
         if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
         g_spu_interp_last_pc = ctx->pc;
+        if (ctx->pc == 0x2f834 && ctx->image_id == 2 && !exact_counts &&
+            _tr <= 0 && _g1 <= 0 && s_is <= 0) {
+            const unsigned count = spu_sample_reduce(ctx, stop_lsa);
+            if (count) { steps += count; continue; }
+        }
         if (_g1>0) {
             int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);
             if (inr) { _g1in = 1; }
@@ -452,8 +493,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
          * address nothing was lifted for runs here at a fraction of the
          * compiled speed, and from the outside that only looks like a
          * workload that is slow for no reason (late audio, slow decode). */
-        { static long s_is = -1;
-          if (s_is < 0) { const char* e = getenv("SPU_INTERP_STATS"); s_is = e ? atol(e) : 0; }
+        {
           if (s_is > 0) {
             enum { IS_N = 64 };
             static volatile long long s_tot;

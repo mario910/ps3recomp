@@ -747,6 +747,13 @@ static void test_texture_sparse_rehash(void)
     rsx_draw_engine_present();
     vm_base[TEX_OFFSET + 37] ^= 0xFF;
     CHECK(frames_to_notice(0) == 0, "a small texture is hashed in full every frame");
+    const int before_mips = stub.n_texture_create;
+    m(M_TEX_UNIT + 0x04, 2u | (2u << 4) | ((0x85u | 0x20u) << 8) | (2u << 16));
+    draw_triangle();
+    CHECK(stub.n_texture_create == before_mips + 1, "changing only the mip count selects a new layout");
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    CHECK(stub.n_texture_create == before_mips + 1, "the original mip layout remains cached");
     engine_down();
 
     /* PS3RECOMP_ENG_TEXHASH_FULL=1: the full hash every frame, as before. */

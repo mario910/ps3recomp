@@ -132,6 +132,22 @@ static void test_bitmap(void)
     CHECK(spu_coh_is_reserved(LINE_A - 1) == 0);
     CHECK(spu_coh_is_reserved(LINE_A + 128) == 0);
     CHECK(spu_coh_is_reserved(LINE_B) == 0);
+
+    TEST("range scan matches line marks across partial bitmap bytes and EA wrap");
+    spu_getllar(&g_spu_a, 0xffffff80u);
+    spu_getllar(&g_spu_a, 256);
+    const uint32_t bases[] = { LINE_A - 2048u, 0xfffff800u };
+    for (unsigned b = 0; b < sizeof(bases)/sizeof(bases[0]); ++b) {
+        for (unsigned i = 0; i < 32; ++i) {
+            uint32_t first = bases[b] + i * 128;
+            int marked = 0;
+            for (unsigned j = 0; j <= 32; ++j) {
+                uint32_t last = first + j * 128;
+                marked |= spu_coh_is_reserved(last);
+                CHECK(spu_coh_span_reserved(first, last) == marked);
+            }
+        }
+    }
 }
 
 /* ===========================================================================

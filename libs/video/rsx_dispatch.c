@@ -577,29 +577,30 @@ void rsx_dsp_get_vertex_attr(const rsx_dispatch* rsx, u32 index, rsx_dsp_vertex_
 
 void rsx_dsp_get_texture(const rsx_dispatch* rsx, u32 unit, rsx_dsp_texture* out)
 {
-    memset(out, 0, sizeof(*out));
-    if (unit >= RSX_DSP_NUM_TEXTURES)
+    if (unit >= RSX_DSP_NUM_TEXTURES) {
+        memset(out, 0, sizeof(*out));
         return;
-    const u32 base = M_TEX_OFFSET + unit * 0x20;
-    const u32 fmt  = rsx_dsp_reg(rsx, base + 0x04);
+    }
+    const u32* regs = &rsx->regs[M_TEX_OFFSET / 4 + unit * 8];
+    const u32 fmt  = regs[1];
     /* The offset is 31 bits; bit 31 is not part of it (RPCS3 masks it with 0x7FFFFFFF for fragment and vertex
      * textures). Taken whole, a main-memory texture bound at 0x82A22900 missed the IO lookup. The location comes from
      * the format word alone. */
-    out->offset    = rsx_dsp_reg(rsx, base) & 0x7FFFFFFFu;
+    out->offset    = regs[0] & 0x7FFFFFFFu;
     out->location  = (fmt & 3) == 2 ? RSX_LOCATION_MAIN : RSX_LOCATION_LOCAL;
     out->cubemap   = (fmt >> 2) & 1;
     out->dimension = (fmt >> 4) & 0xF;
     out->format    = (fmt >> 8) & 0xFF;
     out->mipmaps   = fmt >> 16;
-    out->wrap      = rsx_dsp_reg(rsx, base + 0x08);
-    out->control0  = rsx_dsp_reg(rsx, base + 0x0C);
+    out->wrap      = regs[2];
+    out->control0  = regs[3];
     out->enabled   = out->control0 >> 31;
-    out->remap     = rsx_dsp_reg(rsx, base + 0x10);
-    out->filter    = rsx_dsp_reg(rsx, base + 0x14);
-    const u32 rect = rsx_dsp_reg(rsx, base + 0x18);
+    out->remap     = regs[4];
+    out->filter    = regs[5];
+    const u32 rect = regs[6];
     out->width     = rect >> 16;
     out->height    = rect & 0xFFFF;
-    out->border_color = rsx_dsp_reg(rsx, base + 0x1C);
+    out->border_color = regs[7];
     const u32 sz1  = rsx_dsp_reg(rsx, M_TEX_SIZE1 + unit * 4);
     out->pitch     = sz1 & 0xFFFFF;
     out->depth     = sz1 >> 20;

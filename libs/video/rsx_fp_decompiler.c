@@ -112,23 +112,25 @@ u32 rsx_fp_read_word(const u8* p)
     return (be << 16) | (be >> 16);   /* 16-bit half-word swap */
 }
 
+/* END and source types are in the low bits of the half-word-swapped
+ * register words, all in byte 1 of their respective words on the wire. */
+static int fp_raw_has_constant(const u8* instruction)
+{
+    return ((instruction[5] & FP_REG_TYPE_MASK) == FP_REG_TYPE_CONST) |
+           ((instruction[9] & FP_REG_TYPE_MASK) == FP_REG_TYPE_CONST) |
+           ((instruction[13] & FP_REG_TYPE_MASK) == FP_REG_TYPE_CONST);
+}
+
 u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes)
 {
     if (!ucode) return 0;
     u32 off = 0;
-    while (off + 16 <= max_bytes) {
-        u32 w0 = rsx_fp_read_word(ucode + off + 0);
-        u32 w1 = rsx_fp_read_word(ucode + off + 4);
-        u32 w2 = rsx_fp_read_word(ucode + off + 8);
-        u32 w3 = rsx_fp_read_word(ucode + off + 12);
+    while (max_bytes - off >= 16) {
+        const u8* instruction = ucode + off;
+        const int constant = fp_raw_has_constant(instruction);
         off += 16;
-        /* A CONST source pulls an inline 16-byte constant slot. */
-        if (((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST ||
-            ((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST ||
-            ((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) {
-            if (off + 16 <= max_bytes) off += 16;
-        }
-        if (w0 & FP_END) return off;
+        if (constant && max_bytes - off >= 16) off += 16;
+        if (instruction[1] & FP_END) return off;
     }
     return 0;
 }
@@ -210,22 +212,19 @@ u64 rsx_fp_structural_hash(const u8* ucode, u32 max_bytes, u64 seed)
     u32 off = 0;
     u32 instruction_count = 0;
     u32 constant_count = 0;
-    while (off + 16 <= max_bytes) {
-        const u32 w0 = rsx_fp_read_word(ucode + off + 0);
-        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
-        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
-        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
-        hash = fp_hash_bytes(ucode + off, 16, hash);
+    while (max_bytes - off >= 16) {
+        const u8* instruction = ucode + off;
+        hash = fp_hash_bytes(instruction, 16, hash);
         instruction_count++;
         off += 16;
-        if (fp_instruction_has_constant(w1, w2, w3)) {
-            if (off + 16 > max_bytes ||
+        if (fp_raw_has_constant(instruction)) {
+            if (max_bytes - off < 16 ||
                 constant_count >= RSX_FP_MAX_INLINE_CONSTANTS)
                 return 0;
             constant_count++;
             off += 16;
         }
-        if (w0 & FP_END) {
+        if (instruction[1] & FP_END) {
             hash = fp_hash_bytes(
                 &instruction_count, sizeof(instruction_count), hash);
             hash = fp_hash_bytes(

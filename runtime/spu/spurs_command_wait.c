@@ -9,6 +9,9 @@
 enum { WAITERS = 32 };
 typedef struct { uint32_t pc, chain; int active; CONDITION_VARIABLE wake; } Waiter;
 static Waiter waiters[WAITERS];
+/* Writers change the occupied slots under lock; DMA readers take a snapshot
+ * after observing the published line mask. */
+static uint32_t occupied_slots;
 static SRWLOCK lock = SRWLOCK_INIT;
 uint64_t g_spurs_command_wait_lines;
 
@@ -24,8 +27,9 @@ static uint64_t read_be64(const uint8_t* memory, uint32_t address)
 void spurs_command_written(uint32_t address)
 {
     AcquireSRWLockExclusive(&lock);
-    for (unsigned i = 0; i < WAITERS; ++i) {
-        Waiter* w = &waiters[i];
+    for (uint32_t slots = __atomic_load_n(&occupied_slots, __ATOMIC_RELAXED);
+         slots; slots &= slots - 1) {
+        Waiter* w = &waiters[__builtin_ctz(slots)];
         if (w->active && (w->pc == address || w->chain == address))
             WakeConditionVariable(&w->wake);
     }
@@ -57,7 +61,7 @@ void spurs_command_dma_written(uint32_t ea, uint32_t size)
     if (!always_fence) {
         const uint64_t hint = __atomic_load_n(&g_spurs_command_wait_lines, __ATOMIC_RELAXED);
         if (!hint) return;
-        if (size < 8192) {
+        if (hi - (lo & ~127ull) <= 256) {
             int maybe = 0;
             for (uint64_t a = lo & ~127ull; a < hi && !maybe; a += 128u)
                 maybe = (hint & spurs_command_line_bit((uint32_t)a)) != 0;
@@ -67,31 +71,29 @@ void spurs_command_dma_written(uint32_t ea, uint32_t size)
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     const uint64_t lines = __atomic_load_n(&g_spurs_command_wait_lines, __ATOMIC_ACQUIRE);
     if (!lines) return;
-    for (uint64_t a = lo & ~127ull; a < hi; a += 128u) {
-        if (!(lines & spurs_command_line_bit((uint32_t)a))) continue;
-        /* A large PUT covers most filter bits. Check the registered words
-         * before taking the lock: a waiter's fields are stored before its
-         * release RMW of the line mask observed (acquire) above, and a waiter
-         * cleared since is no longer parked. */
-        int overlap = 0;
-        for (unsigned i = 0; i < WAITERS && !overlap; ++i) {
-            Waiter* w = &waiters[i];
-            if (!__atomic_load_n(&w->active, __ATOMIC_RELAXED)) continue;
-            const uint64_t pc = __atomic_load_n(&w->pc, __ATOMIC_RELAXED);
-            const uint64_t chain = __atomic_load_n(&w->chain, __ATOMIC_RELAXED);
-            overlap = (pc < hi && pc + 8ull > lo) || (chain < hi && chain + 8ull > lo);
-        }
-        if (!overlap) return;
-        AcquireSRWLockExclusive(&lock);
-        for (unsigned i = 0; i < WAITERS; ++i) {
-            Waiter* w = &waiters[i];
-            if (w->active && ((w->pc < hi && w->pc + 8ull > lo) ||
-                              (w->chain < hi && w->chain + 8ull > lo)))
-                WakeConditionVariable(&w->wake);
-        }
-        ReleaseSRWLockExclusive(&lock);
-        return;
+    // For long transfers inspect the few occupied waiter slots directly.
+    // Keep the mandatory post-copy fence and repeat the overlap under lock.
+    if (hi - (lo & ~127ull) <= 256 &&
+        !(lines & (spurs_command_line_bit((uint32_t)lo) | spurs_command_line_bit((uint32_t)(hi-1))))) return;
+    int overlap = 0;
+    for (uint32_t slots = __atomic_load_n(&occupied_slots, __ATOMIC_ACQUIRE);
+         slots && !overlap; slots &= slots - 1) {
+        Waiter* w = &waiters[__builtin_ctz(slots)];
+        if (!__atomic_load_n(&w->active, __ATOMIC_RELAXED)) continue;
+        const uint64_t pc = __atomic_load_n(&w->pc, __ATOMIC_RELAXED);
+        const uint64_t chain = __atomic_load_n(&w->chain, __ATOMIC_RELAXED);
+        overlap = (pc < hi && pc + 8ull > lo) || (chain < hi && chain + 8ull > lo);
     }
+    if (!overlap) return;
+    AcquireSRWLockExclusive(&lock);
+    for (uint32_t slots = __atomic_load_n(&occupied_slots, __ATOMIC_RELAXED);
+         slots; slots &= slots - 1) {
+        Waiter* w = &waiters[__builtin_ctz(slots)];
+        if (w->active && ((w->pc < hi && w->pc + 8ull > lo) ||
+                          (w->chain < hi && w->chain + 8ull > lo)))
+            WakeConditionVariable(&w->wake);
+    }
+    ReleaseSRWLockExclusive(&lock);
 }
 
 static unsigned logical_processors(void)
@@ -191,16 +193,17 @@ void spurs_command_wait(const uint8_t* memory, uint32_t pc, uint32_t chain,
         if (published(memory, pc, chain, published_pc)) return;
     if (published(memory, pc, chain, published_pc)) return;
     AcquireSRWLockExclusive(&lock);
-    unsigned i = 0;
-    for (; i < WAITERS && waiters[i].active; ++i) {}
-    if (i == WAITERS) {
+    const uint32_t slots = __atomic_load_n(&occupied_slots, __ATOMIC_RELAXED);
+    if (slots == UINT32_MAX) {
         ReleaseSRWLockExclusive(&lock);
         Sleep(timeout_ms);
         return;
     }
+    const unsigned i = __builtin_ctz(~slots);
     Waiter* w = &waiters[i];
     __atomic_store_n(&w->pc, pc, __ATOMIC_RELAXED); __atomic_store_n(&w->chain, chain, __ATOMIC_RELAXED);
     __atomic_store_n(&w->active, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&occupied_slots, slots | (1u << i), __ATOMIC_RELEASE);
     __atomic_fetch_or(&g_spurs_command_wait_lines,
                       spurs_command_line_bit(pc) | spurs_command_line_bit(chain), __ATOMIC_RELEASE);
     /* A write before registration is observed here; one after registration
@@ -215,10 +218,13 @@ void spurs_command_wait(const uint8_t* memory, uint32_t pc, uint32_t chain,
         SleepConditionVariableSRW(&w->wake, &lock, timeout_ms, 0);
     }
     __atomic_store_n(&w->active, 0, __ATOMIC_RELAXED);
+    const uint32_t remaining = __atomic_load_n(&occupied_slots, __ATOMIC_RELAXED) & ~(1u << i);
+    __atomic_store_n(&occupied_slots, remaining, __ATOMIC_RELEASE);
     uint64_t lines = 0;
-    for (unsigned n = 0; n < WAITERS; ++n)
-        if (waiters[n].active)
-            lines |= spurs_command_line_bit(waiters[n].pc) | spurs_command_line_bit(waiters[n].chain);
+    for (uint32_t active = remaining; active; active &= active - 1) {
+        const Waiter* other = &waiters[__builtin_ctz(active)];
+        lines |= spurs_command_line_bit(other->pc) | spurs_command_line_bit(other->chain);
+    }
     __atomic_store_n(&g_spurs_command_wait_lines, lines, __ATOMIC_RELEASE);
     ReleaseSRWLockExclusive(&lock);
 }

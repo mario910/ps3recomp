@@ -191,6 +191,7 @@ typedef struct {
     u32 location, offset, format, width, height, pitch, remap, cubemap;
     u32 handle;
     u64 content_hash;
+    u32 levels, span;           /* layout validated when this entry was created */
     u64 sparse_hash;            /* eng_texture_sparse_hash, the per-frame check */
     u32 last_full_frame;        /* g.frames of the last full content hash */
     u32 last_hash_frame;
@@ -250,6 +251,9 @@ static struct {
     u32* indices;
     u32 index_cap;
 
+    int render_hash_valid;
+    u64 render_hash_seed, render_hash_result;
+    rsx_be_render_state render_hash_state;
     rsx_fp_constant_block fp_constants;
 } g;
 
@@ -336,10 +340,9 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
     rs->alpha_test_enable = rsx_dsp_reg(rsx, M_ALPHA_TEST_ENABLE) & 1;
     rs->alpha_func   = rsx_dsp_reg(rsx, M_ALPHA_FUNC);
     rs->alpha_ref_raw = rsx_dsp_reg(rsx, M_ALPHA_REF);
-    rsx_dsp_surface sf;
-    rsx_dsp_get_surface(rsx, &sf);
-    rs->alpha_ref_format = sf.color_format;
-    rs->rt_fp16 = sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16;
+    /* Only the colour format participates in this render state. */
+    rs->alpha_ref_format = rsx_dsp_reg(rsx, 0x0208u) & 0x1Fu;
+    rs->rt_fp16 = rs->alpha_ref_format == RSX_SURFACE_FMT_F_W16Z16Y16X16;
     rs->blend_enable = rsx_dsp_reg(rsx, M_BLEND_ENABLE) & 1;
     const u32 sfac = rsx_dsp_reg(rsx, M_BLEND_SFACTOR);
     const u32 dfac = rsx_dsp_reg(rsx, M_BLEND_DFACTOR);
@@ -1042,10 +1045,24 @@ static void eng_deswizzle_3d_slice(u8* dst, const u8* src, u32 w, u32 h, u32 d, 
     while ((1u << lw) < w) lw++;
     while ((1u << lh) < h) lh++;
     while ((1u << ld) < d) ld++;
-    for (u32 y = 0; y < h; y++)
-        for (u32 x = 0; x < w; x++)
-            memcpy(dst + ((size_t)y * w + x) * bpp,
-                   src + (size_t)rsx_swizzle_offset_3d(x, y, z, lw, lh, ld) * bpp, bpp);
+    /* Increment the interleaved X bits without recomputing a Morton
+     * address for every texel. Y and Z are constant across each row. */
+    const u32 xmask = rsx_swizzle_offset_3d(~0u, 0, 0, lw, lh, ld);
+    for (u32 y = 0; y < h; ++y) {
+        const u32 row = rsx_swizzle_offset_3d(0, y, z, lw, lh, ld);
+        u32 xbits = 0;
+        for (u32 x = 0; x < w; ++x) {
+            const u8* texel = src + (size_t)(row | xbits) * bpp;
+            switch (bpp) {
+            case 1: *dst = *texel; break;
+            case 2: memcpy(dst, texel, 2); break;
+            case 4: memcpy(dst, texel, 4); break;
+            default: memcpy(dst, texel, bpp); break;
+            }
+            dst += bpp;
+            xbits = (xbits - xmask) & xmask;
+        }
+    }
 }
 
 /* One hash per cached texture per presented frame. Word-at-a-time FNV over
@@ -1093,15 +1110,30 @@ static u64 eng_texture_sparse_hash(u32 location, u32 offset, u32 span,
 {
     const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
     if (!src) { *readable = 0; return 0; }
+    const u64 prime = 1099511628211ull;
     u64 hash = 1469598103934665603ull;
-    for (u32 i = 0; i + 64 <= span; i += ENG_TEXHASH_STRIDE)
-        for (u32 k = 0; k < 64; k += 8) {
-            u64 word;
-            memcpy(&word, src + i + k, sizeof(word));
-            hash = (hash ^ word) * 1099511628211ull;
+    u64 lanes[4] = {hash, hash ^ 1u, hash ^ 2u, hash ^ 3u};
+    /* The cache stores these fingerprints only in this process. Keep the
+     * original sample coverage, with four independent word accumulators. */
+    const u32 blocks = span < 64 ? 0 : 1 + (span - 64) / ENG_TEXHASH_STRIDE;
+    for (u32 i = 0; i < blocks; ++i) {
+        const u8* block = src + (size_t)i * ENG_TEXHASH_STRIDE;
+        for (unsigned lane = 0; lane < 4; ++lane) {
+            u64 a, b;
+            memcpy(&a, block + lane * 8, 8);
+            memcpy(&b, block + 32 + lane * 8, 8);
+            lanes[lane] = (((lanes[lane] ^ a) * prime) ^ b) * prime;
         }
-    for (u32 i = span > 64 ? span - 64 : 0; i < span; i++)
-        hash = (hash ^ src[i]) * 1099511628211ull;
+    }
+    for (unsigned lane = 0; lane < 4; ++lane) hash = (hash ^ lanes[lane]) * prime;
+    u32 tail = span > 64 ? span - 64 : 0;
+    while (span - tail >= 8) {
+        u64 word;
+        memcpy(&word, src + tail, 8);
+        hash = (hash ^ word) * prime;
+        tail += 8;
+    }
+    while (tail < span) hash = (hash ^ src[tail++]) * prime;
     *readable = 1;
     return hash;
 }
@@ -1312,11 +1344,6 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
 {
     if (!w || !h || w > ENG_MAX_TEX_DIM || h > ENG_MAX_TEX_DIM) return 0;
     if (!depth) depth = 1;
-    const u32 span = depth > 1 ? eng_texture_span_3d(fmt, w, h, depth, levels, pitch)
-                               : eng_texture_span(fmt, w, h, levels, pitch, cube);
-    if (!span) return 0;
-    eng_texture_input_dump(location,offset,fmt,w,h,pitch,remap,cube,depth);
-
     /* Direct-mapped hint: key hash -> slot + 1. Always verified by the full
      * compare below; a stale or colliding hint only costs the linear scan. */
     static u16 s_tex_hint[4096];
@@ -1338,8 +1365,10 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
         if (e->location != location || e->offset != offset ||
             e->format != fmt || e->width != w || e->height != h ||
             e->pitch != pitch || e->remap != remap ||
-            e->cubemap != (u32)(cube != 0) || e->depth != depth)
+            e->cubemap != (u32)(cube != 0) || e->depth != depth || e->levels != levels)
             continue;
+        eng_texture_input_dump(location,offset,fmt,w,h,pitch,remap,cube,depth);
+        const u32 span = e->span;
         s_tex_hint[hint_key] = (u16)(i + 1u);
         if (e->handle && e->last_hash_frame != g.frames) {
             /* Every cached texture used to be hashed in full every frame;
@@ -1349,12 +1378,16 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
              * small texture, or after a write the engine saw. */
             int readable = 0;
             u64 hash = e->content_hash;
-            const u64 sparse = eng_texture_sparse_hash(location, offset, span,
-                                                       &readable);
-            if (readable && (sparse != e->sparse_hash ||
-                             eng_texture_full_rehash(span, e->last_full_frame))) {
+            u64 sparse = e->sparse_hash;
+            int full = eng_texture_full_rehash(span, e->last_full_frame);
+            if (!s_texhash_full_always && span > ENG_TEXHASH_SMALL) {
+                sparse = eng_texture_sparse_hash(location, offset, span, &readable);
+                if (!readable) full = 0;
+                else full |= sparse != e->sparse_hash;
+            }
+            if (full) {
                 hash = eng_texture_content_hash(location, offset, span, &readable);
-                e->last_full_frame = g.frames;
+                if (readable) e->last_full_frame = g.frames;
             }
             if (readable) e->sparse_hash = sparse;
             e->last_hash_frame = g.frames;
@@ -1373,6 +1406,10 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
         return e->handle;
     }
 
+    const u32 span = depth > 1 ? eng_texture_span_3d(fmt, w, h, depth, levels, pitch)
+                               : eng_texture_span(fmt, w, h, levels, pitch, cube);
+    if (!span) return 0;
+    eng_texture_input_dump(location,offset,fmt,w,h,pitch,remap,cube,depth);
     if(s_eng_perf.on)s_eng_texture_perf.misses++;
     u32 index;
     u32 evicted = 0;
@@ -1391,13 +1428,15 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     memset(&e, 0, sizeof(e));
     e.location = location; e.offset = offset; e.format = fmt;
     e.width = w; e.height = h; e.pitch = pitch;
+    e.levels = levels; e.span = span;
     e.remap = remap; e.cubemap = (u32)(cube != 0); e.depth = depth;
     e.last_hash_frame = g.frames;
     e.last_full_frame = g.frames - (index & (ENG_TEXHASH_FULL_EVERY - 1u));
     e.last_use_serial = ++g.texture_use_serial;
     { int readable = 0;
       e.content_hash = eng_texture_content_hash(location, offset, span, &readable);
-      e.sparse_hash = eng_texture_sparse_hash(location, offset, span, &readable); }
+      if (!s_texhash_full_always && span > ENG_TEXHASH_SMALL)
+          e.sparse_hash = eng_texture_sparse_hash(location, offset, span, &readable); }
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
                                   cube, remap, depth);
     if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);
@@ -1646,9 +1685,10 @@ static u32 eng_vtex_mask(void)
 {
     u32 mask = 0;
     for (u32 u = 0; u < RSX_DSP_NUM_VERTEX_TEXTURES; u++) {
-        rsx_dsp_vertex_texture vt;
-        rsx_dsp_get_vertex_texture(&g.rsx, u, &vt);
-        if (vt.enabled && vt.width && vt.height) mask |= 1u << u;
+        const u32 base = 0x0900u + u * 0x20u;
+        if (!(rsx_dsp_reg(&g.rsx, base + 0x0Cu) >> 31)) continue;
+        const u32 rect = rsx_dsp_reg(&g.rsx, base + 0x18u);
+        if ((rect >> 16) && (rect & 0xFFFFu)) mask |= 1u << u;
     }
     return mask;
 }
@@ -1685,6 +1725,7 @@ static u32 eng_volume_mask(void)
     if (!g.be->texture_create_3d || !g.be->texture_upload_3d) return 0;
     u32 mask = 0;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
+        if (!(rsx_dsp_reg(&g.rsx, 0x1A00u + u * 0x20u + 0x0Cu) >> 31)) continue;
         rsx_dsp_texture t;
         rsx_dsp_get_texture(&g.rsx, u, &t);
         if (t.enabled && !t.cubemap && t.dimension == 3 && t.depth > 1 && t.width && t.height)
@@ -1697,6 +1738,7 @@ static u32 eng_cube_mask(void)
 {
     u32 mask = 0;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
+        if (!(rsx_dsp_reg(&g.rsx, 0x1A00u + u * 0x20u + 0x0Cu) >> 31)) continue;
         rsx_dsp_texture t;
         rsx_dsp_get_texture(&g.rsx, u, &t);
         /* A cube face is square by construction, so a non-square image
@@ -1922,7 +1964,7 @@ static u64 eng_fp_debug_hash(const u8* fp_uc, u32 fp_size)
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
                             rsx_be_format rt_fmt, u32 rt_count, int* out_fixed,
-                            u32* out_tex_used, u64* out_fp_hash,const eng_program_pair* pair)
+                            u32* out_tex_used, u64* out_fp_hash,const eng_program_pair* pair, u32 vtex_mask)
 {
     *out_fixed = 1;
     *out_tex_used = 0;
@@ -1938,12 +1980,15 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 srgb_output = !fixed && rsx_fp_srgb_output_enabled(
         rsx_dsp_reg(&g.rsx, 0x1FECu), fp_ctrl,
         rsx_dsp_reg(&g.rsx, 0x0208u) & 0x1Fu);
-    const u32 cube_mask = eng_cube_mask();
-    const u32 vol_mask = eng_volume_mask();
-    const u32 vtex_mask = eng_vtex_mask();
+    const u32 bound_cube_mask = eng_cube_mask();
+    const u32 bound_vol_mask = eng_volume_mask();
     rsx_fp_shadow_desc shadow[RSX_DSP_NUM_TEXTURES] = {{0}};
     u32 shadow_mask = 0;
     const u32 sampled_units = fixed ? 0 : rsx_fp_texture_units(fp_uc, fp_size);
+    /* Unreferenced slots do not affect the shader or its descriptor layout.
+     * Otherwise binding a cube on an idle slot compiles another pipeline. */
+    const u32 cube_mask = fixed ? bound_cube_mask : bound_cube_mask & sampled_units;
+    const u32 vol_mask = fixed ? bound_vol_mask : bound_vol_mask & sampled_units;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
         if (!(sampled_units & (1u << u))) continue;
         rsx_dsp_texture t;
@@ -2019,7 +2064,16 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     /* How many colour attachments the pass will have is pipeline identity:
      * a host API matches the two against each other. */
     key = eng_fnv1a(&rt_count, sizeof rt_count, key);
-    key = rsx_draw_engine_hash_render_state(rs, key);
+    if (g.render_hash_valid && key == g.render_hash_seed &&
+        !memcmp(rs, &g.render_hash_state, sizeof(*rs))) {
+        key = g.render_hash_result;
+    } else {
+        g.render_hash_seed = key;
+        key = rsx_draw_engine_hash_render_state(rs, key);
+        g.render_hash_result = key;
+        memcpy(&g.render_hash_state, rs, sizeof(*rs));
+        g.render_hash_valid = 1;
+    }
 
     for (u32 i = 0; i < g.n_pipelines; i++)
         if (g.pipelines[i].key == key) {
@@ -3013,10 +3067,11 @@ static void sink_end(void* user, const rsx_dispatch* r)
     int pipeline_is_fixed = 1;
     u32 tex_used = 0;
     u64 fp_hash = 0;
+    const u32 vertex_units = eng_vtex_mask();
     const u32 pipeline = eng_pipeline_get(&layout, &rs,
                                           eng_surface_format(sf.color_format),
                                           n_targets, &pipeline_is_fixed, &tex_used,
-                                          &fp_hash,pair);
+                                          &fp_hash,pair, vertex_units);
     if (!pipeline) return;
     if (fp_hash && eng_debug_fp(fp_hash, pipeline)) return;
     eng_profile_step(&profile_at,&profile_ns[2]);
@@ -3034,7 +3089,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot, tex_used,
                                             textures, samplers);
     if (tex_mask == ENG_INVALID) return;
-    const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
+    const u32 vtex_mask = sink_bind_vertex_textures(vertex_units, vtextures,
                                                     vsamplers);
     eng_profile_step(&profile_at,&profile_ns[3]);
 

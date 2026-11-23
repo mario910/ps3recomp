@@ -299,9 +299,19 @@ if(PS3RECOMP_RSX_VULKAN)
         find_package(glslang CONFIG QUIET)
     endif()
     if(TARGET glslang::glslang AND TARGET glslang::SPIRV)
+        set(spirv_cache_inputs "")
+        foreach(input rsx_shader_spirv.cpp rsx_shader_spirv.h rsx_shader_msl.h)
+            set(path "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/${input}")
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${path}")
+            file(SHA256 "${path}" digest)
+            string(APPEND spirv_cache_inputs "${digest}")
+        endforeach()
+        string(SHA256 spirv_build_id "${spirv_cache_inputs};${glslang_VERSION};${CMAKE_SYSTEM_NAME};${CMAKE_SYSTEM_PROCESSOR}")
+        string(SUBSTRING "${spirv_build_id}" 0 23 spirv_build_id)
         set_source_files_properties(
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp"
-            PROPERTIES COMPILE_DEFINITIONS PS3RECOMP_HAVE_SPIRV_TRANSLATION=1)
+            PROPERTIES COMPILE_DEFINITIONS
+            "PS3RECOMP_HAVE_SPIRV_TRANSLATION=1;PS3RECOMP_SPIRV_BUILD_ID=\"${spirv_build_id}\"")
         target_link_libraries(ps3recomp_runtime PRIVATE glslang::glslang glslang::SPIRV)
         if(TARGET glslang::glslang-default-resource-limits)
             target_link_libraries(ps3recomp_runtime PRIVATE

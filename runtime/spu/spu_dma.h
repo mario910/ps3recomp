@@ -170,7 +170,20 @@ static inline int mfc_is_fence(uint32_t cmd)
  * Execute a single DMA transfer between local store and main memory.
  * Returns 0 on success, -1 on error.
  */
-static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+/* Fixed-size transfers dominate job DMA. Constant lengths let the compiler
+ * issue ordinary unaligned loads/stores, including on the full GET path. */
+static inline void mfc_lean_copy(uint8_t* dst, const uint8_t* src, uint32_t size)
+{
+    switch (size) {
+    case 16: memcpy(dst, src, 16); return;
+    case 32: memcpy(dst, src, 32); return;
+    case 64: memcpy(dst, src, 64); return;
+    case 128: memcpy(dst, src, 128); return;
+    default: memcpy(dst, src, size); return;
+    }
+}
+
+static inline int mfc_do_transfer_full(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
     /* Upper16 command-channel bits carry replacement/transfer class IDs. */
@@ -604,7 +617,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * in order, and x86 loads stay in order anyway, but an arm64 core may
          * satisfy these loads first and hand the SPU stale data. Free on x86. */
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        memcpy(ls_ptr, ea_ptr, size);
+        mfc_lean_copy(ls_ptr, ea_ptr, size);
         { extern void (*g_spu_dma_observer)(spu_context*, uint32_t, uint32_t, uint32_t, uint32_t, const void*);
           if (g_spu_dma_observer) g_spu_dma_observer(spu, 1, lsa, (uint32_t)ea, size, ls_ptr); }
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
@@ -682,21 +695,11 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * x86. */
         __atomic_thread_fence(__ATOMIC_RELEASE);
         {
-            extern int  spu_coh_is_reserved(uint32_t);
-            extern void spu_coh_notify_write(uint32_t);
-            extern void spu_coh_notify_write_except(uint32_t, const void*);
-            extern void spu_lockline_lock(void);
-            extern void spu_lockline_unlock(void);
             extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
             spu_lockguard_check(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size, "PUT");
             uint32_t a0 = (uint32_t)ea & ~127u;
             uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
-            int span_reserved = 0;
-            for (uint32_t a = a0; ; a += 128u) {
-                if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
-                if (a == a1) break;
-            }
-            if (span_reserved) {
+            if (spu_coh_span_reserved(a0, a1)) {
                 spu_lockline_lock();
                 memcpy(ea_ptr, ls_ptr, size);
                 for (uint32_t a = a0; ; a += 128u) {
@@ -706,13 +709,15 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 spu_lockline_unlock();
             } else {
                 memcpy(ea_ptr, ls_ptr, size);
-                for (uint32_t a = a0; ; a += 128u) {
-                    if (spu_coh_is_reserved(a)) {
-                        spu_lockline_lock();
-                        spu_coh_notify_write_except(a, spu);
-                        spu_lockline_unlock();
+                if (spu_coh_span_reserved(a0, a1)) {
+                    for (uint32_t a = a0; ; a += 128u) {
+                        if (spu_coh_is_reserved(a)) {
+                            spu_lockline_lock();
+                            spu_coh_notify_write_except(a, spu);
+                            spu_lockline_unlock();
+                        }
+                        if (a == a1) break;
                     }
-                    if (a == a1) break;
                 }
             }
         }
@@ -778,6 +783,43 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     }
 
     return 0;
+}
+
+static inline int mfc_lean_enabled(void);
+
+/* The list runner owns tag completion and stall state. Copy one GET at a
+ * time so observers and overlay registration see each element before the
+ * next descriptor (which itself may be in the destination) is read. */
+static inline void mfc_get_bytes(spu_context* spu, uint32_t lsa, uint32_t ea, uint32_t size)
+{
+    extern void (*g_spu_dma_observer)(spu_context*, uint32_t, uint32_t, uint32_t, uint32_t, const void*);
+    extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
+    uint8_t* dst = spu->ls + lsa;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    mfc_lean_copy(dst, vm_base + ea, size);
+    if (g_spu_dma_observer) g_spu_dma_observer(spu, 1, lsa, ea, size, dst);
+    spu_overlay_note_get(spu, ea, dst, size);
+}
+
+static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+                                  uint32_t size, uint32_t cmd)
+{
+#if !defined(_WIN32) && !defined(SPU_DMA_LOG)
+    if (cmd >= MFC_GET_CMD && cmd <= MFC_GETF_CMD && mfc_lean_enabled() &&
+        size && size <= MFC_MAX_DMA_SIZE && (size < 16 || !(size & 15u)) &&
+        !((lsa ^ (uint32_t)ea) & 15u) && lsa <= SPU_LS_SIZE - size &&
+        ea >= 0x10000u && ea <= UINT32_MAX && mfc_ea_range_committed(ea, size)) {
+        int watched;
+        spu_ls_watch_list(&watched);
+        if (!watched) {
+            extern int g_cri_video_dma;
+            if (spu->image_id == 22 && size > 0x100) g_cri_video_dma = 1;
+            mfc_get_bytes(spu, lsa, (uint32_t)ea, size);
+            return 0;
+        }
+    }
+#endif
+    return mfc_do_transfer_full(spu, lsa, ea, size, cmd);
 }
 
 /*
@@ -1056,28 +1098,12 @@ static inline int mfc_lean_enabled(void)
             0 };
         v = 1;
         for (int i = 0; diagnostics[i]; i++) if (getenv(diagnostics[i])) v = 0;
-#ifdef _WIN32
-        v = 0;   /* the registered wait-site wake lives in the full PUT path */
+#if defined(_WIN32) || defined(SPU_DMA_LOG)
+        v = 0;   /* keep Windows wakeups and build-time transfer logging */
 #endif
         __atomic_store_n(&lean, v, __ATOMIC_RELAXED);
     }
     return v;
-}
-
-/* Plain copy for the lean path. Most job DMAs are a few quadwords (image 39
- * issues ~700 transfers of 128 bytes or less per job); for those an inline
- * 16-byte loop replaces the libc call and its size dispatch. Same bytes, same
- * single pass over source and destination. */
-static inline void mfc_lean_copy(uint8_t* dst, const uint8_t* src, uint32_t size)
-{
-#if defined(__SSE2__)
-    if (size <= 128 && !(size & 15u)) {
-        for (uint32_t o = 0; o < size; o += 16)
-            _mm_storeu_si128((__m128i*)(dst + o), _mm_loadu_si128((const __m128i*)(src + o)));
-        return;
-    }
-#endif
-    memcpy(dst, src, size);
 }
 
 /* 1 = handled here, 0 = not eligible (the caller runs the full path). */
@@ -1089,7 +1115,8 @@ static inline int mfc_submit_lean(mfc_engine* mfc, spu_context* spu, uint32_t cm
     const uint32_t lsa = spu->mfc_lsa, size = spu->mfc_size, tag = spu->mfc_tag & 0x1F;
     const uint64_t ea = ((uint64_t)spu->mfc_eah << 32) | spu->mfc_eal;
     const uint32_t e = (uint32_t)ea;
-    if (size == 0 || size > MFC_MAX_DMA_SIZE || lsa > SPU_LS_MASK ||
+    if (size == 0 || size > MFC_MAX_DMA_SIZE || (size >= 16 && (size & 15u)) ||
+        ((lsa ^ e) & 15u) || lsa > SPU_LS_MASK ||
         (uint64_t)lsa + size > (uint64_t)SPU_LS_SIZE || (ea >> 32) || e < 0x10000u ||
         (uint64_t)e + size > 0x100000000ull || !vm_base ||
         g_spu_ls_watch_n != 0 || g_barrier_sync_watch ||
@@ -1102,26 +1129,13 @@ static inline int mfc_submit_lean(mfc_engine* mfc, spu_context* spu, uint32_t cm
     uint8_t* ls_ptr = &spu->ls[lsa];
     uint8_t* ea_ptr = vm_base + e;
     extern void (*g_spu_dma_observer)(spu_context*, uint32_t, uint32_t, uint32_t, uint32_t, const void*);
-    if (cmd == MFC_GET_CMD) {
-        __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        mfc_lean_copy(ls_ptr, ea_ptr, size);
-        if (g_spu_dma_observer) g_spu_dma_observer(spu, 1, lsa, e, size, ls_ptr);
-        { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
-          spu_overlay_note_get(spu, e, (const uint8_t*)ls_ptr, size); }
+    if (mfc_is_get(cmd)) {
+        mfc_get_bytes(spu, lsa, e, size);
     } else {
         /* PUT: the reservation contract of mfc_do_transfer. */
-        extern int  spu_coh_is_reserved(uint32_t);
-        extern void spu_coh_notify_write_except(uint32_t, const void*);
-        extern void spu_lockline_lock(void);
-        extern void spu_lockline_unlock(void);
         __atomic_thread_fence(__ATOMIC_RELEASE);
         const uint32_t a0 = e & ~127u, a1 = (e + size - 1u) & ~127u;
-        int span_reserved = 0;
-        for (uint32_t a = a0; ; a += 128u) {
-            if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
-            if (a == a1) break;
-        }
-        if (span_reserved) {
+        if (spu_coh_span_reserved(a0, a1)) {
             spu_lockline_lock();
             memcpy(ea_ptr, ls_ptr, size);
             for (uint32_t a = a0; ; a += 128u) {
@@ -1131,13 +1145,15 @@ static inline int mfc_submit_lean(mfc_engine* mfc, spu_context* spu, uint32_t cm
             spu_lockline_unlock();
         } else {
             mfc_lean_copy(ea_ptr, ls_ptr, size);
-            for (uint32_t a = a0; ; a += 128u) {
-                if (spu_coh_is_reserved(a)) {
-                    spu_lockline_lock();
-                    spu_coh_notify_write_except(a, spu);
-                    spu_lockline_unlock();
+            if (spu_coh_span_reserved(a0, a1)) {
+                for (uint32_t a = a0; ; a += 128u) {
+                    if (spu_coh_is_reserved(a)) {
+                        spu_lockline_lock();
+                        spu_coh_notify_write_except(a, spu);
+                        spu_lockline_unlock();
+                    }
+                    if (a == a1) break;
                 }
-                if (a == a1) break;
             }
         }
         { extern void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
@@ -1150,12 +1166,8 @@ static inline int mfc_submit_lean(mfc_engine* mfc, spu_context* spu, uint32_t cm
     return 1;
 }
 
-static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+static inline int mfc_submit_full(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 {
-    if ((cmd == MFC_GET_CMD || cmd == MFC_PUT_CMD) && !spu->policy_mode &&
-        spu->image_id != 2 && spu->image_id != 3 && spu->image_id != 22 &&
-        mfc_lean_enabled() && mfc_submit_lean(mfc, spu, cmd))
-        return 0;
     /* SPU_CMDHIST=1: every MFC command that reaches the engine, by opcode and
      * SPU image. Catches list DMAs (putl/getl) that never reach
      * mfc_do_transfer's per-element path. */
@@ -1748,6 +1760,19 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         mfc->tag_completed |= (1u << tag);
 
     return rc;
+}
+
+static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+{
+    /* A fenced/barrier GET can complete immediately when every prior
+     * synchronous transfer has completed and no list is parked. */
+    int regular = cmd == MFC_GET_CMD || cmd == MFC_PUT_CMD;
+    int ordered_get = (cmd == MFC_GETB_CMD || cmd == MFC_GETF_CMD) && !spu->list_stall_mask;
+    if ((regular || ordered_get) && !spu->policy_mode &&
+        spu->image_id != 2 && spu->image_id != 3 && spu->image_id != 22 &&
+        mfc_lean_enabled() && mfc_submit_lean(mfc, spu, cmd))
+        return 0;
+    return mfc_submit_full(mfc, spu, cmd);
 }
 
 /* ---------------------------------------------------------------------------

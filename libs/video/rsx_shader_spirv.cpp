@@ -126,10 +126,12 @@ int translate(const char* hlsl, int stage, std::vector<unsigned int>& spirv,
 
 const u32 kCacheFormat = 1;
 const u32 kCacheMagic = 0x56505352u;   /* "RSPV" */
-/* This file's compile time stands for translate()'s options and the binding
- * contract in rsx_shader_spirv.h: when either changes, this file is rebuilt,
- * and the files an older build wrote become misses. */
-const char kTranslatorBuild[24] = __DATE__ " " __TIME__;
+/* CMake fingerprints the translator and its binding contract. Builds of
+ * unrelated engine code can keep using the disk cache. */
+#ifndef PS3RECOMP_SPIRV_BUILD_ID
+#define PS3RECOMP_SPIRV_BUILD_ID __DATE__ " " __TIME__
+#endif
+const char kTranslatorBuild[24] = PS3RECOMP_SPIRV_BUILD_ID;
 
 struct Cache {
     std::mutex lock;

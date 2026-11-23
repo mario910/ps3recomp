@@ -582,22 +582,33 @@ static int run_spurs_job_context(spu_lifted_entry_fn entry, int image_id,
 
     /* ---- input DMA list -> ioBuffer, each entry 16-byte aligned ---------- */
     uint32_t io_cur = io_ls, io_used = 0;
-    /* Touch every input's lines first: they were just written by other
-     * threads, and copying them one by one serializes the misses. */
-    if (n_dma > 1)
-        for (uint32_t i = 0; i < n_dma; i++) {
-            uint64_t e   = g64(dma_base + i * 8u);
-            uint32_t sz  = (uint32_t)((e >> 32) & 0x7FFFu);
-            const uint8_t* src = vm_base + (uint32_t)e;
-            if (!sz || !(uint32_t)e) continue;
-            for (uint32_t at = 0; at < sz && at < 4096u; at += 64) __builtin_prefetch(src + at);
-        }
     for (uint32_t i = 0; i < n_dma; i++) {
         uint64_t e   = g64(dma_base + i * 8u);
         uint32_t sz  = (uint32_t)((e >> 32) & 0x7FFFu);
         uint32_t eal = (uint32_t)e;
         if (!sz || !eal) continue;
         if (!io_ls || io_cur + sz > SPU_LS_SIZE) break;
+        /* Consecutive aligned descriptors occasionally partition one DMA.
+         * Keep the padding of the last entry and all LS/EA boundaries exact. */
+        while (!(sz & 15u) && i + 1 < n_dma) {
+            const uint64_t next = g64(dma_base + (i + 1) * 8u);
+            const uint32_t length = (uint32_t)(next >> 32) & 0x7fffu;
+            if (!length || (uint64_t)eal + sz != (uint32_t)next ||
+                (uint64_t)io_cur + sz + length > SPU_LS_SIZE) break;
+            sz += length;
+            ++i;
+        }
+        /* Warm the next independent source while copying this run. libc
+         * streams the interior of large buffers without a second traversal. */
+        if (i + 1 < n_dma) {
+            const uint64_t next = g64(dma_base + (i + 1) * 8u);
+            const uint32_t length = (next >> 32) & 0x7fffu;
+            if (length && (uint32_t)next) {
+                const uint8_t* source = vm_base + (uint32_t)next;
+                __builtin_prefetch(source);
+                if (length > 64) __builtin_prefetch(source + 64);
+            }
+        }
         memcpy(ls + io_cur, vm_base + eal, sz);
         if (lazy_zero && (sz & 15u)) memset(ls + io_cur + sz, 0, 16u - (sz & 15u));
         io_cur  += (sz + 15u) & ~15u;
